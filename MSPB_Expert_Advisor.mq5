@@ -1130,6 +1130,7 @@ enum SessionBucket
 #define EXEC_QUAL_INT_MATCH_MAX_SEC 300
 #define EXEC_QUAL_INT_MAX 2147483647
 #define EXEC_QUAL_EPS 1e-12
+#define EXEC_QUAL_SEC_PER_MIN 60
 
 string   g_execIntentSym[EXEC_QUAL_INTENT_MAX];
 int      g_execIntentDir[EXEC_QUAL_INTENT_MAX];
@@ -3408,7 +3409,7 @@ int ExecQual_FindIntent(const string sym, const int dir, const datetime dealTime
       if(g_execIntentTs[i]<=0) continue;
       if(g_execIntentDir[i]!=dir) continue;
       if(g_execIntentSym[i]!=sym) continue;
-      int deltaSec=(int)MathAbs((double)(dealTime - g_execIntentTs[i]));
+      int deltaSec=(int)MathAbs(dealTime - g_execIntentTs[i]);
       if(deltaSec>EXEC_QUAL_INT_MATCH_MAX_SEC) continue;
       if(deltaSec<bestDeltaSec)
       {
@@ -3503,7 +3504,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
       reason="EXEC_BLOCK_COOLDOWN";
    else if(InpMinMinutesBetweenEntriesPerSymbol>0 &&
            g_execLastEntryIntent[symIdx]>0 &&
-           (now-g_execLastEntryIntent[symIdx]) < (InpMinMinutesBetweenEntriesPerSymbol*60))
+           (now-g_execLastEntryIntent[symIdx]) < (InpMinMinutesBetweenEntriesPerSymbol*EXEC_QUAL_SEC_PER_MIN))
       reason="ENTRY_SYMBOL_COOLDOWN";
 
    int n=0;
