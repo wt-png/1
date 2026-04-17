@@ -290,7 +290,6 @@ bool RiskCap_SendTelegramAlert(const string message)
 
 bool RiskCap_IsEntryBlockedByCaps(
    const string symbol,
-   const bool is_buy,
    const double intended_r_total,
    CurrencyRiskBuckets &current,
    CurrencyRiskBuckets &projected,
@@ -354,7 +353,7 @@ bool RiskCap_CheckEntryAllowed(const string symbol, const bool is_buy, const dou
    // Entry-only gate. Do NOT call this for exits, SL/TP modifications, or protective actions.
    CurrencyRiskBuckets current, projected;
    string reason;
-   bool blocked = RiskCap_IsEntryBlockedByCaps(symbol, is_buy, intended_r_total, current, projected, reason);
+   bool blocked = RiskCap_IsEntryBlockedByCaps(symbol, intended_r_total, current, projected, reason);
    if(!blocked)
       return(true);
 
