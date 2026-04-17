@@ -3276,7 +3276,7 @@ int GetSessionBucket(const datetime serverTime)
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
    int h=dt.hour;
-   if(h>=0 && h<=6)  return SESSION_ASIA;
+   if(h<=6)  return SESSION_ASIA;
    if(h>=7 && h<=11) return SESSION_LONDON;
    if(h>=12 && h<=20) return SESSION_NEWYORK;
    return SESSION_UNKNOWN;
@@ -3402,18 +3402,18 @@ void ExecQual_RecordEntryIntent(const int symIdx,
 int ExecQual_FindIntent(const string sym, const int dir, const datetime dealTime)
 {
    int best=-1;
-   int bestDt=EXEC_QUAL_INT_MAX;
+   int bestDeltaSec=EXEC_QUAL_INT_MAX;
    for(int i=0;i<EXEC_QUAL_INTENT_MAX;i++)
    {
       if(g_execIntentTs[i]<=0) continue;
       if(g_execIntentDir[i]!=dir) continue;
       if(g_execIntentSym[i]!=sym) continue;
-      int dt=(int)MathAbs((double)(dealTime - g_execIntentTs[i]));
-      if(dt>EXEC_QUAL_INT_MATCH_MAX_SEC) continue;
-      if(dt<bestDt)
+      int deltaSec=(int)MathAbs((double)(dealTime - g_execIntentTs[i]));
+      if(deltaSec>EXEC_QUAL_INT_MATCH_MAX_SEC) continue;
+      if(deltaSec<bestDeltaSec)
       {
          best=i;
-         bestDt=dt;
+         bestDeltaSec=deltaSec;
       }
    }
    return best;
