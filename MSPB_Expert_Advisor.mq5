@@ -1124,9 +1124,12 @@ enum SessionBucket
 };
 
 #define EXEC_QUAL_BUCKETS 4
-#define EXEC_QUAL_MAX_WINDOW 256
-#define EXEC_QUAL_INTENT_MAX 128
-#define EXEC_QUAL_SEEN_DEALS_MAX 512
+#define EXEC_QUAL_MAX_WINDOW 256      // max rolling samples per symbol+bucket (64*4*256 bounded static memory)
+#define EXEC_QUAL_INTENT_MAX 128      // ring capacity for recent entry intents awaiting deal match
+#define EXEC_QUAL_SEEN_DEALS_MAX 512  // dedupe ring for processed deal tickets
+#define EXEC_QUAL_INT_MATCH_MAX_SEC 300
+#define EXEC_QUAL_INT_MAX 2147483647
+#define EXEC_QUAL_EPS 1e-12
 
 string   g_execIntentSym[EXEC_QUAL_INTENT_MAX];
 int      g_execIntentDir[EXEC_QUAL_INTENT_MAX];
@@ -3268,6 +3271,8 @@ string SessionBucketName(const int bucket)
 
 int GetSessionBucket(const datetime serverTime)
 {
+   // Fixed buckets in broker server time (institutional policy):
+   // ASIA: 00:00-06:59, LONDON: 07:00-11:59, NEWYORK: 12:00-20:59, UNKNOWN otherwise.
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
    int h=dt.hour;
@@ -3333,7 +3338,7 @@ void ExecQual_AddSample(const int symIdx,
    g_execSlipSum[symIdx][bucket] += (absSlipPips-oldSlip);
    g_execBadCount[symIdx][bucket] += (bad-oldBad);
    if(absSlipPips>=g_execWorstSlip[symIdx][bucket]) g_execWorstSlip[symIdx][bucket]=absSlipPips;
-   else if(oldSlip>=g_execWorstSlip[symIdx][bucket]-1e-12) ExecQual_RecomputeWorstSlip(symIdx, bucket);
+   else if(oldSlip>=g_execWorstSlip[symIdx][bucket]-EXEC_QUAL_EPS) ExecQual_RecomputeWorstSlip(symIdx, bucket);
 }
 
 void ExecQual_GetStats(const int symIdx,
@@ -3359,7 +3364,10 @@ bool ExecQual_IsDealSeen(const ulong dealTicket)
 {
    if(dealTicket==0) return true;
    for(int i=0;i<EXEC_QUAL_SEEN_DEALS_MAX;i++)
+   {
+      if(g_execSeenDeals[i]==0) break;
       if(g_execSeenDeals[i]==dealTicket) return true;
+   }
    return false;
 }
 
@@ -3394,14 +3402,14 @@ void ExecQual_RecordEntryIntent(const int symIdx,
 int ExecQual_FindIntent(const string sym, const int dir, const datetime dealTime)
 {
    int best=-1;
-   int bestDt=2147483647;
+   int bestDt=EXEC_QUAL_INT_MAX;
    for(int i=0;i<EXEC_QUAL_INTENT_MAX;i++)
    {
       if(g_execIntentTs[i]<=0) continue;
       if(g_execIntentDir[i]!=dir) continue;
       if(g_execIntentSym[i]!=sym) continue;
       int dt=(int)MathAbs((double)(dealTime - g_execIntentTs[i]));
-      if(dt>300) continue;
+      if(dt>EXEC_QUAL_INT_MATCH_MAX_SEC) continue;
       if(dt<bestDt)
       {
          best=i;
@@ -3488,6 +3496,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
    string reason="";
    if(bucket==SESSION_ASIA && !InpAllowAsiaEntries)
       reason="SESSION_ASIA_DISABLED";
+   // By policy, only London/NewYork are allowed sessions; UNKNOWN is treated as disallowed.
    else if(bucket==SESSION_UNKNOWN)
       reason="SESSION_UNKNOWN_DISABLED";
    else if(InpExecQual_BlockCooldownSec>0 && g_execBlockUntil[symIdx]>0 && now<g_execBlockUntil[symIdx])
