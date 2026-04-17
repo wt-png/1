@@ -453,6 +453,13 @@ input double   InpRiskPercent             = 0.30;  // per trade (0.25 = nog stab
 input double   InpLots                    = 0.01; // fixed lot fallback when risk sizing disabled
 input bool     InpUsePortfolioRiskGuard   = true;
 input double   InpMaxPortfolioRiskPct     = 2.0;
+input int      InpRisk_Cap_Mode           = 1;     // 0=Off, 1=Absolute
+input double   InpRisk_Cap_USD_R          = 1.0;
+input double   InpRisk_Cap_EUR_R          = 1.0;
+input double   InpRisk_Cap_GBP_R          = 1.0;
+input double   InpRisk_Cap_Other_R        = 1.0;
+input bool     InpRisk_Cap_LogDetail      = true;
+input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.2;  // DATA mode: slightly tighter SL for more turnover
@@ -1089,6 +1096,7 @@ datetime g_dealQLastProgress=0;
 int     g_dealQBackoffSec=0;
 
 datetime g_dealQNextTry=0; // NEW: backoff timer for deal queue processing
+datetime g_riskCapLastTG=0;
 
 // --- Sanity mode runtime state (NEW)
 datetime g_startTime=0;       // EA start time for sanity warm-up
@@ -2220,6 +2228,237 @@ bool CalcRiskLots(const string sym, const double entry, const double sl, double 
 {
    // wrapper for legacy calls: equity-regime only
    return CalcRiskLotsEx(sym, entry, sl, g_riskMult, lotsOut, riskMoneyOut);
+}
+
+enum RiskCapBucket
+{
+   RISK_CAP_USD=0,
+   RISK_CAP_EUR=1,
+   RISK_CAP_GBP=2,
+   RISK_CAP_OTHER=3
+};
+
+bool RiskCap_IsEnabled()
+{
+   return (InpRisk_Cap_Mode==1);
+}
+
+double RiskCap_OneRMoney()
+{
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
+   if(eq<=0.0) return 0.0;
+   if(!InpUseRiskPercent || InpRiskPercent<=0.0) return 0.0;
+   return eq * (InpRiskPercent/100.0);
+}
+
+double RiskCap_MoneyToR(const double riskMoney)
+{
+   if(riskMoney<=0.0) return 0.0;
+   double oneR=RiskCap_OneRMoney();
+   if(oneR<=0.0) return 0.0;
+   return (riskMoney/oneR);
+}
+
+string RiskCap_BucketName(const int idx)
+{
+   if(idx==RISK_CAP_USD) return "USD";
+   if(idx==RISK_CAP_EUR) return "EUR";
+   if(idx==RISK_CAP_GBP) return "GBP";
+   return "OTHER";
+}
+
+double RiskCap_BucketCapR(const int idx)
+{
+   if(idx==RISK_CAP_USD) return MathMax(0.0, InpRisk_Cap_USD_R);
+   if(idx==RISK_CAP_EUR) return MathMax(0.0, InpRisk_Cap_EUR_R);
+   if(idx==RISK_CAP_GBP) return MathMax(0.0, InpRisk_Cap_GBP_R);
+   return MathMax(0.0, InpRisk_Cap_Other_R);
+}
+
+int RiskCap_BucketIndexByCurrency(const string ccy)
+{
+   if(ccy=="USD") return RISK_CAP_USD;
+   if(ccy=="EUR") return RISK_CAP_EUR;
+   if(ccy=="GBP") return RISK_CAP_GBP;
+   return RISK_CAP_OTHER;
+}
+
+bool RiskCap_ParseBaseQuote(const string sym, string &baseOut, string &quoteOut)
+{
+   baseOut="OTHER";
+   quoteOut="OTHER";
+   string letters="";
+   int L=StringLen(sym);
+   for(int i=0; i<L && StringLen(letters)<6; i++)
+   {
+      int c=StringGetCharacter(sym, i);
+      bool isAz = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
+      if(isAz) letters += StringSubstr(sym, i, 1);
+   }
+   if(StringLen(letters)<6) return false;
+
+   baseOut=StringSubstr(letters, 0, 3);
+   quoteOut=StringSubstr(letters, 3, 3);
+   StringToUpper(baseOut);
+   StringToUpper(quoteOut);
+   return true;
+}
+
+double RiskCap_PositionInitialRBestEffort(const string sym,
+                                          const long posId,
+                                          const double openPx,
+                                          const double slPx,
+                                          const double vol)
+{
+   double riskMoney=0.0;
+
+   int tIdx=PosTrackFind(posId);
+   if(tIdx>=0)
+   {
+      if(g_posTrackRiskMoney[tIdx]>0.0)
+         riskMoney=g_posTrackRiskMoney[tIdx];
+      else if(g_posTrackVolIn[tIdx]>0.0 && g_posTrackSL0[tIdx]>0.0 && g_posTrackOpenSum[tIdx]>0.0)
+      {
+         double avgEntry = g_posTrackOpenSum[tIdx] / g_posTrackVolIn[tIdx];
+         riskMoney = PositionRiskMoney(sym, avgEntry, g_posTrackSL0[tIdx], g_posTrackVolIn[tIdx]);
+      }
+   }
+
+   if(riskMoney<=0.0 && openPx>0.0 && slPx>0.0 && vol>0.0)
+      riskMoney = PositionRiskMoney(sym, openPx, slPx, vol);
+
+   return RiskCap_MoneyToR(riskMoney);
+}
+
+void RiskCap_AddSymbolExposure(const string sym, const double posR, double &buckets[])
+{
+   if(posR<=0.0) return;
+   string base="", quote="";
+   if(!RiskCap_ParseBaseQuote(sym, base, quote))
+   {
+      // parsing failed => fallback bucket
+      buckets[RISK_CAP_OTHER] += (2.0*posR);
+      return;
+   }
+
+   int b0=RiskCap_BucketIndexByCurrency(base);
+   int b1=RiskCap_BucketIndexByCurrency(quote);
+   buckets[b0] += posR;
+   buckets[b1] += posR;
+}
+
+void RiskCap_CollectCurrentBuckets(double &buckets[])
+{
+   ArrayResize(buckets, 4);
+   ArrayInitialize(buckets, 0.0);
+
+   int total=PositionsTotal();
+   for(int i=0;i<total;i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+
+      string sym=PositionGetString(POSITION_SYMBOL);
+      long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
+      double openPx=PositionGetDouble(POSITION_PRICE_OPEN);
+      double slPx=PositionGetDouble(POSITION_SL);
+      double vol=PositionGetDouble(POSITION_VOLUME);
+
+      double posR=RiskCap_PositionInitialRBestEffort(sym, posId, openPx, slPx, vol);
+      if(posR<=0.0) continue;
+      RiskCap_AddSymbolExposure(sym, posR, buckets);
+   }
+}
+
+string RiskCap_BucketsKV(const double &vals[])
+{
+   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
+                       vals[RISK_CAP_USD], vals[RISK_CAP_EUR], vals[RISK_CAP_GBP], vals[RISK_CAP_OTHER]);
+}
+
+string RiskCap_CapsKV()
+{
+   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
+                       RiskCap_BucketCapR(RISK_CAP_USD),
+                       RiskCap_BucketCapR(RISK_CAP_EUR),
+                       RiskCap_BucketCapR(RISK_CAP_GBP),
+                       RiskCap_BucketCapR(RISK_CAP_OTHER));
+}
+
+void RiskCap_SendBlockedTelegram(const string msg)
+{
+   if(!InpEnableTelegram) return;
+   datetime now=TimeCurrent();
+   int cool=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
+   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cool) return;
+   g_riskCapLastTG=now;
+   TelegramSendMessage(msg);
+}
+
+bool RiskCap_AllowsEntry(const int symIdx,
+                         const string sym,
+                         const string dir,
+                         const string setup,
+                         const double intendedR,
+                         const double riskMoney)
+{
+   if(!RiskCap_IsEnabled()) return true;
+   if(intendedR<=0.0) return true;
+
+   double current[];
+   RiskCap_CollectCurrentBuckets(current);
+
+   double projected[];
+   ArrayResize(projected, 4);
+   for(int i=0;i<4;i++) projected[i]=current[i];
+   RiskCap_AddSymbolExposure(sym, intendedR, projected);
+
+   bool blocked=false;
+   string breach="";
+   for(int i=0;i<4;i++)
+   {
+      double cap=RiskCap_BucketCapR(i);
+      if(projected[i] > cap + 1e-9)
+      {
+         blocked=true;
+         if(breach!="") breach += ",";
+         breach += RiskCap_BucketName(i);
+      }
+   }
+   if(!blocked) return true;
+
+   string kv = StringFormat("symbol=%s|dir=%s|setup=%s|intended_R_total=%.3f|breach=%s|current={%s}|projected={%s}|caps={%s}",
+                            sym, dir, setup, intendedR, breach,
+                            RiskCap_BucketsKV(current),
+                            RiskCap_BucketsKV(projected),
+                            RiskCap_CapsKV());
+
+   Audit_Log("BLOCKED_CURRENCY_RISK", kv, false);
+
+   if(InpEnableMLExport)
+   {
+      ML_WriteRowV2("entry_block", NowStr(), sym, setup, dir,
+                    0, 0, 0, 0, riskMoney,
+                    0, 0, 0, 0, 0,
+                    "CURRENCY_RISK_CAP", breach,
+                    0, "ENTRY_BLOCKED", 0, 0, 0,
+                    0, "BLOCKED_CURRENCY_RISK|"+kv, g_mlSchema);
+   }
+
+   if(InpRisk_Cap_LogDetail || InpDebug)
+      Print("BLOCKED_CURRENCY_RISK ", kv);
+
+   RiskCap_SendBlockedTelegram(StringFormat("BLOCKED_CURRENCY_RISK %s %s intendedR=%.3f breach=%s current={%s} projected={%s} caps={%s}",
+                                            sym, dir, intendedR, breach,
+                                            RiskCap_BucketsKV(current),
+                                            RiskCap_BucketsKV(projected),
+                                            RiskCap_CapsKV()));
+
+   IncReject(symIdx, REJ_RISK_GUARDS);
+   return false;
 }
 
 // -----------------------------------------
@@ -5532,6 +5771,10 @@ void ProcessSymbol(const int idx, const string sym)
          }
       }
 
+      double intendedR = RiskCap_MoneyToR(riskMoney);
+      if(!RiskCap_AllowsEntry(idx, sym, "BUY", setup, intendedR, riskMoney))
+         return;
+
 
       // send order
       trade.SetExpertMagicNumber((long)InpMagic);
@@ -5644,6 +5887,10 @@ void ProcessSymbol(const int idx, const string sym)
             return;
          }
       }
+
+      double intendedR = RiskCap_MoneyToR(riskMoney);
+      if(!RiskCap_AllowsEntry(idx, sym, "SELL", setup, intendedR, riskMoney))
+         return;
 
 
       trade.SetExpertMagicNumber((long)InpMagic);
