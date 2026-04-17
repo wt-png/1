@@ -31,6 +31,10 @@ struct PositionRiskMeta
    double initial_r;
 };
 
+const int CURRENCY_PAIR_LENGTH = 6;
+const int ASCII_CASE_OFFSET = 32;
+const int TELEGRAM_TIMEOUT_MS = 5000;
+
 PositionRiskMeta g_position_risk_meta[];
 datetime g_risk_cap_last_telegram_at = 0;
 
@@ -48,7 +52,7 @@ bool RiskCap_ParseBaseQuote(const string raw_symbol, string &base, string &quote
    string letters = "";
    int n = StringLen(raw_symbol);
 
-   for(int i = 0; i < n && StringLen(letters) < 6; ++i)
+   for(int i = 0; i < n && StringLen(letters) < CURRENCY_PAIR_LENGTH; ++i)
    {
       ushort ch = (ushort)StringGetCharacter(raw_symbol, i);
       bool isUpper = (ch >= 'A' && ch <= 'Z');
@@ -57,12 +61,12 @@ bool RiskCap_ParseBaseQuote(const string raw_symbol, string &base, string &quote
          continue;
 
       if(isLower)
-         ch = (ushort)(ch - 32);
+         ch = (ushort)(ch - ASCII_CASE_OFFSET);
 
       letters += CharToString(ch);
    }
 
-   if(StringLen(letters) < 6)
+   if(StringLen(letters) < CURRENCY_PAIR_LENGTH)
       return(false);
 
    base = StringSubstr(letters, 0, 3);
@@ -221,6 +225,8 @@ string RiskCap_UrlEncode(const string text)
 
    string out = "";
    int n = ArraySize(bytes);
+   if(n > 0 && bytes[n - 1] == 0)
+      n--;
    for(int i = 0; i < n; ++i)
    {
       int c = (int)bytes[i];
@@ -244,7 +250,8 @@ bool RiskCap_SendTelegramAlert(const string message)
    datetime now = TimeCurrent();
    if(InpRisk_Cap_TelegramCooldownSec > 0 && g_risk_cap_last_telegram_at > 0)
    {
-      if((now - g_risk_cap_last_telegram_at) < InpRisk_Cap_TelegramCooldownSec)
+      int elapsed_sec = (int)(now - g_risk_cap_last_telegram_at);
+      if(elapsed_sec < InpRisk_Cap_TelegramCooldownSec)
          return(false);
    }
 
@@ -261,12 +268,15 @@ bool RiskCap_SendTelegramAlert(const string message)
    string payload = "chat_id=" + RiskCap_UrlEncode(InpTelegramChatId) + "&text=" + RiskCap_UrlEncode(message);
    uchar body[];
    StringToCharArray(payload, body, 0, StringLen(payload), CP_UTF8);
+   int body_size = ArraySize(body);
+   if(body_size > 0 && body[body_size - 1] == 0)
+      ArrayResize(body, body_size - 1);
 
    string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
    uchar result[];
    string result_headers;
    ResetLastError();
-   int code = WebRequest("POST", url, headers, 5000, body, result, result_headers);
+   int code = WebRequest("POST", url, headers, TELEGRAM_TIMEOUT_MS, body, result, result_headers);
 
    if(code < 200 || code >= 300)
    {
