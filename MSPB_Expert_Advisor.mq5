@@ -2237,6 +2237,8 @@ enum RiskCapBucket
    RISK_CAP_GBP=2,
    RISK_CAP_OTHER=3
 };
+const double RISK_CAP_EPS = 1e-9;
+const double RISK_CAP_PARSE_FALLBACK_MULT = 2.0;
 
 bool RiskCap_IsEnabled()
 {
@@ -2292,7 +2294,7 @@ bool RiskCap_ParseBaseQuote(const string sym, string &baseOut, string &quoteOut)
    int L=StringLen(sym);
    for(int i=0; i<L && StringLen(letters)<6; i++)
    {
-      int c=StringGetCharacter(sym, i);
+      ushort c=(ushort)StringGetCharacter(sym, i);
       bool isAz = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
       if(isAz) letters += StringSubstr(sym, i, 1);
    }
@@ -2338,7 +2340,7 @@ void RiskCap_AddSymbolExposure(const string sym, const double posR, double &buck
    if(!RiskCap_ParseBaseQuote(sym, base, quote))
    {
       // parsing failed => fallback bucket
-      buckets[RISK_CAP_OTHER] += (2.0*posR);
+      buckets[RISK_CAP_OTHER] += (RISK_CAP_PARSE_FALLBACK_MULT*posR);
       return;
    }
 
@@ -2392,8 +2394,8 @@ void RiskCap_SendBlockedTelegram(const string msg)
 {
    if(!InpEnableTelegram) return;
    datetime now=TimeCurrent();
-   int cool=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
-   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cool) return;
+   int cooldownSec=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
+   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cooldownSec) return;
    g_riskCapLastTG=now;
    TelegramSendMessage(msg);
 }
@@ -2421,7 +2423,7 @@ bool RiskCap_AllowsEntry(const int symIdx,
    for(int i=0;i<4;i++)
    {
       double cap=RiskCap_BucketCapR(i);
-      if(projected[i] > cap + 1e-9)
+      if(projected[i] > cap + RISK_CAP_EPS)
       {
          blocked=true;
          if(breach!="") breach += ",";
@@ -2445,7 +2447,7 @@ bool RiskCap_AllowsEntry(const int symIdx,
                     0, 0, 0, 0, 0,
                     "CURRENCY_RISK_CAP", breach,
                     0, "ENTRY_BLOCKED", 0, 0, 0,
-                    0, "BLOCKED_CURRENCY_RISK|"+kv, g_mlSchema);
+                    0, "BLOCKED_CURRENCY_RISK "+kv, g_mlSchema);
    }
 
    if(InpRisk_Cap_LogDetail || InpDebug)
