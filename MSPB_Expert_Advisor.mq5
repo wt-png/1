@@ -3276,9 +3276,9 @@ int GetSessionBucket(const datetime serverTime)
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
    int h=dt.hour;
-   if(h<=6)  return SESSION_ASIA;
-   if(h>=7 && h<=11) return SESSION_LONDON;
-   if(h>=12 && h<=20) return SESSION_NEWYORK;
+   if(h<7)  return SESSION_ASIA;
+   if(h<=11) return SESSION_LONDON;
+   if(h<=20) return SESSION_NEWYORK;
    return SESSION_UNKNOWN;
 }
 
@@ -3496,7 +3496,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
    string reason="";
    if(bucket==SESSION_ASIA && !InpAllowAsiaEntries)
       reason="SESSION_ASIA_DISABLED";
-   // By policy, only London/NewYork are allowed sessions; UNKNOWN is treated as disallowed.
+   // ASIA is configurable via InpAllowAsiaEntries, but UNKNOWN stays disallowed by policy.
    else if(bucket==SESSION_UNKNOWN)
       reason="SESSION_UNKNOWN_DISABLED";
    else if(InpExecQual_BlockCooldownSec>0 && g_execBlockUntil[symIdx]>0 && now<g_execBlockUntil[symIdx])
@@ -3512,7 +3512,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
 
    if(reason=="" && n>0 && avgSpread>0.0)
    {
-      double mult=MathMax(1.0, InpExecQual_SpreadAvgMult);
+      double mult=MathMax(0.1, InpExecQual_SpreadAvgMult);
       if(spreadNowPips > (avgSpread*mult))
          reason="SPREAD_SHOCK";
    }
@@ -3539,7 +3539,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
    if(InpEnableMLExport)
    {
       string rid=(enforce ? "entry_block" : "entry_would_block");
-      string comment=(ev+" "+mlKv);
+      string comment=(ev+"|"+mlKv);
       ML_WriteRowV2(rid, NowStr(), sym, setup, dir,
                     0, 0, 0, 0, riskMoney,
                     atrPips, adxTrend, adxEntry, spreadNowPips, bodyPips,
