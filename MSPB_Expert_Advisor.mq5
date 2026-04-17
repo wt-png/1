@@ -51,12 +51,12 @@ bool RiskCap_ParseBaseQuote(const string raw_symbol, string &base, string &quote
    for(int i = 0; i < n && StringLen(letters) < 6; ++i)
    {
       ushort ch = (ushort)StringGetCharacter(raw_symbol, i);
-      bool is_upper = (ch >= 'A' && ch <= 'Z');
-      bool is_lower = (ch >= 'a' && ch <= 'z');
-      if(!is_upper && !is_lower)
+      bool isUpper = (ch >= 'A' && ch <= 'Z');
+      bool isLower = (ch >= 'a' && ch <= 'z');
+      if(!isUpper && !isLower)
          continue;
 
-      if(is_lower)
+      if(isLower)
          ch = (ushort)(ch - 32);
 
       letters += CharToString(ch);
@@ -153,7 +153,7 @@ bool RiskCap_ComputeCurrentBuckets(CurrencyRiskBuckets &buckets)
    RiskCap_ZeroBuckets(buckets);
 
    int total = PositionsTotal();
-   for(int i = total - 1; i >= 0; --i)
+   for(int i = 0; i < total; ++i)
    {
       if(!PositionSelectByIndex(i))
          continue;
@@ -173,8 +173,9 @@ bool RiskCap_ComputeCurrentBuckets(CurrencyRiskBuckets &buckets)
       if(!RiskCap_ParseBaseQuote(symbol, base, quote))
       {
          if(InpRisk_Cap_LogDetail)
-            PrintFormat("RiskCap: failed to parse symbol=%s for ticket=%I64u", symbol, ticket);
-         continue;
+            PrintFormat("RiskCap: failed to parse symbol=%s for ticket=%I64u, assigning to OTHER bucket", symbol, ticket);
+         base = "OTHER";
+         quote = "OTHER";
       }
 
       RiskCap_AddToBucket(buckets, base, pos_r);
@@ -216,15 +217,13 @@ void RiskCap_AppendMlKv(
 string RiskCap_UrlEncode(const string text)
 {
    uchar bytes[];
-   StringToCharArray(text, bytes, 0, WHOLE_ARRAY, CP_UTF8);
+   StringToCharArray(text, bytes, 0, StringLen(text), CP_UTF8);
 
    string out = "";
    int n = ArraySize(bytes);
    for(int i = 0; i < n; ++i)
    {
       int c = (int)bytes[i];
-      if(c == 0)
-         break;
 
       bool alnum = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
       if(alnum || c == '-' || c == '_' || c == '.' || c == '~')
@@ -233,9 +232,7 @@ string RiskCap_UrlEncode(const string text)
          continue;
       }
 
-      string hex = StringUpper(IntegerToString(c, 16));
-      if(StringLen(hex) == 1)
-         hex = "0" + hex;
+      string hex = StringFormat("%02X", c);
       out += "%" + hex;
    }
 
@@ -263,7 +260,7 @@ bool RiskCap_SendTelegramAlert(const string message)
    string url = "https://api.telegram.org/bot" + InpTelegramBotToken + "/sendMessage";
    string payload = "chat_id=" + RiskCap_UrlEncode(InpTelegramChatId) + "&text=" + RiskCap_UrlEncode(message);
    uchar body[];
-   StringToCharArray(payload, body, 0, WHOLE_ARRAY, CP_UTF8);
+   StringToCharArray(payload, body, 0, StringLen(payload), CP_UTF8);
 
    string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
    uchar result[];
@@ -308,8 +305,10 @@ bool RiskCap_IsEntryBlockedByCaps(
    string base, quote;
    if(!RiskCap_ParseBaseQuote(symbol, base, quote))
    {
-      reason = "failed_parse_symbol";
-      return(true);
+      if(InpRisk_Cap_LogDetail)
+         PrintFormat("RiskCap: failed to parse entry symbol=%s, assigning intended risk to OTHER bucket", symbol);
+      base = "OTHER";
+      quote = "OTHER";
    }
 
    RiskCap_AddToBucket(projected, base, intended_r_total);
