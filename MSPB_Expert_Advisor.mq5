@@ -461,6 +461,23 @@ input double   InpRisk_Cap_Other_R        = 1.0;
 input bool     InpRisk_Cap_LogDetail      = true;
 input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
+// --- Execution quality gate (session-aware)
+enum ExecQualMode
+{
+   EXEC_QUAL_OFF=0,
+   EXEC_QUAL_SHADOW=1,
+   EXEC_QUAL_ENFORCE=2
+};
+input int      InpExecQual_Mode                 = 1;      // 0=Off, 1=Shadow, 2=Enforce
+input bool     InpAllowAsiaEntries             = false;
+input int      InpExecQual_WindowPerBucket     = 50;
+input double   InpExecQual_BadSlipPips         = 1.2;
+input double   InpExecQual_MaxBadFillRate      = 0.35;
+input double   InpExecQual_SpreadAvgMult       = 2.5;
+input int      InpExecQual_BlockCooldownSec    = 120;
+input int      InpExecQual_TelegramCooldownSec = 120;
+input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
+
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.2;  // DATA mode: slightly tighter SL for more turnover
 input double   InpTP_RR                   = 0.8;  // DATA mode: faster TP
@@ -1097,6 +1114,45 @@ int     g_dealQBackoffSec=0;
 
 datetime g_dealQNextTry=0; // NEW: backoff timer for deal queue processing
 datetime g_riskCapLastTG=0;
+
+enum SessionBucket
+{
+   SESSION_ASIA=0,
+   SESSION_LONDON=1,
+   SESSION_NEWYORK=2,
+   SESSION_UNKNOWN=3
+};
+
+const int EXEC_QUAL_BUCKETS=4;
+#define EXEC_QUAL_MAX_WINDOW 256
+#define EXEC_QUAL_INTENT_MAX 128
+#define EXEC_QUAL_SEEN_DEALS_MAX 512
+
+string   g_execIntentSym[EXEC_QUAL_INTENT_MAX];
+int      g_execIntentDir[EXEC_QUAL_INTENT_MAX];
+double   g_execIntentReqPrice[EXEC_QUAL_INTENT_MAX];
+int      g_execIntentDevPts[EXEC_QUAL_INTENT_MAX];
+double   g_execIntentSpreadPips[EXEC_QUAL_INTENT_MAX];
+datetime g_execIntentTs[EXEC_QUAL_INTENT_MAX];
+string   g_execIntentSetup[EXEC_QUAL_INTENT_MAX];
+int      g_execIntentHead=0;
+
+ulong    g_execSeenDeals[EXEC_QUAL_SEEN_DEALS_MAX];
+int      g_execSeenDealsHead=0;
+
+double   g_execSpreadHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
+double   g_execSlipHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
+uchar    g_execBadHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
+int      g_execHistN[64][EXEC_QUAL_BUCKETS];
+int      g_execHistPos[64][EXEC_QUAL_BUCKETS];
+double   g_execSpreadSum[64][EXEC_QUAL_BUCKETS];
+double   g_execSlipSum[64][EXEC_QUAL_BUCKETS];
+int      g_execBadCount[64][EXEC_QUAL_BUCKETS];
+double   g_execWorstSlip[64][EXEC_QUAL_BUCKETS];
+
+datetime g_execLastEntryIntent[64];
+datetime g_execBlockUntil[64];
+datetime g_execQualLastTG=0;
 
 // --- Sanity mode runtime state (NEW)
 datetime g_startTime=0;       // EA start time for sanity warm-up
@@ -3202,6 +3258,298 @@ bool IsNewConfirmBar(const int symIdx, const string sym)
    return false;
 }
 
+string SessionBucketName(const int bucket)
+{
+   if(bucket==SESSION_ASIA) return "ASIA";
+   if(bucket==SESSION_LONDON) return "LONDON";
+   if(bucket==SESSION_NEWYORK) return "NEWYORK";
+   return "UNKNOWN";
+}
+
+int GetSessionBucket(const datetime serverTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+   int h=dt.hour;
+   if(h>=0 && h<=6)  return SESSION_ASIA;
+   if(h>=7 && h<=11) return SESSION_LONDON;
+   if(h>=12 && h<=20) return SESSION_NEWYORK;
+   return SESSION_UNKNOWN;
+}
+
+int ExecQual_WindowSize()
+{
+   int w=MathMax(5, InpExecQual_WindowPerBucket);
+   if(w>EXEC_QUAL_MAX_WINDOW) w=EXEC_QUAL_MAX_WINDOW;
+   return w;
+}
+
+void ExecQual_RecomputeWorstSlip(const int symIdx, const int bucket)
+{
+   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   int n=g_execHistN[symIdx][bucket];
+   if(n<=0) { g_execWorstSlip[symIdx][bucket]=0.0; return; }
+   double w=0.0;
+   for(int i=0;i<n;i++)
+      if(g_execSlipHist[symIdx][bucket][i]>w)
+         w=g_execSlipHist[symIdx][bucket][i];
+   g_execWorstSlip[symIdx][bucket]=w;
+}
+
+void ExecQual_AddSample(const int symIdx,
+                        const int bucket,
+                        const double spreadPips,
+                        const double absSlipPips)
+{
+   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   int w=ExecQual_WindowSize();
+   int n=g_execHistN[symIdx][bucket];
+   int p=g_execHistPos[symIdx][bucket];
+   int bad = (absSlipPips > MathMax(0.0, InpExecQual_BadSlipPips) ? 1 : 0);
+
+   if(n < w)
+   {
+      g_execSpreadHist[symIdx][bucket][n]=spreadPips;
+      g_execSlipHist[symIdx][bucket][n]=absSlipPips;
+      g_execBadHist[symIdx][bucket][n]=(uchar)bad;
+      g_execHistN[symIdx][bucket]=n+1;
+      g_execSpreadSum[symIdx][bucket]+=spreadPips;
+      g_execSlipSum[symIdx][bucket]+=absSlipPips;
+      g_execBadCount[symIdx][bucket]+=bad;
+      if(absSlipPips>g_execWorstSlip[symIdx][bucket]) g_execWorstSlip[symIdx][bucket]=absSlipPips;
+      return;
+   }
+
+   double oldSpread=g_execSpreadHist[symIdx][bucket][p];
+   double oldSlip=g_execSlipHist[symIdx][bucket][p];
+   int oldBad=(int)g_execBadHist[symIdx][bucket][p];
+
+   g_execSpreadHist[symIdx][bucket][p]=spreadPips;
+   g_execSlipHist[symIdx][bucket][p]=absSlipPips;
+   g_execBadHist[symIdx][bucket][p]=(uchar)bad;
+   g_execHistPos[symIdx][bucket]=(p+1)%w;
+
+   g_execSpreadSum[symIdx][bucket] += (spreadPips-oldSpread);
+   g_execSlipSum[symIdx][bucket] += (absSlipPips-oldSlip);
+   g_execBadCount[symIdx][bucket] += (bad-oldBad);
+   if(absSlipPips>=g_execWorstSlip[symIdx][bucket]) g_execWorstSlip[symIdx][bucket]=absSlipPips;
+   else if(oldSlip>=g_execWorstSlip[symIdx][bucket]-1e-12) ExecQual_RecomputeWorstSlip(symIdx, bucket);
+}
+
+void ExecQual_GetStats(const int symIdx,
+                       const int bucket,
+                       int &nOut,
+                       double &avgSpreadOut,
+                       double &avgSlipOut,
+                       double &worstSlipOut,
+                       double &badRateOut)
+{
+   nOut=0; avgSpreadOut=0.0; avgSlipOut=0.0; worstSlipOut=0.0; badRateOut=0.0;
+   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   int n=g_execHistN[symIdx][bucket];
+   if(n<=0) return;
+   nOut=n;
+   avgSpreadOut=g_execSpreadSum[symIdx][bucket]/n;
+   avgSlipOut=g_execSlipSum[symIdx][bucket]/n;
+   worstSlipOut=g_execWorstSlip[symIdx][bucket];
+   badRateOut=((double)g_execBadCount[symIdx][bucket])/n;
+}
+
+bool ExecQual_IsDealSeen(const ulong dealTicket)
+{
+   if(dealTicket==0) return true;
+   for(int i=0;i<EXEC_QUAL_SEEN_DEALS_MAX;i++)
+      if(g_execSeenDeals[i]==dealTicket) return true;
+   return false;
+}
+
+void ExecQual_MarkDealSeen(const ulong dealTicket)
+{
+   if(dealTicket==0) return;
+   g_execSeenDeals[g_execSeenDealsHead]=dealTicket;
+   g_execSeenDealsHead=(g_execSeenDealsHead+1)%EXEC_QUAL_SEEN_DEALS_MAX;
+}
+
+void ExecQual_RecordEntryIntent(const int symIdx,
+                                const string sym,
+                                const int dir,
+                                const double reqPrice,
+                                const int devPts,
+                                const double spreadPips,
+                                const string setup)
+{
+   datetime now=TimeCurrent();
+   int i=g_execIntentHead;
+   g_execIntentSym[i]=sym;
+   g_execIntentDir[i]=dir;
+   g_execIntentReqPrice[i]=reqPrice;
+   g_execIntentDevPts[i]=devPts;
+   g_execIntentSpreadPips[i]=spreadPips;
+   g_execIntentTs[i]=now;
+   g_execIntentSetup[i]=setup;
+   g_execIntentHead=(g_execIntentHead+1)%EXEC_QUAL_INTENT_MAX;
+   if(symIdx>=0 && symIdx<64) g_execLastEntryIntent[symIdx]=now;
+}
+
+int ExecQual_FindIntent(const string sym, const int dir, const datetime dealTime)
+{
+   int best=-1;
+   int bestDt=2147483647;
+   for(int i=0;i<EXEC_QUAL_INTENT_MAX;i++)
+   {
+      if(g_execIntentTs[i]<=0) continue;
+      if(g_execIntentDir[i]!=dir) continue;
+      if(g_execIntentSym[i]!=sym) continue;
+      int dt=(int)MathAbs((double)(dealTime - g_execIntentTs[i]));
+      if(dt>300) continue;
+      if(dt<bestDt)
+      {
+         best=i;
+         bestDt=dt;
+      }
+   }
+   return best;
+}
+
+bool ExecQual_ShouldSendTelegram()
+{
+   if(!InpEnableTelegram) return false;
+   datetime now=TimeCurrent();
+   int cd=MathMax(1, InpExecQual_TelegramCooldownSec);
+   if(g_execQualLastTG>0 && (now-g_execQualLastTG)<cd) return false;
+   g_execQualLastTG=now;
+   return true;
+}
+
+void ExecQual_HandleEntryFill(const ulong dealTicket,
+                              const string sym,
+                              const int dir,
+                              const datetime dealTime,
+                              const double dealPrice)
+{
+   if(ExecQual_IsDealSeen(dealTicket)) return;
+   ExecQual_MarkDealSeen(dealTicket);
+
+   int symIdx=SymIndexByNameLoose(sym);
+   if(symIdx<0 || symIdx>=g_symCount) return;
+   int bucket=GetSessionBucket(dealTime);
+   int intentIdx=ExecQual_FindIntent(sym, dir, dealTime);
+   if(intentIdx<0) return;
+
+   double pip=PipSize(sym);
+   if(pip<=0.0) return;
+   double req=g_execIntentReqPrice[intentIdx];
+   if(req<=0.0) return;
+
+   double absSlipPips=MathAbs(dealPrice-req)/pip;
+   ExecQual_AddSample(symIdx, bucket, g_execIntentSpreadPips[intentIdx], absSlipPips);
+
+   g_execIntentTs[intentIdx]=0;
+   g_execIntentSym[intentIdx]="";
+}
+
+void ExecQual_TryCaptureDeal(const ulong dealTicket)
+{
+   if(dealTicket==0 || ExecQual_IsDealSeen(dealTicket)) return;
+   if(!HistoryDealSelect(dealTicket)) return;
+   if((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC)!=(long)InpMagic) return;
+
+   long entry=(long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+   if(!(entry==DEAL_ENTRY_IN || entry==DEAL_ENTRY_INOUT)) return;
+
+   ENUM_DEAL_TYPE dtype=(ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+   int dir=0;
+   if(dtype==DEAL_TYPE_BUY) dir=1;
+   else if(dtype==DEAL_TYPE_SELL) dir=-1;
+   if(dir==0) return;
+
+   string sym=HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   datetime dealTime=(datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+   double dealPrice=HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+   ExecQual_HandleEntryFill(dealTicket, sym, dir, dealTime, dealPrice);
+}
+
+bool ExecQual_AllowsEntry(const int symIdx,
+                          const string sym,
+                          const string dir,
+                          const string setup,
+                          const double spreadNowPips,
+                          const double riskMoney,
+                          const double atrPips,
+                          const double adxTrend,
+                          const double adxEntry,
+                          const double bodyPips)
+{
+   if(InpExecQual_Mode<=EXEC_QUAL_OFF) return true;
+
+   datetime now=TimeCurrent();
+   int bucket=GetSessionBucket(now);
+
+   string reason="";
+   if(bucket==SESSION_ASIA && !InpAllowAsiaEntries)
+      reason="SESSION_ASIA_DISABLED";
+   else if(bucket==SESSION_UNKNOWN)
+      reason="SESSION_UNKNOWN_DISABLED";
+   else if(InpExecQual_BlockCooldownSec>0 && g_execBlockUntil[symIdx]>0 && now<g_execBlockUntil[symIdx])
+      reason="EXEC_BLOCK_COOLDOWN";
+   else if(InpMinMinutesBetweenEntriesPerSymbol>0 &&
+           g_execLastEntryIntent[symIdx]>0 &&
+           (now-g_execLastEntryIntent[symIdx]) < (InpMinMinutesBetweenEntriesPerSymbol*60))
+      reason="ENTRY_SYMBOL_COOLDOWN";
+
+   int n=0;
+   double avgSpread=0.0, avgSlip=0.0, worstSlip=0.0, badRate=0.0;
+   ExecQual_GetStats(symIdx, bucket, n, avgSpread, avgSlip, worstSlip, badRate);
+
+   if(reason=="" && n>0 && avgSpread>0.0)
+   {
+      double mult=MathMax(1.0, InpExecQual_SpreadAvgMult);
+      if(spreadNowPips > (avgSpread*mult))
+         reason="SPREAD_SHOCK";
+   }
+   if(reason=="" && n>0)
+   {
+      if(badRate > MathMax(0.0, InpExecQual_MaxBadFillRate))
+         reason="BAD_FILL_RATE_DEGRADED";
+      else if(avgSlip > MathMax(0.0, InpExecQual_BadSlipPips))
+         reason="AVG_SLIPPAGE_DEGRADED";
+   }
+
+   if(reason=="") return true;
+
+   string kv = StringFormat("symbol=%s|dir=%s|setup=%s|SESSION_BUCKET=%s|WOULD_BLOCK_REASON=%s|mode=%d|spread_now=%.2f|spread_avg=%.2f|slip_avg=%.2f|slip_worst=%.2f|bad_fill_rate=%.2f|N=%d",
+                            sym, dir, setup, SessionBucketName(bucket), reason, InpExecQual_Mode,
+                            spreadNowPips, avgSpread, avgSlip, worstSlip, badRate, n);
+   string mlKv = StringFormat("SESSION_BUCKET=%s|WOULD_BLOCK_REASON=%s|spread_now=%.2f|spread_avg=%.2f|slip_avg=%.2f|slip_worst=%.2f|bad_fill_rate=%.2f|N=%d",
+                              SessionBucketName(bucket), reason,
+                              spreadNowPips, avgSpread, avgSlip, worstSlip, badRate, n);
+   bool enforce=(InpExecQual_Mode==EXEC_QUAL_ENFORCE);
+   string ev=(enforce ? "BLOCKED_ENTRY" : "WOULD_BLOCK_ENTRY");
+   Audit_Log(ev, kv, false);
+
+   if(InpEnableMLExport)
+   {
+      string rid=(enforce ? "entry_block" : "entry_would_block");
+      string comment=(ev+" "+mlKv);
+      ML_WriteRowV2(rid, NowStr(), sym, setup, dir,
+                    0, 0, 0, 0, riskMoney,
+                    atrPips, adxTrend, adxEntry, spreadNowPips, bodyPips,
+                    "EXEC_QUALITY", reason,
+                    0, ev, 0, 0, 0,
+                    0, comment, g_mlSchema);
+   }
+
+   if(ExecQual_ShouldSendTelegram())
+      TelegramSendMessage(StringFormat("%s %s %s %s", ev, sym, dir, mlKv));
+
+   if(!enforce) return true;
+
+   if(InpExecQual_BlockCooldownSec>0)
+      g_execBlockUntil[symIdx]=now + (datetime)InpExecQual_BlockCooldownSec;
+   IncReject(symIdx, REJ_RISK_GUARDS);
+   return false;
+}
+
 // -----------------------------------------
 // Session / Spread checks
 // -----------------------------------------
@@ -3414,6 +3762,7 @@ void ProcessDealQueue()
       long entry=HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
       double vol=HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
       long posId=HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      ENUM_DEAL_TYPE dtype=(ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
 
       double pSum = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
                   + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
@@ -3432,6 +3781,18 @@ void ProcessDealQueue()
 
       double posRiskMoney=0.0;
       bool posClosedNow = PosTrackUpdate(sym, posId,(int)entry,vol,pSum,reason,dealPrice,dealSL,posProfit,closeReason,posRiskMoney);
+
+      if(entry==DEAL_ENTRY_IN || entry==DEAL_ENTRY_INOUT)
+      {
+         int fillDir=0;
+         if(dtype==DEAL_TYPE_BUY) fillDir=1;
+         else if(dtype==DEAL_TYPE_SELL) fillDir=-1;
+         if(fillDir!=0)
+         {
+            datetime dealTime=(datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+            ExecQual_HandleEntryFill(dealTicket, sym, fillDir, dealTime, dealPrice);
+         }
+      }
 
       // We only log/export for exit-side deals.
       if(!(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY || entry==DEAL_ENTRY_INOUT))
@@ -5793,6 +6154,8 @@ void ProcessSymbol(const int idx, const string sym)
       double intendedR = RiskCap_MoneyToR(riskMoney);
       if(!RiskCap_AllowsEntry(idx, sym, "BUY", setup, intendedR, riskMoney))
          return;
+      if(!ExecQual_AllowsEntry(idx, sym, "BUY", setup, spreadPips, riskMoney, atrPips, adxTrend, adxEntry, bodyPips))
+         return;
 
 
       // send order
@@ -5800,6 +6163,7 @@ void ProcessSymbol(const int idx, const string sym)
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
       double priceParam = (InpUseMarketOrdersNoPrice ? 0.0 : entry);
+      ExecQual_RecordEntryIntent(idx, sym, 1, entry, devPts, spreadPips, setup);
       bool ok = trade.Buy(lots, sym, priceParam, sl, tp, setup);
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
@@ -5910,12 +6274,15 @@ void ProcessSymbol(const int idx, const string sym)
       double intendedR = RiskCap_MoneyToR(riskMoney);
       if(!RiskCap_AllowsEntry(idx, sym, "SELL", setup, intendedR, riskMoney))
          return;
+      if(!ExecQual_AllowsEntry(idx, sym, "SELL", setup, spreadPips, riskMoney, atrPips, adxTrend, adxEntry, bodyPips))
+         return;
 
 
       trade.SetExpertMagicNumber((long)InpMagic);
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
       double priceParam = (InpUseMarketOrdersNoPrice ? 0.0 : entry);
+      ExecQual_RecordEntryIntent(idx, sym, -1, entry, devPts, spreadPips, setup);
       bool ok = trade.Sell(lots, sym, priceParam, sl, tp, setup);
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
@@ -6480,6 +6847,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       ulong deal=trans.deal;
       if(deal>0)
       {
+         ExecQual_TryCaptureDeal(deal);
          if(!DealQ_Push(deal))
          {
             PrintFormat("DEALQ_OVERFLOW: queue full, dropping deal %I64d", (long)deal);
