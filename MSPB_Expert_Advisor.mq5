@@ -2238,6 +2238,7 @@ enum RiskCapBucket
    RISK_CAP_OTHER=3
 };
 const double RISK_CAP_EPS = 1e-9;
+// Fallback counts both FX legs into OTHER when parsing fails (base + quote => 2x).
 const double RISK_CAP_PARSE_FALLBACK_MULT = 2.0;
 
 bool RiskCap_IsEnabled()
@@ -2292,11 +2293,12 @@ bool RiskCap_ParseBaseQuote(const string sym, string &baseOut, string &quoteOut)
    quoteOut="OTHER";
    string letters="";
    int L=StringLen(sym);
+   // Broker suffix/prefix safe: extract first 6 alphabetic chars, then split 3/3 (e.g. EURUSDm -> EUR/USD).
    for(int i=0; i<L && StringLen(letters)<6; i++)
    {
       ushort c=(ushort)StringGetCharacter(sym, i);
-      bool isAz = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
-      if(isAz) letters += StringSubstr(sym, i, 1);
+      bool isAlphabetic = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
+      if(isAlphabetic) letters += StringSubstr(sym, i, 1);
    }
    if(StringLen(letters)<6) return false;
 
@@ -2341,6 +2343,16 @@ void RiskCap_AddSymbolExposure(const string sym, const double posR, double &buck
    {
       // parsing failed => fallback bucket
       buckets[RISK_CAP_OTHER] += (RISK_CAP_PARSE_FALLBACK_MULT*posR);
+      if(InpRisk_Cap_LogDetail || InpDebug)
+      {
+         static datetime lastParseWarn=0;
+         datetime now=TimeCurrent();
+         if(lastParseWarn==0 || (now-lastParseWarn)>60)
+         {
+            PrintFormat("RISK_CAP_PARSE_FALLBACK symbol=%s posR=%.3f", sym, posR);
+            lastParseWarn=now;
+         }
+      }
       return;
    }
 
@@ -2395,7 +2407,12 @@ void RiskCap_SendBlockedTelegram(const string msg)
    if(!InpEnableTelegram) return;
    datetime now=TimeCurrent();
    int cooldownSec=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
-   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cooldownSec) return;
+   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cooldownSec)
+   {
+      if(InpRisk_Cap_LogDetail || InpDebug)
+         Print("RISK_CAP_TG_COOLDOWN active; blocked alert suppressed.");
+      return;
+   }
    g_riskCapLastTG=now;
    TelegramSendMessage(msg);
 }
