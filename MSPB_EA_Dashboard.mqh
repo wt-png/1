@@ -61,13 +61,13 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    }
    else if(sparam == "MSPB_BTN_RISK_UP")
    {
-      g_riskMultiplierOverride = MathMin(InpMaxRiskMultiplier, g_riskMultiplierOverride * 1.1);
+      g_riskMultiplierOverride = MathMin(InpMaxRiskMultiplier, g_riskMultiplierOverride * RISK_MULT_STEP_UP);
       Print(StringFormat("[DashBtn] Risk multiplier increased to %.3f", g_riskMultiplierOverride));
       handled = true;
    }
    else if(sparam == "MSPB_BTN_RISK_DN")
    {
-      g_riskMultiplierOverride = MathMax(0.1, g_riskMultiplierOverride * 0.9);
+      g_riskMultiplierOverride = MathMax(0.1, g_riskMultiplierOverride * RISK_MULT_STEP_DN);
       Print(StringFormat("[DashBtn] Risk multiplier decreased to %.3f", g_riskMultiplierOverride));
       handled = true;
    }

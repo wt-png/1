@@ -30,6 +30,16 @@
 #define MAX_POSITION_TRACK 256   // max simultaneously tracked open/closed positions
 #define DEAL_QUEUE_MAX     4096  // ring-buffer capacity for deal-capture queue
 
+// Equity-regime minimum gap between caution and defensive DD thresholds (percentage points)
+#define EQ_DD_MIN_THRESHOLD_GAP 0.1
+
+// Dashboard risk-button step factors (applied as multiplicative factor per click)
+#define RISK_MULT_STEP_UP 1.1
+#define RISK_MULT_STEP_DN 0.9
+
+// JSON text-field backward search window relative to update_id end position (characters)
+#define TG_JSON_TEXT_SEARCH_WINDOW 20
+
 // Read a full line from a FILE_TXT handle (safe when fields contain spaces).
 bool FileReadLineTxt(const int handle, string &line)
 {
@@ -197,18 +207,19 @@ input double   InpDev_SpreadMult          = 2.0;    // deviation points = spread
 input double   InpDev_ATRMult             = 0.10;
 input int      InpDev_MaxPoints           = 200;    // safety cap (0 => no cap)
 
-// --- Correlation guard behavior (v10)
+// --- Correlation guard behavior
 input bool     InpCorrSameExposureOnly    = true;   // if true: block only when entry increases exposure (direction-aware)
 input bool     InpCorrUseWeightedExposure = true;   // weight correlated exposure by lots and abs(corr)
 input double   InpCorrMaxWeightedLots     = 2.0;    // block if sum(abs(corr)*openLots)+newLots exceeds this (FX-like only)
 
-// --- Per-symbol cooldown after exits (v11)
+// --- Per-symbol cooldown after exits
+// InpCooldownLossOnly controls the loss-only condition globally for all cooldown parameters below.
 input bool     InpUseSymbolCooldown       = true;
-input bool     InpCooldownLossOnly        = true;   // apply cooldown only when net position P/L < 0
-input double   InpCooldownLossMinR        = 0.10;  // apply cooldown only if loss <= -X R (e.g. 0.10). 0 => any loss
-input int      InpCooldownSLMin           = 5;      // cooldown minutes after SL close (when loss-only: only if loss)
-input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP close (when loss-only: usually not applied)
-input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
+input bool     InpCooldownLossOnly        = true;   // when true, all cooldown timers below apply only if the closed trade was a loss
+input double   InpCooldownLossMinR        = 0.10;  // minimum loss in R-multiples to trigger cooldown (0 => any loss)
+input int      InpCooldownSLMin           = 5;      // cooldown minutes after SL close
+input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP close
+input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close
 
 input bool     InpUseVolRegime            = true;
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
@@ -835,7 +846,7 @@ int    g_auditHandle=INVALID_HANDLE;
 bool   g_inAuditLog=false;
 
 // --- Deal queue
-ulong  g_dealQueueTickets[];
+ulong  g_dealQueueTickets[DEAL_QUEUE_MAX];
 int    g_dealQHead=0, g_dealQTail=0;
 datetime g_dealQLastProgress=0;
 int     g_dealQBackoffSec=0;
@@ -924,7 +935,7 @@ ulong    g_partialDoneTick[MAX_POSITION_TRACK];
 int      g_partialDoneN = 0;
 
 // --- Position closure tracker (to count *closed positions* reliably, even with multi-fill exit deals)
-long   g_posTrackId[];
+long   g_posTrackId[MAX_POSITION_TRACK];
 double g_posTrackVolIn[MAX_POSITION_TRACK];
 double g_posTrackVolOut[MAX_POSITION_TRACK];
 double g_posTrackProfit[MAX_POSITION_TRACK];
@@ -949,7 +960,7 @@ long EffectiveMagic(const int symIdx)
 bool IsMyMagic(const long magic)
 {
    if(InpMagicPerSymbol)
-      return (magic >= (long)InpMagic && magic < (long)InpMagic + 64);
+      return (magic >= (long)InpMagic && magic < (long)InpMagic + MAX_SYMBOLS);
    return (magic == (long)InpMagic);
 }
 
@@ -3287,7 +3298,7 @@ void EqRegime_Update()
    if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
 
    double cauPct = MathMax(0.1, InpEqDD_Caution_Pct);
-   double defPct = MathMax(cauPct + 0.1, InpEqDD_Defensive_Pct);
+   double defPct = MathMax(cauPct + EQ_DD_MIN_THRESHOLD_GAP, InpEqDD_Defensive_Pct);
    // warn once if Defensive threshold was clamped (user misconfiguration: Defensive <= Caution)
    static bool s_warnedDefClamp = false;
    if(!s_warnedDefClamp && InpEqDD_Defensive_Pct <= InpEqDD_Caution_Pct)
@@ -6551,9 +6562,7 @@ int OnInit()
    // seed closed-position counter helper (important after terminal/EA restart)
    PosTrackSeedOpenPositions();
 
-   // Initialise dynamic arrays
-   ArrayResize(g_posTrackId, MAX_POSITION_TRACK);
-   ArrayResize(g_dealQueueTickets, DEAL_QUEUE_MAX);
+   // Initialise dynamic history arrays (statically-sized position/deal arrays need no resize)
    ArrayResize(g_execSpreadHist, MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
    ArrayResize(g_execSlipHist,   MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
    ArrayResize(g_execBadHist,    MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);

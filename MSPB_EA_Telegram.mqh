@@ -605,8 +605,10 @@ void TG_PollCommands()
       if(updateId > g_tgLastUpdateId)
          g_tgLastUpdateId = updateId;
 
-      // Find "text":" after this update_id position
-      int tp = StringFind(resp, "\"text\":\"", searchPos-20 < 0 ? 0 : searchPos-20);
+      // Find "text":" near the current update_id position.
+      // TG_JSON_TEXT_SEARCH_WINDOW chars back avoids missing the field when the search
+      // cursor overshoots slightly; +500 ahead bounds it to this update object.
+      int tp = StringFind(resp, "\"text\":\"", searchPos-TG_JSON_TEXT_SEARCH_WINDOW < 0 ? 0 : searchPos-TG_JSON_TEXT_SEARCH_WINDOW);
       // Ensure text belongs to this update (within next 500 chars)
       if(tp < 0 || tp > pEnd + 500) continue;
       tp += StringLen("\"text\":\"");
