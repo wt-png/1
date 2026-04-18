@@ -3529,7 +3529,7 @@ double SessionADXMin()
    if(bucket == SESSION_ASIA)    return InpADX_Asia;
    if(bucket == SESSION_LONDON)  return InpADX_London;
    if(bucket == SESSION_NEWYORK) return InpADX_NY;
-   return InpMinADXForEntry; // off-session fallback
+   return InpMinADXForEntry; // fallback to global default for unknown/off session
 }
 
 double SessionATRMin()
