@@ -437,7 +437,7 @@ input int      InpSymbolOverrides_ReloadSec  = 60;     // reload interval (secon
 input bool     InpSymbolOverrides_PrintOnLoad= true;   // print loaded overrides in Experts log
 // --- General
 input long     InpMagic                   = 20250213;
-input bool     InpMagicPerSymbol          = false;  // if true, each symbol uses InpMagic+symIdx (prevents cross-symbol confusion)
+input bool     InpMagicPerSymbol          = false;  // Enable to assign InpMagic+symIdx per symbol. Use when running multiple EA instances on different symbol sets to prevent cross-instance position mixing in hedging accounts.
 input bool     InpAllowBuy                = true;
 input bool     InpAllowSell               = true;
 input int      InpMaxPositionsPerSymbol   = 2;
@@ -1253,6 +1253,8 @@ void PartialTP_MarkDone(const ulong ticket)
 {
    if(g_partialDoneN < ArraySize(g_partialDoneTick))
       g_partialDoneTick[g_partialDoneN++] = ticket;
+   else
+      Print("[PARTIAL_TP] WARNING: partial TP ring buffer full (", ArraySize(g_partialDoneTick), "). Ticket ", ticket, " not marked.");
 }
 
 void PartialTP_Remove(const ulong ticket)
@@ -1297,11 +1299,12 @@ bool DailyLoss_IsTripped()
    if(g_dailyLossTripped) return true;
    if(g_dayStartBalance <= 0.0) return false;
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lossPct = (g_dayStartBalance - eq) / g_dayStartBalance * 100.0;
-   if(lossPct >= InpDailyLossLimitPct)
+   // positive = equity below day-start balance (loss), negative = equity above (profit)
+   double ddPct = (g_dayStartBalance - eq) / g_dayStartBalance * 100.0;
+   if(ddPct >= InpDailyLossLimitPct)
    {
       g_dailyLossTripped = true;
-      string msg = StringFormat("DAILY_LOSS_LIMIT hit: %.2f%% (limit=%.2f%%)", lossPct, InpDailyLossLimitPct);
+      string msg = StringFormat("DAILY_LOSS_LIMIT hit: %.2f%% (limit=%.2f%%)", ddPct, InpDailyLossLimitPct);
       Print(msg);
       if(InpEnableTelegram) TelegramSendMessage(msg);
    }
@@ -3450,8 +3453,10 @@ string SessionBucketName(const int bucket)
 int GetSessionBucket(const datetime serverTime)
 {
    // Bucket boundaries derived from inputs (inclusive end hours):
-   // ASIA: 00:00..AsiaEndH, LONDON: (AsiaEndH+1)..LondonEndH,
-   // NEWYORK: (LondonEndH+1)..NYEndH, UNKNOWN otherwise.
+   // ASIA:    0..AsiaEndH    (h <= InpExecQual_AsiaEndH)
+   // LONDON:  AsiaEndH+1..LondonEndH  (h <= InpExecQual_LondonEndH)
+   // NEWYORK: LondonEndH+1..NYEndH    (h <= InpExecQual_NYEndH)
+   // UNKNOWN: NYEndH+1..23
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
    int h = dt.hour;
@@ -3865,6 +3870,14 @@ void EqRegime_Update()
 
    double cauPct = MathMax(0.1, InpEqDD_Caution_Pct);
    double defPct = MathMax(cauPct + 0.1, InpEqDD_Defensive_Pct);
+   // warn once if Defensive threshold was clamped (user misconfiguration: Defensive <= Caution)
+   static bool s_warnedDefClamp = false;
+   if(!s_warnedDefClamp && InpEqDD_Defensive_Pct <= InpEqDD_Caution_Pct)
+   {
+      s_warnedDefClamp = true;
+      PrintFormat("[EqRegime] WARNING: InpEqDD_Defensive_Pct (%.2f) <= InpEqDD_Caution_Pct (%.2f). Defensive threshold auto-clamped to %.2f%%.",
+                  InpEqDD_Defensive_Pct, InpEqDD_Caution_Pct, defPct);
+   }
 
    if(ddPct < cauPct)       g_eqRegime = EQ_NEUTRAL;
    else if(ddPct < defPct)  g_eqRegime = EQ_CAUTION;
@@ -5890,7 +5903,7 @@ bool ClosePositionByTicketSafe(const string sym,
    if(PositionSelectByTicket(posTicket))
       req.magic = (long)PositionGetInteger(POSITION_MAGIC);
    else
-      req.magic = (long)InpMagic;
+      req.magic = EffectiveMagic(SymIndexByNameLoose(sym)); // best-effort fallback using symIdx
    req.volume    = volume;
    req.deviation = (deviationPts>0 ? deviationPts : MathMax(1, InpDev_MinPoints));
    req.type_time = ORDER_TIME_GTC;
@@ -5990,8 +6003,8 @@ void DashboardUpdate()
       string guardLine = "";
       if(InpDailyLossLimit_Enable)
       {
-         double lossPct = (g_dayStartBalance > 0 ? (g_dayStartBalance - AccountInfoDouble(ACCOUNT_EQUITY)) / g_dayStartBalance * 100.0 : 0.0);
-         guardLine += StringFormat("DailyLoss:%.2f%%/%s%.1f%% ", lossPct, (g_dailyLossTripped?"BLOCKED/":""), InpDailyLossLimitPct);
+         double ddPct = (g_dayStartBalance > 0 ? (g_dayStartBalance - AccountInfoDouble(ACCOUNT_EQUITY)) / g_dayStartBalance * 100.0 : 0.0);
+         guardLine += StringFormat("DailyLoss:%.2f%%/%s%.1f%% ", ddPct, (g_dailyLossTripped?"BLOCKED/":""), InpDailyLossLimitPct);
       }
       if(InpConsecLoss_Enable)
       {
@@ -6697,7 +6710,15 @@ void ManagePositions()
          if(lotStep <= 0.0) lotStep = 0.01;
 
          closeVol = MathFloor(closeVol / lotStep) * lotStep;
-         if(closeVol >= minLot && closeVol < vol)
+         // Normalize to valid precision
+         closeVol = NormalizeDouble(closeVol, 2);
+         if(closeVol < minLot)
+         {
+            // volume rounded down below minimum - mark as done to avoid repeated attempts
+            PartialTP_MarkDone(ticket);
+            if(InpDebug) PrintFormat("[PARTIAL_TP] vol too small after rounding (%.4f < %.4f). Skipping for %s ticket=%I64u.", closeVol, minLot, sym, ticket);
+         }
+         else if(closeVol < vol)
          {
             int pret = 0; string pcmt = "";
             int devPts = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
