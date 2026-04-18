@@ -697,6 +697,7 @@ input int      InpSanityMode_Seconds       = 15;     // disable spike/trailing a
 // --- Debug / Dashboard
 input bool     InpDebug                   = true;
 input bool     InpShowDashboard           = true;
+input bool     InpShowRejHeatmap          = false;  // 8B: show per-hour rejection heatmap on dashboard
 
 
 
@@ -745,12 +746,17 @@ string g_rejNames[REJ_MAX] = {
 
 int g_rejCounts[REJ_MAX];
 int g_rejCountsSym[64][REJ_MAX];
+int g_rejHour[24];   // 8B: per-hour rejection counts
 
 void IncReject(const int symIdx, const RejectReason rr)
 {
    if(rr<=REJ_NONE || rr>=REJ_MAX) return;
    g_rejCounts[rr]++;
    if(symIdx>=0 && symIdx<64) g_rejCountsSym[symIdx][rr]++;
+   // 8B: track rejection by hour
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+   if(h>=0 && h<24) g_rejHour[h]++;
 }
 
 // --- Symbol handling
@@ -1135,7 +1141,7 @@ int    g_auditHandle=INVALID_HANDLE;
 bool   g_inAuditLog=false;
 
 // --- Deal queue
-ulong  g_dealQueueTickets[4096];
+ulong  g_dealQueueTickets[];
 int    g_dealQHead=0, g_dealQTail=0;
 datetime g_dealQLastProgress=0;
 int     g_dealQBackoffSec=0;
@@ -1159,6 +1165,8 @@ enum SessionBucket
 #define EXEC_QUAL_INT_MAX 2147483647
 #define EXEC_QUAL_EPS 1e-12
 #define EXEC_QUAL_SEC_PER_MIN 60
+// Flatten 3D [64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW] into 1D index
+#define ExecIdx(sym,bucket,pos) ((sym)*EXEC_QUAL_BUCKETS*EXEC_QUAL_MAX_WINDOW+(bucket)*EXEC_QUAL_MAX_WINDOW+(pos))
 
 string   g_execIntentSym[EXEC_QUAL_INTENT_MAX];
 int      g_execIntentDir[EXEC_QUAL_INTENT_MAX];
@@ -1172,9 +1180,9 @@ int      g_execIntentHead=0;
 ulong    g_execSeenDeals[EXEC_QUAL_SEEN_DEALS_MAX];
 int      g_execSeenDealsHead=0;
 
-double   g_execSpreadHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
-double   g_execSlipHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
-uchar    g_execBadHist[64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW];
+double   g_execSpreadHist[];
+double   g_execSlipHist[];
+uchar    g_execBadHist[];
 int      g_execHistN[64][EXEC_QUAL_BUCKETS];
 int      g_execHistPos[64][EXEC_QUAL_BUCKETS];
 double   g_execSpreadSum[64][EXEC_QUAL_BUCKETS];
@@ -1210,7 +1218,7 @@ ulong    g_partialDoneTick[256];
 int      g_partialDoneN = 0;
 
 // --- Position closure tracker (to count *closed positions* reliably, even with multi-fill exit deals)
-long   g_posTrackId[256];
+long   g_posTrackId[];
 double g_posTrackVolIn[256];
 double g_posTrackVolOut[256];
 double g_posTrackProfit[256];
@@ -3480,8 +3488,8 @@ void ExecQual_RecomputeWorstSlip(const int symIdx, const int bucket)
    if(n<=0) { g_execWorstSlip[symIdx][bucket]=0.0; return; }
    double w=0.0;
    for(int i=0;i<n;i++)
-      if(g_execSlipHist[symIdx][bucket][i]>w)
-         w=g_execSlipHist[symIdx][bucket][i];
+      if(g_execSlipHist[ExecIdx(symIdx,bucket,i)]>w)
+         w=g_execSlipHist[ExecIdx(symIdx,bucket,i)];
    g_execWorstSlip[symIdx][bucket]=w;
 }
 
@@ -3498,9 +3506,9 @@ void ExecQual_AddSample(const int symIdx,
 
    if(n < w)
    {
-      g_execSpreadHist[symIdx][bucket][n]=spreadPips;
-      g_execSlipHist[symIdx][bucket][n]=absSlipPips;
-      g_execBadHist[symIdx][bucket][n]=(uchar)bad;
+      g_execSpreadHist[ExecIdx(symIdx,bucket,n)]=spreadPips;
+      g_execSlipHist[ExecIdx(symIdx,bucket,n)]=absSlipPips;
+      g_execBadHist[ExecIdx(symIdx,bucket,n)]=(uchar)bad;
       g_execHistN[symIdx][bucket]=n+1;
       g_execSpreadSum[symIdx][bucket]+=spreadPips;
       g_execSlipSum[symIdx][bucket]+=absSlipPips;
@@ -3509,13 +3517,13 @@ void ExecQual_AddSample(const int symIdx,
       return;
    }
 
-   double oldSpread=g_execSpreadHist[symIdx][bucket][p];
-   double oldSlip=g_execSlipHist[symIdx][bucket][p];
-   int oldBad=(int)g_execBadHist[symIdx][bucket][p];
+   double oldSpread=g_execSpreadHist[ExecIdx(symIdx,bucket,p)];
+   double oldSlip=g_execSlipHist[ExecIdx(symIdx,bucket,p)];
+   int oldBad=(int)g_execBadHist[ExecIdx(symIdx,bucket,p)];
 
-   g_execSpreadHist[symIdx][bucket][p]=spreadPips;
-   g_execSlipHist[symIdx][bucket][p]=absSlipPips;
-   g_execBadHist[symIdx][bucket][p]=(uchar)bad;
+   g_execSpreadHist[ExecIdx(symIdx,bucket,p)]=spreadPips;
+   g_execSlipHist[ExecIdx(symIdx,bucket,p)]=absSlipPips;
+   g_execBadHist[ExecIdx(symIdx,bucket,p)]=(uchar)bad;
    g_execHistPos[symIdx][bucket]=(p+1)%w;
 
    g_execSpreadSum[symIdx][bucket] += (spreadPips-oldSpread);
@@ -6066,6 +6074,41 @@ void DashboardUpdate()
       else
          DashSetLine(line++, StringFormat("%s | open=%d | spread=%.2f", sym, open, sp), clrWhite);
    }
+
+   // 4C: Execution quality summary per session bucket
+   static const string _bucketNames[4] = {"Asia","London","NY","Other"};
+   DashSetLine(line++, "=== EXEC QUALITY ===", clrYellow);
+   for(int b=0;b<EXEC_QUAL_BUCKETS;b++)
+   {
+      // aggregate across all active symbols for this bucket
+      double spreadSum=0.0;
+      int    totalN=0;
+      for(int s=0;s<g_symCount;s++)
+      {
+         int sn=0; double sa=0.0,sl2=0.0,sw=0.0,sbr=0.0;
+         ExecQual_GetStats(s, b, sn, sa, sl2, sw, sbr);
+         if(sn>0){ spreadSum+=sa*sn; totalN+=sn; }
+      }
+      string avgStr = (totalN>0 ? StringFormat("%.2f", spreadSum/totalN) : "n/a");
+      DashSetLine(line++, StringFormat("%-6s avg_spd=%s n=%d", _bucketNames[b], avgStr, totalN), clrSilver);
+   }
+
+   // 8B: Rejection heatmap (optional)
+   if(InpShowRejHeatmap)
+   {
+      DashSetLine(line++, "=== REJECTION HEATMAP ===", clrYellow);
+      int maxRej=1;
+      for(int h=0;h<24;h++) if(g_rejHour[h]>maxRej) maxRej=g_rejHour[h];
+      for(int h=0;h<24;h++)
+      {
+         if(g_rejHour[h]<=0) continue;
+         int barLen = (int)MathRound((double)g_rejHour[h]/maxRej*7);
+         string bar="";
+         for(int k=0;k<barLen;k++)       bar+="█";
+         for(int k=barLen;k<7;k++)       bar+="░";
+         DashSetLine(line++, StringFormat("H%02d: %s (%d)", h, bar, g_rejHour[h]), clrSilver);
+      }
+   }
 }
 
 // -----------------------------------------
@@ -6729,6 +6772,19 @@ void ManagePositions()
                Audit_Log("PARTIAL_TP",
                          StringFormat("sym=%s|posId=%I64d|pct=%.1f|closeVol=%.2f|floatR=%.2f",
                                       sym, posId, pct, closeVol, floatR), false);
+               // 2D: move SL to break-even after partial TP
+               double entryPx = PositionGetDouble(POSITION_PRICE_OPEN);
+               double curSL   = PositionGetDouble(POSITION_SL);
+               double curTP   = PositionGetDouble(POSITION_TP);
+               bool beNeeded  = (type==POSITION_TYPE_BUY  && curSL < entryPx) ||
+                                (type==POSITION_TYPE_SELL && curSL > entryPx);
+               if(beNeeded)
+               {
+                  trade.PositionModify(ticket, entryPx, curTP);
+                  Audit_Log("BE_AFTER_PARTIAL_TP",
+                            StringFormat("sym=%s|ticket=%I64u|entry=%.5f|oldSL=%.5f", sym, ticket, entryPx, curSL), false);
+                  if(InpDebug) PrintFormat("[PARTIAL_TP] BE after partial TP: %s ticket=%I64u entry=%.5f oldSL=%.5f", sym, ticket, entryPx, curSL);
+               }
             }
          }
       }
@@ -7101,6 +7157,16 @@ int OnInit()
 
    // seed closed-position counter helper (important after terminal/EA restart)
    PosTrackSeedOpenPositions();
+
+   // 1B: initialise dynamic arrays
+   ArrayResize(g_posTrackId, 256);
+   ArrayResize(g_dealQueueTickets, 4096);
+   ArrayResize(g_execSpreadHist, 64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayResize(g_execSlipHist,   64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayResize(g_execBadHist,    64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayInitialize(g_execSpreadHist, 0.0);
+   ArrayInitialize(g_execSlipHist,   0.0);
+   ArrayInitialize(g_execBadHist,    0);
 
    // timer
    EventSetTimer(MathMax(1, InpTimerSec));
