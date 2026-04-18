@@ -437,6 +437,7 @@ input int      InpSymbolOverrides_ReloadSec  = 60;     // reload interval (secon
 input bool     InpSymbolOverrides_PrintOnLoad= true;   // print loaded overrides in Experts log
 // --- General
 input long     InpMagic                   = 20250213;
+input bool     InpMagicPerSymbol          = false;  // if true, each symbol uses InpMagic+symIdx (prevents cross-symbol confusion)
 input bool     InpAllowBuy                = true;
 input bool     InpAllowSell               = true;
 input int      InpMaxPositionsPerSymbol   = 2;
@@ -461,6 +462,21 @@ input double   InpRisk_Cap_Other_R        = 1.0;
 input bool     InpRisk_Cap_LogDetail      = true;
 input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
+// --- Equity-regime drawdown thresholds (configurable)
+input double   InpEqDD_Caution_Pct        = 2.0;   // equity DD% → CAUTION regime
+input double   InpEqDD_Defensive_Pct      = 5.0;   // equity DD% → DEFENSIVE regime
+input double   InpEqDD_Caution_RiskMult   = 0.70;  // risk multiplier in CAUTION
+input double   InpEqDD_Defensive_RiskMult = 0.40;  // risk multiplier in DEFENSIVE
+
+// --- Daily loss limit
+input bool     InpDailyLossLimit_Enable   = false;
+input double   InpDailyLossLimitPct       = 2.0;   // max daily loss as % of balance at day start (stops new entries)
+
+// --- Consecutive loss guard
+input bool     InpConsecLoss_Enable       = false;
+input int      InpConsecLoss_MaxN         = 5;      // pause entries after N consecutive losses
+input int      InpConsecLoss_CooldownMin  = 60;     // pause duration in minutes
+
 // --- Execution quality gate (session-aware)
 enum ExecQualMode
 {
@@ -481,6 +497,11 @@ input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.2;  // DATA mode: slightly tighter SL for more turnover
 input double   InpTP_RR                   = 0.8;  // DATA mode: faster TP
+
+// --- Partial take-profit (scale out at first target)
+input bool     InpTP_Partial_Enable       = false;
+input double   InpTP_Partial_R            = 1.0;  // float-R at which to close partial portion
+input double   InpTP_Partial_Pct          = 50.0; // % of position to close at partial target (1–99)
 
 // --- Filters
 input bool     InpUsePullbackEMA          = false;
@@ -529,7 +550,6 @@ input double   InpCooldownLossMinR        = 0.10;  // apply cooldown only if los
 input int      InpCooldownSLMin           = 5;      // cooldown minutes after SL close (when loss-only: only if loss)
 input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP close (when loss-only: usually not applied)
 input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
-input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
 input bool     InpUseVolRegime            = true;
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
@@ -549,6 +569,11 @@ input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
+
+// --- ExecQual session-bucket hour boundaries (broker server time, inclusive end)
+input int      InpExecQual_AsiaEndH       = 6;    // hours 0..AsiaEndH → ASIA bucket
+input int      InpExecQual_LondonEndH     = 11;   // hours AsiaEndH+1..LondonEndH → LONDON bucket
+input int      InpExecQual_NYEndH         = 20;   // hours LondonEndH+1..NYEndH → NEWYORK bucket; later → UNKNOWN
 
 // --- Spread
 input double   InpMaxSpreadPips_FX        = 25.0;
@@ -773,6 +798,7 @@ struct SymbolOverrides
    int    allowBuy;            // -1 => use global, 0 => off, 1 => on
    int    allowSell;           // -1 => use global, 0 => off, 1 => on
    int    usePullbackEMA;      // -1 => use global, 0 => off, 1 => on
+   double riskWeight;          // >0 => scale InpRiskPercent by this factor (e.g. 0.5 = half risk); <=0 => use 1.0
 };
 
 SymbolOverrides g_ovr[128];
@@ -870,6 +896,7 @@ bool LoadSymbolOverrides()
       o.allowBuy     =(n>9?ParseInt(cols[9],-1):-1);
       o.allowSell    =(n>10?ParseInt(cols[10],-1):-1);
       o.usePullbackEMA=(n>11?ParseInt(cols[11],-1):-1);
+      o.riskWeight   =(n>12?ParseDbl(cols[12],0):0);
 
       g_ovr[g_ovrCount]=o;
       g_ovrCount++;
@@ -895,7 +922,8 @@ bool LoadSymbolOverrides()
                " breakPrev=",(string)g_ovr[i].useBreakPrev,
                " buy=",(string)g_ovr[i].allowBuy,
                " sell=",(string)g_ovr[i].allowSell,
-               " ema=",(string)g_ovr[i].usePullbackEMA);
+               " ema=",(string)g_ovr[i].usePullbackEMA,
+               " riskW=",DoubleToString(g_ovr[i].riskWeight,2));
       }
    }
    return true;
@@ -1168,6 +1196,19 @@ bool g_entryLoopBusy=false;
 int      g_closedTradesSinceProposal = 0;
 datetime g_lastProposalTime = 0;
 
+// --- Daily loss limit state
+double   g_dayStartBalance    = 0.0;
+datetime g_dayStartTime       = 0;
+bool     g_dailyLossTripped   = false;
+
+// --- Consecutive loss guard state
+int      g_consecLosses           = 0;
+datetime g_consecLossPauseUntil   = 0;
+
+// --- Partial TP tracking (ring buffer of ticket IDs that already had partial close)
+ulong    g_partialDoneTick[256];
+int      g_partialDoneN = 0;
+
 // --- Position closure tracker (to count *closed positions* reliably, even with multi-fill exit deals)
 long   g_posTrackId[256];
 double g_posTrackVolIn[256];
@@ -1180,6 +1221,133 @@ long   g_posTrackLastReason[256];
 int    g_posTrackN=0;
 
 
+
+// -----------------------------------------
+// Magic helpers (1C: per-symbol magic support)
+// -----------------------------------------
+long EffectiveMagic(const int symIdx)
+{
+   if(InpMagicPerSymbol && symIdx >= 0 && symIdx < 64)
+      return (long)InpMagic + symIdx;
+   return (long)InpMagic;
+}
+
+bool IsMyMagic(const long magic)
+{
+   if(InpMagicPerSymbol)
+      return (magic >= (long)InpMagic && magic < (long)InpMagic + 64);
+   return (magic == (long)InpMagic);
+}
+
+// -----------------------------------------
+// Partial TP helpers (2D)
+// -----------------------------------------
+bool PartialTP_AlreadyDone(const ulong ticket)
+{
+   for(int i = 0; i < g_partialDoneN; i++)
+      if(g_partialDoneTick[i] == ticket) return true;
+   return false;
+}
+
+void PartialTP_MarkDone(const ulong ticket)
+{
+   if(g_partialDoneN < ArraySize(g_partialDoneTick))
+      g_partialDoneTick[g_partialDoneN++] = ticket;
+}
+
+void PartialTP_Remove(const ulong ticket)
+{
+   for(int i = 0; i < g_partialDoneN; i++)
+   {
+      if(g_partialDoneTick[i] == ticket)
+      {
+         g_partialDoneTick[i] = g_partialDoneTick[--g_partialDoneN];
+         return;
+      }
+   }
+}
+
+// -----------------------------------------
+// Daily loss limit helpers (3C)
+// -----------------------------------------
+void DailyLoss_ResetIfNewDay()
+{
+   if(!InpDailyLossLimit_Enable) return;
+   MqlDateTime now_dt; TimeToStruct(TimeCurrent(), now_dt);
+   MqlDateTime start_dt;
+   bool needReset = (g_dayStartTime == 0);
+   if(!needReset && g_dayStartTime > 0)
+   {
+      TimeToStruct(g_dayStartTime, start_dt);
+      needReset = (now_dt.day != start_dt.day ||
+                   now_dt.mon != start_dt.mon ||
+                   now_dt.year != start_dt.year);
+   }
+   if(needReset)
+   {
+      g_dayStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_dayStartTime     = TimeCurrent();
+      g_dailyLossTripped = false;
+   }
+}
+
+bool DailyLoss_IsTripped()
+{
+   if(!InpDailyLossLimit_Enable) return false;
+   if(g_dailyLossTripped) return true;
+   if(g_dayStartBalance <= 0.0) return false;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossPct = (g_dayStartBalance - eq) / g_dayStartBalance * 100.0;
+   if(lossPct >= InpDailyLossLimitPct)
+   {
+      g_dailyLossTripped = true;
+      string msg = StringFormat("DAILY_LOSS_LIMIT hit: %.2f%% (limit=%.2f%%)", lossPct, InpDailyLossLimitPct);
+      Print(msg);
+      if(InpEnableTelegram) TelegramSendMessage(msg);
+   }
+   return g_dailyLossTripped;
+}
+
+// -----------------------------------------
+// Consecutive loss guard helpers (3D)
+// -----------------------------------------
+bool ConsecLoss_IsBlocked()
+{
+   if(!InpConsecLoss_Enable) return false;
+   return (g_consecLossPauseUntil > 0 && TimeCurrent() < g_consecLossPauseUntil);
+}
+
+void ConsecLoss_OnTradeClosed(const double profitMoney)
+{
+   if(!InpConsecLoss_Enable) return;
+   if(profitMoney < 0.0)
+   {
+      g_consecLosses++;
+      if(g_consecLosses >= InpConsecLoss_MaxN)
+      {
+         g_consecLossPauseUntil = TimeCurrent() + (datetime)(InpConsecLoss_CooldownMin * 60);
+         g_consecLosses = 0;
+         string msg = StringFormat("CONSEC_LOSS_BLOCK: %d consecutive losses → entries paused for %d min.",
+                                   InpConsecLoss_MaxN, InpConsecLoss_CooldownMin);
+         Print(msg);
+         if(InpEnableTelegram) TelegramSendMessage(msg);
+      }
+   }
+   else
+   {
+      g_consecLosses = 0;
+   }
+}
+
+// -----------------------------------------
+// Per-symbol risk weight getter (3B)
+// -----------------------------------------
+double Sym_RiskWeight(const string sym)
+{
+   int k = FindOverrideIndex(sym);
+   if(k >= 0 && g_ovr[k].riskWeight > 0.0) return g_ovr[k].riskWeight;
+   return 1.0;
+}
 
 // -----------------------------------------
 // Utility: string helpers
@@ -1308,7 +1476,7 @@ bool PosTrackUpdate(const string sym,
                ulong pt=PositionGetTicket(pi);
                if(pt==0) continue;
                if(!PositionSelectByTicket(pt)) continue;
-               if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+               if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
                if(PositionGetString(POSITION_SYMBOL)!=sym) continue;
                long pid=(long)PositionGetInteger(POSITION_IDENTIFIER);
                if(pid!=posId) continue;
@@ -1349,7 +1517,7 @@ void PosTrackSeedOpenPositions()
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
       long magic=(long)PositionGetInteger(POSITION_MAGIC);
-      if(magic!=InpMagic) continue;
+      if(!IsMyMagic(magic)) continue;
       string sym=PositionGetString(POSITION_SYMBOL);
       long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
       double vol=PositionGetDouble(POSITION_VOLUME);
@@ -1865,13 +2033,15 @@ bool ML_Open()
          "atr_pips","adx_trend","adx_entry","spread_pips","body_pips",
          "rej_reason","rej_detail",
          "pos_id","event","profit_pips","profit_money","r_mult",
-         "slmod_ret","comment","schema"
+         "slmod_ret","comment","schema",
+         "day_of_week","hour_of_day","session_bucket","eq_regime","vol_regime"
       );
       // config row
       FileWrite(g_mlHandle, "cfg", NowStr(), "", "", "", "", "", "", "", "",
                 "", "", "", "", "", "", "",
                 "", "CONFIG", "", "", "",
-                "", "schema="+g_mlSchema, g_mlSchema);
+                "", "schema="+g_mlSchema, g_mlSchema,
+                "", "", "", "", "");
    }
    return true;
 }
@@ -1936,7 +2106,13 @@ void ML_WriteRowV2(
    const int slmod_ret,
    const string comment,
    const string schema,
-   const string kv=""
+   const string kv="",
+   // 6A: new context columns (default empty for backward compat)
+   const string ctx_dow="",
+   const string ctx_hour="",
+   const string ctx_session="",
+   const string ctx_eq_regime="",
+   const string ctx_vol_regime=""
 )
 {
    if(!InpEnableMLExport) return;
@@ -1971,7 +2147,8 @@ FileWrite(g_mlHandle,
       DoubleToString(r_mult,2),
       slmod_ret,
       comment,
-      schema
+      schema,
+      ctx_dow, ctx_hour, ctx_session, ctx_eq_regime, ctx_vol_regime
    );
    g_mlRowsSinceFlush++;
    ML_MaybeFlush();
@@ -2149,10 +2326,7 @@ void Cooldown_Apply(const string sym,
    else if(closeReason==DEAL_REASON_TP) mins = InpCooldownTPMin;
    else mins = InpCooldownManualMin;
 
-   // Backward compatibility: if ManualMin not set, fall back to ExitMin
-   if(mins<=0 && closeReason!=DEAL_REASON_SL && closeReason!=DEAL_REASON_TP)
-      mins = InpCooldownExitMin;
-
+   // fallback: if manual min is 0, no cooldown for this reason
    if(mins<=0) return;
 
    datetime until = now + (mins*60);
@@ -2268,6 +2442,9 @@ bool CalcRiskLotsEx(const string sym, const double entry, const double sl, const
    double riskBudget=eq * (InpRiskPercent/100.0);
    if(riskMult<=0.0) return false;
    riskBudget *= riskMult;
+   // per-symbol risk weight (3B): scales the budget up/down per symbol
+   double symWeight = Sym_RiskWeight(sym);
+   if(symWeight > 0.0) riskBudget *= symWeight;
 
    double riskPerLot=PositionRiskMoney(sym, entry, sl, 1.0);
    if(riskPerLot<=0.0) return false;
@@ -2433,7 +2610,7 @@ void RiskCap_CollectCurrentBuckets(double &buckets[])
       ulong ticket=PositionGetTicket(i);
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
 
       string sym=PositionGetString(POSITION_SYMBOL);
       long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
@@ -2803,7 +2980,7 @@ bool CorrelationAllowsEntry(const int symIdx,
       ulong ticket=PositionGetTicket(i);
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
 
       string osym=PositionGetString(POSITION_SYMBOL);
       if(osym==sym) continue;
@@ -2991,7 +3168,7 @@ double CurrentPortfolioRiskPct()
       ulong ticket=PositionGetTicket(i);
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
 
       string sym=PositionGetString(POSITION_SYMBOL);
       double vol=PositionGetDouble(POSITION_VOLUME);
@@ -3272,14 +3449,15 @@ string SessionBucketName(const int bucket)
 
 int GetSessionBucket(const datetime serverTime)
 {
-   // Fixed buckets in broker server time (institutional policy):
-   // ASIA: 00:00-06:59, LONDON: 07:00-11:59, NEWYORK: 12:00-20:59, UNKNOWN otherwise.
+   // Bucket boundaries derived from inputs (inclusive end hours):
+   // ASIA: 00:00..AsiaEndH, LONDON: (AsiaEndH+1)..LondonEndH,
+   // NEWYORK: (LondonEndH+1)..NYEndH, UNKNOWN otherwise.
    MqlDateTime dt;
    TimeToStruct(serverTime, dt);
-   int h=dt.hour;
-   if(h<7)  return SESSION_ASIA;
-   if(h<=11) return SESSION_LONDON;
-   if(h<=20) return SESSION_NEWYORK;
+   int h = dt.hour;
+   if(h <= InpExecQual_AsiaEndH)   return SESSION_ASIA;
+   if(h <= InpExecQual_LondonEndH) return SESSION_LONDON;
+   if(h <= InpExecQual_NYEndH)     return SESSION_NEWYORK;
    return SESSION_UNKNOWN;
 }
 
@@ -3461,7 +3639,7 @@ void ExecQual_TryCaptureDeal(const ulong dealTicket)
 {
    if(dealTicket==0 || ExecQual_IsDealSeen(dealTicket)) return;
    if(!HistoryDealSelect(dealTicket)) return;
-   if((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC)!=(long)InpMagic) return;
+   if(!IsMyMagic((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC))) return;
 
    long entry=(long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
    if(!(entry==DEAL_ENTRY_IN || entry==DEAL_ENTRY_INOUT)) return;
@@ -3599,7 +3777,7 @@ int CountOpenPositionsOurMagic(const string sym="")
          continue;
       }
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
       if(sym!="" && PositionGetString(POSITION_SYMBOL)!=sym) continue;
       cnt++;
    }
@@ -3616,7 +3794,7 @@ void CountOpenPositionsOurMagicBoth(const string sym, int &cntSym, int &cntTotal
       ulong ticket=PositionGetTicket(i);
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
 
       cntTotal++;
       if(sym!="" && PositionGetString(POSITION_SYMBOL)==sym)
@@ -3685,13 +3863,16 @@ void EqRegime_Update()
    double ddPct=0.0;
    if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
 
-   if(ddPct<2.0) g_eqRegime=EQ_NEUTRAL;
-   else if(ddPct<5.0) g_eqRegime=EQ_CAUTION;
-   else g_eqRegime=EQ_DEFENSIVE;
+   double cauPct = MathMax(0.1, InpEqDD_Caution_Pct);
+   double defPct = MathMax(cauPct + 0.1, InpEqDD_Defensive_Pct);
 
-   if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
-   if(g_eqRegime==EQ_CAUTION) g_riskMult=0.7;
-   if(g_eqRegime==EQ_DEFENSIVE) g_riskMult=0.4;
+   if(ddPct < cauPct)       g_eqRegime = EQ_NEUTRAL;
+   else if(ddPct < defPct)  g_eqRegime = EQ_CAUTION;
+   else                     g_eqRegime = EQ_DEFENSIVE;
+
+   if(g_eqRegime==EQ_NEUTRAL)   g_riskMult = 1.0;
+   if(g_eqRegime==EQ_CAUTION)   g_riskMult = MathMax(0.01, MathMin(1.0, InpEqDD_Caution_RiskMult));
+   if(g_eqRegime==EQ_DEFENSIVE) g_riskMult = MathMax(0.01, MathMin(1.0, InpEqDD_Defensive_RiskMult));
 }
 
 // -----------------------------------------
@@ -3767,7 +3948,7 @@ void ProcessDealQueue()
 
       string sym=HistoryDealGetString(dealTicket, DEAL_SYMBOL);
       long magic=HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-      if(magic!=InpMagic) continue;
+      if(!IsMyMagic(magic)) continue;
 
       long entry=HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
       double vol=HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
@@ -3817,6 +3998,8 @@ void ProcessDealQueue()
                       StringFormat("sym=%s|posId=%I64d|deal=%I64d|entry=%d", sym, posId, (long)dealTicket, (int)entry),
                       false);
             Cooldown_Apply(sym, now, closeReason, posProfit, posRiskMoney);
+            ConsecLoss_OnTradeClosed(posProfit);
+            PartialTP_Remove((ulong)posId);
          }
          continue;
       }
@@ -3850,8 +4033,10 @@ void ProcessDealQueue()
       if(posClosedNow)
       {
          g_closedTradesSinceProposal++;
-            Cooldown_Apply(sym, now, closeReason, posProfit, posRiskMoney);
+         Cooldown_Apply(sym, now, closeReason, posProfit, posRiskMoney);
          CheckTradeCountProposal();
+         ConsecLoss_OnTradeClosed(posProfit);
+         PartialTP_Remove((ulong)posId);
       }
 
       g_dealQLastProgress=now;
@@ -4131,7 +4316,7 @@ int BuildClosedTradesFromHistory(ClosedTradeRec &outTrades[])
    {
       ulong deal = HistoryDealGetTicket(i);
       if(!HistoryDealSelect(deal)) continue;
-      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagic) continue;
+      if(!IsMyMagic((long)HistoryDealGetInteger(deal, DEAL_MAGIC))) continue;
 
       long posId = (long)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
       string sym = HistoryDealGetString(deal, DEAL_SYMBOL);
@@ -4604,12 +4789,13 @@ void Tune_OvrInitEmpty(SymbolOverrides &o)
    o.allowBuy=-1;
    o.allowSell=-1;
    o.usePullbackEMA=-1;
+   o.riskWeight=0;
 }
 
 string Tune_OvrSig(const SymbolOverrides &o)
 {
    // Stable signature (fixed precision)
-   return StringFormat("%s|%s|%s|%s|%s|%s|%s|%d|%d|%d|%d",
+   return StringFormat("%s|%s|%s|%s|%s|%s|%s|%d|%d|%d|%d|%s",
       DoubleToString(o.maxSpreadPips, 2),
       DoubleToString(o.minATR_Pips, 2),
       DoubleToString(o.minADXTrend, 2),
@@ -4620,7 +4806,8 @@ string Tune_OvrSig(const SymbolOverrides &o)
       (int)o.useBreakPrev,
       (int)o.allowBuy,
       (int)o.allowSell,
-      (int)o.usePullbackEMA
+      (int)o.usePullbackEMA,
+      DoubleToString(o.riskWeight, 2)
    );
 }
 
@@ -4787,11 +4974,12 @@ void TuneState_Load()
          o.allowBuy      = (int)StringToInteger(f[cur+8]);
          o.allowSell     = (int)StringToInteger(f[cur+9]);
          o.usePullbackEMA= (int)StringToInteger(f[cur+10]);
+         if(n>=cur+12) o.riskWeight = StringToDouble(f[cur+11]);
 
          g_tune[idx].active_ovr=o;
          g_tune[idx].active_sig=Tune_OvrSig(o);
       }
-      cur += 11;
+      cur += 12;
 
       if(n>=cur+11)
       {
@@ -4810,6 +4998,7 @@ void TuneState_Load()
          o.allowBuy      = (int)StringToInteger(f[cur+8]);
          o.allowSell     = (int)StringToInteger(f[cur+9]);
          o.usePullbackEMA= (int)StringToInteger(f[cur+10]);
+         if(n>=cur+12) o.riskWeight = StringToDouble(f[cur+11]);
 
          g_tune[idx].prev_ovr=o;
          g_tune[idx].prev_sig=Tune_OvrSig(o);
@@ -4837,8 +5026,8 @@ void TuneState_Save()
 
    FileWriteString(h, StringFormat("VERSION;%d\r\n", TUNE_STATE_VERSION));
    FileWriteString(h, "#sym;last_used_close;trial_active;trial_start_time;trial_close_watermark;base_trades;base_pf;base_dd;base_avgr;base_net;" +
-                      "act_maxSpread;act_minATR;act_minADXTrend;act_minADXEntry;act_minBody;act_slATRMult;act_tpRR;act_useBreakPrev;act_allowBuy;act_allowSell;act_usePullbackEMA;" +
-                      "prev_maxSpread;prev_minATR;prev_minADXTrend;prev_minADXEntry;prev_minBody;prev_slATRMult;prev_tpRR;prev_useBreakPrev;prev_allowBuy;prev_allowSell;prev_usePullbackEMA\r\n");
+                      "act_maxSpread;act_minATR;act_minADXTrend;act_minADXEntry;act_minBody;act_slATRMult;act_tpRR;act_useBreakPrev;act_allowBuy;act_allowSell;act_usePullbackEMA;act_riskWeight;" +
+                      "prev_maxSpread;prev_minATR;prev_minADXTrend;prev_minADXEntry;prev_minBody;prev_slATRMult;prev_tpRR;prev_useBreakPrev;prev_allowBuy;prev_allowSell;prev_usePullbackEMA;prev_riskWeight\r\n");
 
    // Reset-guard: only save current symbols (if InpSymbols changes, stale rows disappear automatically)
    for(int i=0;i<g_symCount;i++)
@@ -4858,13 +5047,13 @@ void TuneState_Save()
                     DoubleToString(r.active_ovr.minADXTrend,2) + ";" + DoubleToString(r.active_ovr.minADXEntry,2) + ";" +
                     DoubleToString(r.active_ovr.minBodyPips,2) + ";" + DoubleToString(r.active_ovr.slATRMult,2) + ";" +
                     DoubleToString(r.active_ovr.tpRR,2) + ";" + (string)r.active_ovr.useBreakPrev + ";" + (string)r.active_ovr.allowBuy + ";" +
-                    (string)r.active_ovr.allowSell + ";" + (string)r.active_ovr.usePullbackEMA + ";" +
+                    (string)r.active_ovr.allowSell + ";" + (string)r.active_ovr.usePullbackEMA + ";" + DoubleToString(r.active_ovr.riskWeight,2) + ";" +
 
                     DoubleToString(r.prev_ovr.maxSpreadPips,2) + ";" + DoubleToString(r.prev_ovr.minATR_Pips,2) + ";" +
                     DoubleToString(r.prev_ovr.minADXTrend,2) + ";" + DoubleToString(r.prev_ovr.minADXEntry,2) + ";" +
                     DoubleToString(r.prev_ovr.minBodyPips,2) + ";" + DoubleToString(r.prev_ovr.slATRMult,2) + ";" +
                     DoubleToString(r.prev_ovr.tpRR,2) + ";" + (string)r.prev_ovr.useBreakPrev + ";" + (string)r.prev_ovr.allowBuy + ";" +
-                    (string)r.prev_ovr.allowSell + ";" + (string)r.prev_ovr.usePullbackEMA;
+                    (string)r.prev_ovr.allowSell + ";" + (string)r.prev_ovr.usePullbackEMA + ";" + DoubleToString(r.prev_ovr.riskWeight,2);
 
       FileWriteString(h, line+"\r\n");
    }
@@ -5547,7 +5736,7 @@ bool SendSLTPModifyByTicket(const string sym, const ulong posTicket, const doubl
    req.position = posTicket;
    req.sl       = sl;
    req.tp       = tp;
-   req.magic    = InpMagic;
+   req.magic    = EffectiveMagic(symIdx);
 
    ResetLastError();
    bool ok = OrderSend(req, res);
@@ -5697,7 +5886,11 @@ bool ClosePositionByTicketSafe(const string sym,
    req.action    = TRADE_ACTION_DEAL;
    req.symbol    = sym;
    req.position  = posTicket;
-   req.magic     = InpMagic;
+   // Match the magic of the existing position (important when InpMagicPerSymbol is enabled)
+   if(PositionSelectByTicket(posTicket))
+      req.magic = (long)PositionGetInteger(POSITION_MAGIC);
+   else
+      req.magic = (long)InpMagic;
    req.volume    = volume;
    req.deviation = (deviationPts>0 ? deviationPts : MathMax(1, InpDev_MinPoints));
    req.type_time = ORDER_TIME_GTC;
@@ -5790,6 +5983,24 @@ void DashboardUpdate()
    }
 
    DashSetLine(line++, StringFormat("Status: %s | EqReg: %s | RiskMult: %.2f", status, EqRegToStr(g_eqRegime), g_riskMult), statusCol);
+
+   // 3C/3D: daily loss and consecutive loss guard status
+   if(InpDailyLossLimit_Enable || InpConsecLoss_Enable)
+   {
+      string guardLine = "";
+      if(InpDailyLossLimit_Enable)
+      {
+         double lossPct = (g_dayStartBalance > 0 ? (g_dayStartBalance - AccountInfoDouble(ACCOUNT_EQUITY)) / g_dayStartBalance * 100.0 : 0.0);
+         guardLine += StringFormat("DailyLoss:%.2f%%/%s%.1f%% ", lossPct, (g_dailyLossTripped?"BLOCKED/":""), InpDailyLossLimitPct);
+      }
+      if(InpConsecLoss_Enable)
+      {
+         bool blocked = ConsecLoss_IsBlocked();
+         guardLine += StringFormat("ConsecL:%d/%d%s", g_consecLosses, InpConsecLoss_MaxN, (blocked?" PAUSED":""));
+      }
+      color gc = (g_dailyLossTripped || ConsecLoss_IsBlocked()) ? clrOrange : clrSilver;
+      DashSetLine(line++, TrimStr(guardLine), gc);
+   }
 
    // driver + news mode summary
    string entryDrv = (InpUseTimerForEntries ? "TIMER" : "TICK");
@@ -5943,6 +6154,20 @@ void ProcessSymbol(const int idx, const string sym)
 {
    // NEW: fail-safe stop entries
    if(g_failSafeStopEntries)
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // 3C: daily loss limit guard
+   if(DailyLoss_IsTripped())
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // 3D: consecutive loss guard
+   if(ConsecLoss_IsBlocked())
    {
       IncReject(idx, REJ_FAILSAFE);
       return;
@@ -6169,7 +6394,7 @@ void ProcessSymbol(const int idx, const string sym)
 
 
       // send order
-      trade.SetExpertMagicNumber((long)InpMagic);
+      trade.SetExpertMagicNumber(EffectiveMagic(idx));
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
       double priceParam = (InpUseMarketOrdersNoPrice ? 0.0 : entry);
@@ -6192,12 +6417,21 @@ void ProcessSymbol(const int idx, const string sym)
             string cmt = (success ? ("deal="+(string)trade.ResultDeal()+"|"+Shorten(trade.ResultComment(),60))
                              : ("ret="+(string)ret+"|"+Shorten(trade.ResultComment(),60)));
 
+            // build context fields for ML export (6A)
+            MqlDateTime ml_dt; TimeToStruct(TimeCurrent(), ml_dt);
+            string ml_dow     = (string)ml_dt.day_of_week;
+            string ml_hour    = (string)ml_dt.hour;
+            string ml_sess    = SessionBucketName(GetSessionBucket(TimeCurrent()));
+            string ml_eq      = EqRegToStr(g_eqRegime);
+            string ml_vol     = (volPct <= InpVolLowPct ? "LOW" : (volPct >= InpVolHighPct ? "HIGH" : "NORMAL"));
+
             ML_WriteRowV2(rid, NowStr(), sym, setup, "BUY",
                          entry, sl, tp, lots, riskMoney,
                          atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
                          rr, rd,
                          pid, ev, 0,0,tradeRiskMult,
-                         0, cmt, g_mlSchema);
+                         0, cmt, g_mlSchema,
+                         "", ml_dow, ml_hour, ml_sess, ml_eq, ml_vol);
          }
       }
 
@@ -6288,7 +6522,7 @@ void ProcessSymbol(const int idx, const string sym)
          return;
 
 
-      trade.SetExpertMagicNumber((long)InpMagic);
+      trade.SetExpertMagicNumber(EffectiveMagic(idx));
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
       double priceParam = (InpUseMarketOrdersNoPrice ? 0.0 : entry);
@@ -6311,12 +6545,21 @@ void ProcessSymbol(const int idx, const string sym)
             string cmt = (success ? ("deal="+(string)trade.ResultDeal()+"|"+Shorten(trade.ResultComment(),60))
                              : ("ret="+(string)ret+"|"+Shorten(trade.ResultComment(),60)));
 
+            // build context fields for ML export (6A)
+            MqlDateTime ml_dt; TimeToStruct(TimeCurrent(), ml_dt);
+            string ml_dow     = (string)ml_dt.day_of_week;
+            string ml_hour    = (string)ml_dt.hour;
+            string ml_sess    = SessionBucketName(GetSessionBucket(TimeCurrent()));
+            string ml_eq      = EqRegToStr(g_eqRegime);
+            string ml_vol     = (volPct <= InpVolLowPct ? "LOW" : (volPct >= InpVolHighPct ? "HIGH" : "NORMAL"));
+
             ML_WriteRowV2(rid, NowStr(), sym, setup, "SELL",
                          entry, sl, tp, lots, riskMoney,
                          atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
                          rr, rd,
                          pid, ev, 0,0,tradeRiskMult,
-                         0, cmt, g_mlSchema);
+                         0, cmt, g_mlSchema,
+                         "", ml_dow, ml_hour, ml_sess, ml_eq, ml_vol);
          }
       }
 
@@ -6369,7 +6612,7 @@ void ManagePositions()
       ulong ticket=PositionGetTicket(i);
       if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
 
       string sym=PositionGetString(POSITION_SYMBOL);
       long type=PositionGetInteger(POSITION_TYPE);
@@ -6437,6 +6680,34 @@ void ManagePositions()
                             openPrice, atrPips,
                             profitPips, floatMoney, floatR,
                             newSL, InpBE_MinStepPips*pip, "BE", kv);
+            }
+         }
+      }
+
+      // 2D: Partial take-profit (scale out at first target)
+      if(InpTP_Partial_Enable && haveTick && pipOk && initRisk > 0 && vol > 0.0 &&
+         floatR >= InpTP_Partial_R && !PartialTP_AlreadyDone(ticket))
+      {
+         double pct = MathMax(1.0, MathMin(99.0, InpTP_Partial_Pct));
+         double closeVol = vol * (pct / 100.0);
+
+         double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+         double lotStep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+         if(minLot <= 0.0) minLot = 0.01;
+         if(lotStep <= 0.0) lotStep = 0.01;
+
+         closeVol = MathFloor(closeVol / lotStep) * lotStep;
+         if(closeVol >= minLot && closeVol < vol)
+         {
+            int pret = 0; string pcmt = "";
+            int devPts = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
+            bool pok = ClosePositionByTicketSafe(sym, ticket, type, closeVol, devPts, pret, pcmt);
+            if(pok)
+            {
+               PartialTP_MarkDone(ticket);
+               Audit_Log("PARTIAL_TP",
+                         StringFormat("sym=%s|posId=%I64d|pct=%.1f|closeVol=%.2f|floatR=%.2f",
+                                      sym, posId, pct, closeVol, floatR), false);
             }
          }
       }
@@ -6629,6 +6900,7 @@ int OnInit()
 {
    Sanity_Reset(); // NEW: startup warm-up baseline
    EquityDD_Reset(); // init DD tracker for OnTester()
+   DailyLoss_ResetIfNewDay(); // 3C: initialise daily loss tracking
    // Load Telegram config early (if enabled) so startup test messages can be sent immediately.
    TG_Config_UpdateIfDue(true);
    // parse symbols
@@ -6870,6 +7142,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 void OnTick()
 {
    Cycle_Begin();
+   DailyLoss_ResetIfNewDay();  // 3C: reset daily loss limit at midnight
    EqRegime_Update();
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
@@ -6941,7 +7214,7 @@ void TradeDensity_Check()
       if(deal==0) continue;
 
       long magic = (long)HistoryDealGetInteger(deal, DEAL_MAGIC);
-      if(magic != (long)InpMagic) continue;
+      if(!IsMyMagic(magic)) continue;
 
       string sym = HistoryDealGetString(deal, DEAL_SYMBOL);
       long posId = (long)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
@@ -7008,6 +7281,7 @@ void TradeDensity_Check()
 void OnTimer()
 {
    Cycle_Begin();
+   DailyLoss_ResetIfNewDay();  // 3C: reset daily loss limit at midnight
    SymbolOverrides_UpdateIfDue();
    EqRegime_Update();
    News_UpdateIfDue();
