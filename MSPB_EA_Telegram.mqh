@@ -69,6 +69,18 @@ datetime g_tgCfgLastLoad=0;
 datetime g_tgCfgNextReload=0;
 bool     g_tgCfgWarned=false;
 
+// -----------------------------------------
+// Telegram circuit-breaker
+// When repeated send failures occur the circuit trips and further sends
+// are suppressed until g_tg_reEnableAt elapses (auto-re-enable).
+// The flag resets itself on the next successful send after the timeout.
+// -----------------------------------------
+#define TG_CB_FAIL_THRESHOLD   3      // consecutive failures before tripping
+#define TG_CB_MUTE_MINUTES    10      // mute duration (minutes) after trip
+bool     g_tg_disabled      = false;
+datetime g_tg_reEnableAt    = 0;
+int      g_tg_failStreak    = 0;      // consecutive failure counter
+
 bool ParseBoolLoose(const string s,const bool def=false)
 {
    string t=TrimStr(s);
@@ -347,6 +359,15 @@ bool TelegramSendNow(const string msg, int &httpOut, string &respOut)
    {
       int err = GetLastError();
       PrintFormat("TG: WebRequest failed (err=%d). MT5 must allow WebRequest to https://api.telegram.org. Also check internet/firewall.", err);
+      // Update circuit-breaker failure streak.
+      g_tg_failStreak++;
+      if(g_tg_failStreak >= TG_CB_FAIL_THRESHOLD && !g_tg_disabled)
+      {
+         g_tg_disabled   = true;
+         g_tg_reEnableAt = TimeCurrent() + (datetime)(TG_CB_MUTE_MINUTES * 60);
+         PrintFormat("[TG] Circuit-breaker TRIPPED after %d consecutive failures. "
+                     "Telegram muted for %d min.", TG_CB_FAIL_THRESHOLD, TG_CB_MUTE_MINUTES);
+      }
       return false;
    }
 
@@ -356,15 +377,36 @@ bool TelegramSendNow(const string msg, int &httpOut, string &respOut)
    if(http != 200)
    {
       PrintFormat("TG: HTTP %d. Resp=%s", http, Shorten(resp, 160));
+      g_tg_failStreak++;
+      if(g_tg_failStreak >= TG_CB_FAIL_THRESHOLD && !g_tg_disabled)
+      {
+         g_tg_disabled   = true;
+         g_tg_reEnableAt = TimeCurrent() + (datetime)(TG_CB_MUTE_MINUTES * 60);
+         PrintFormat("[TG] Circuit-breaker TRIPPED (HTTP %d) after %d consecutive failures. "
+                     "Telegram muted for %d min.", http, TG_CB_FAIL_THRESHOLD, TG_CB_MUTE_MINUTES);
+      }
       return false;
    }
 
+   // Successful send — reset failure streak.
+   g_tg_failStreak = 0;
    return true;
 }
 
 bool TelegramSendMessage(const string msg, const ETGCategory cat=TGC_TRADE)
 {
    if(!InpEnableTelegram) return false;
+
+   // Circuit-breaker: if tripped, suppress sends until the mute window expires.
+   if(g_tg_disabled)
+   {
+      if(TimeCurrent() < g_tg_reEnableAt)
+         return false; // still muted
+      // Mute window expired — try to re-enable on next call.
+      g_tg_disabled   = false;
+      g_tg_failStreak = 0;
+      Print("[TG] Circuit-breaker auto-re-enabled after mute window.");
+   }
 
    // Per-category rate limiting (using datetime seconds as proxy)
    int catRateMs = TGCategoryRateLimitMs(cat);

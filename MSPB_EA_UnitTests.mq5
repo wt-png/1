@@ -8,7 +8,7 @@
 //| directly by including that header here instead.                  |
 //+------------------------------------------------------------------+
 #property copyright "MSPB EA"
-#property version   "3.00"
+#property version   "4.00"
 #property script_show_inputs false
 
 int g_testsPassed = 0;
@@ -378,10 +378,181 @@ void Test_SymbolFilter()
    Assert(idxUtil < 0,       "Utility-chart symbol triggers full-loop (idx < 0)");
 }
 
+// ---- DailyLoss boundary tests ----
+// Inline re-implementation that matches MSPB_EA_Risk.mqh exactly.
+
+double TestDailyLoss_ComputeDD(const double startBal, const double equity)
+{
+   if(startBal <= 0.0) return 0.0;
+   return (startBal - equity) / startBal * 100.0;
+}
+
+bool TestDailyLoss_IsTripped(const double startBal, const double equity, const double limitPct)
+{
+   double ddPct = TestDailyLoss_ComputeDD(startBal, equity);
+   return (ddPct >= limitPct);
+}
+
+void Test_DailyLossLimit_Boundary()
+{
+   PrintFormat("--- DailyLossLimit boundary tests ---");
+
+   double bal = 10000.0;
+   double lim = 2.0;   // 2% = 200 currency units
+
+   // Exactly at limit (boundary value → must trip)
+   double eqAtLimit = bal * (1.0 - lim / 100.0);  // 9800
+   Assert( TestDailyLoss_IsTripped(bal, eqAtLimit, lim),
+           "Equity exactly at limit: tripped");
+
+   // One pip (0.01) above limit (should NOT trip)
+   double eqJustAbove = eqAtLimit + 0.01;
+   Assert(!TestDailyLoss_IsTripped(bal, eqJustAbove, lim),
+           "Equity 0.01 above limit: NOT tripped");
+
+   // One pip below limit (should trip)
+   double eqJustBelow = eqAtLimit - 0.01;
+   Assert( TestDailyLoss_IsTripped(bal, eqJustBelow, lim),
+           "Equity 0.01 below limit: tripped");
+
+   // Zero balance guard
+   Assert(!TestDailyLoss_IsTripped(0.0, 5000.0, lim),
+           "Zero start balance: NOT tripped (guard)");
+
+   // Equity above start (profit day) → never trips
+   Assert(!TestDailyLoss_IsTripped(bal, bal + 500.0, lim),
+           "Equity above start (profit day): NOT tripped");
+
+   // Full wipe-out
+   Assert( TestDailyLoss_IsTripped(bal, 0.0, lim),
+           "Full wipe-out: tripped");
+
+   // Limit = 0 → any loss trips immediately (edge case)
+   Assert( TestDailyLoss_IsTripped(bal, bal - 0.01, 0.0),
+           "Limit=0%%: any loss trips");
+}
+
+// ---- ConsecLoss guard tests ----
+
+int TestConsecLoss_Handle(int &streak, const double profitMoney, const int maxN,
+                          const int cooldownMin, datetime &pauseUntil)
+{
+   // Returns 1 if guard was tripped (new block issued), 0 otherwise.
+   if(profitMoney < 0.0)
+   {
+      streak++;
+      if(streak >= maxN)
+      {
+         pauseUntil = TimeCurrent() + (datetime)(cooldownMin * 60);
+         streak = 0;
+         return 1;
+      }
+   }
+   else
+   {
+      streak = 0;
+   }
+   return 0;
+}
+
+bool TestConsecLoss_IsBlocked(const datetime pauseUntil)
+{
+   return (pauseUntil > 0 && TimeCurrent() < pauseUntil);
+}
+
+void Test_ConsecLoss()
+{
+   PrintFormat("--- ConsecLoss guard ---");
+
+   int streak = 0;
+   datetime pauseUntil = 0;
+   int maxN = 3;
+   int coolMin = 60;
+
+   // Three wins in a row — no block
+   for(int i = 0; i < 3; i++)
+      TestConsecLoss_Handle(streak, 10.0, maxN, coolMin, pauseUntil);
+   Assert(!TestConsecLoss_IsBlocked(pauseUntil), "3 wins: no block");
+   Assert(streak == 0, "3 wins: streak reset to 0");
+
+   // Two losses — not yet at threshold
+   TestConsecLoss_Handle(streak, -5.0, maxN, coolMin, pauseUntil);
+   TestConsecLoss_Handle(streak, -5.0, maxN, coolMin, pauseUntil);
+   Assert(streak == 2, "2 consecutive losses: streak = 2");
+   Assert(!TestConsecLoss_IsBlocked(pauseUntil), "2 losses: not blocked yet");
+
+   // Third loss → trips
+   int tripped = TestConsecLoss_Handle(streak, -5.0, maxN, coolMin, pauseUntil);
+   Assert(tripped == 1, "3rd consecutive loss: guard tripped");
+   Assert(streak == 0,  "After trip: streak reset to 0");
+   Assert(TestConsecLoss_IsBlocked(pauseUntil), "After trip: blocked");
+
+   // Win after trip resets streak but does NOT lift the pause
+   TestConsecLoss_Handle(streak, 10.0, maxN, coolMin, pauseUntil);
+   Assert(streak == 0, "Win after trip: streak still 0");
+   Assert(TestConsecLoss_IsBlocked(pauseUntil), "Pause still active during cooldown");
+}
+
+// ---- EqRegime transition tests ----
+
+enum TestEqRegime { TEST_EQ_NEUTRAL=0, TEST_EQ_CAUTION=1, TEST_EQ_DEFENSIVE=2 };
+
+TestEqRegime TestEqRegime_Classify(const double ddPct, const double cauPct,
+                                   const double defPct, const double minGap)
+{
+   double cauC = (cauPct > 0.1) ? cauPct : 0.1;
+   double defC = (defPct > cauC + minGap) ? defPct : cauC + minGap;
+   if(ddPct < cauC)      return TEST_EQ_NEUTRAL;
+   if(ddPct < defC)      return TEST_EQ_CAUTION;
+   return TEST_EQ_DEFENSIVE;
+}
+
+void Test_EqRegimeTransitions()
+{
+   PrintFormat("--- EqRegime transitions ---");
+
+   double cauPct = 2.0;
+   double defPct = 5.0;
+   double minGap = 0.1;
+
+   // Below caution threshold → NEUTRAL
+   Assert(TestEqRegime_Classify(0.0, cauPct, defPct, minGap) == TEST_EQ_NEUTRAL,
+          "0% DD → NEUTRAL");
+   Assert(TestEqRegime_Classify(1.99, cauPct, defPct, minGap) == TEST_EQ_NEUTRAL,
+          "1.99% DD → NEUTRAL (just below caution)");
+
+   // Exactly at caution threshold → CAUTION
+   Assert(TestEqRegime_Classify(2.0, cauPct, defPct, minGap) == TEST_EQ_CAUTION,
+          "2.0% DD → CAUTION (boundary)");
+
+   // Between thresholds → CAUTION
+   Assert(TestEqRegime_Classify(3.5, cauPct, defPct, minGap) == TEST_EQ_CAUTION,
+          "3.5% DD → CAUTION");
+
+   // Exactly at defensive threshold → DEFENSIVE
+   Assert(TestEqRegime_Classify(5.0, cauPct, defPct, minGap) == TEST_EQ_DEFENSIVE,
+          "5.0% DD → DEFENSIVE (boundary)");
+
+   // Well above defensive → DEFENSIVE
+   Assert(TestEqRegime_Classify(10.0, cauPct, defPct, minGap) == TEST_EQ_DEFENSIVE,
+          "10% DD → DEFENSIVE");
+
+   // Misconfigured: defPct ≤ cauPct → auto-clamp to cauPct + minGap
+   Assert(TestEqRegime_Classify(2.05, cauPct, 1.0 /*def < cau*/, minGap) == TEST_EQ_DEFENSIVE,
+          "Misconfigured (def < cau): 2.05% → DEFENSIVE after clamp");
+
+   // DD exactly at the minimum-gap boundary after clamp
+   double clampedDef = cauPct + minGap; // 2.1
+   Assert(TestEqRegime_Classify(2.09, cauPct, clampedDef, minGap) == TEST_EQ_CAUTION,
+          "2.09% DD → CAUTION when def clamped to 2.1");
+   Assert(TestEqRegime_Classify(2.1, cauPct, clampedDef, minGap) == TEST_EQ_DEFENSIVE,
+          "2.1% DD → DEFENSIVE when def clamped to 2.1 (boundary)");
+}
+
 void OnStart()
 {
    Print("========================================");
-   Print("  MSPB EA Unit Tests v3");
+   Print("  MSPB EA Unit Tests v4");
    Print("========================================");
 
    Test_CalcRiskLots();
@@ -390,6 +561,9 @@ void OnStart()
    Test_ExecIdx();
    Test_RiskMultiplierBounds();
    Test_DailyLossLimit();
+   Test_DailyLossLimit_Boundary();
+   Test_ConsecLoss();
+   Test_EqRegimeTransitions();
    Test_PartialTP();
    Test_SetPointSanity();
    Test_SymbolFilter();

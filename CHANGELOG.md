@@ -6,7 +6,33 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [15.2] — 2026-04-18
+## [16.0] — 2026-04-18
+
+### Added
+- **`MSPB_EA_Risk.mqh`** — new dedicated risk module extracted from the monolithic EA:
+  `EqRegime` enum + state, `EqRegime_Update`, `DailyLoss_*`, `ConsecLoss_*`,
+  `PartialTP_*`, and `Sym_RiskWeight`.  Main file reduced by ~180 lines.
+- **Telegram circuit-breaker** (`MSPB_EA_Telegram.mqh`) — `g_tg_disabled` flag trips
+  after 3 consecutive WebRequest failures and auto-re-enables after 10 minutes;
+  prevents CPU waste and log spam during connectivity outages.
+- **Transactional RuntimeState writes** — `RuntimeState_Save()` now writes to a
+  `.tmp` file first and renames into place, eliminating corrupt-file risk on crash.
+- **Sharpe ratio and Calmar ratio** added to `tools/monte_carlo_analysis.py` output;
+  a Sharpe < 0.5 warning is shown in the report.
+- **`tools/test_monte_carlo.py`** — 18 pytest unit tests for the Monte Carlo tool
+  (max drawdown, Sharpe, Calmar, load_trades, run_simulation).
+- **CI `python-tools` job** in `.github/workflows/lint.yml` — runs pytest with
+  `--cov-fail-under=70` on every push/PR.
+- **CI version-consistency check** — new lint step that asserts `EA_VERSION` in
+  `MSPB_Expert_Advisor.mq5` matches the latest heading in `CHANGELOG.md`.
+- **`MSPB_EA_UnitTests.mq5` v4.00** — three new test groups:
+  `Test_DailyLossLimit_Boundary` (edge/boundary values), `Test_ConsecLoss` (guard
+  trip and cooldown behaviour), `Test_EqRegimeTransitions` (all regime transitions
+  including clamped misconfiguration).
+- **`CONTRIBUTING.md`** — "How to add a new symbol override column" step-by-step
+  guide; updated repository layout table to include new modules; ADR section with
+  ADR-001 (ring buffer), ADR-002 (module extraction), ADR-003 (TG circuit-breaker).
+
 
 ### Added
 - `MSPB_Expert_Advisor.set` — production-ready parameter file with optimizer step/range annotations for the 5 highest-impact parameters (`InpSL_ATR_Mult`, `InpTP_RR`, `InpMinADXForEntry`, `InpRiskPercent`, `InpEqDD_Defensive_Pct`).

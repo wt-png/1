@@ -114,3 +114,48 @@ jobs:
             echo "FAIL: main EA file exceeds ${MAX_EA_LINES} lines ($lines). Extract modules."
             exit 1
           fi
+
+      # ---------------------------------------------------------------
+      # 7. Semantic version consistency: EA_VERSION in the .mq5 file
+      #    must match the latest version heading in CHANGELOG.md.
+      #    CHANGELOG format expected: ## [x.y] — YYYY-MM-DD
+      # ---------------------------------------------------------------
+      - name: Check EA_VERSION matches CHANGELOG.md
+        run: |
+          ea_ver=$(grep -oP '(?<=#define EA_VERSION ")[\d.]+' MSPB_Expert_Advisor.mq5 | head -1)
+          cl_ver=$(grep -oP '(?<=## \[)[\d.]+(?=\])' CHANGELOG.md | head -1)
+          echo "EA_VERSION in .mq5  : $ea_ver"
+          echo "Latest in CHANGELOG : $cl_ver"
+          if [ "$ea_ver" != "$cl_ver" ]; then
+            echo "FAIL: EA_VERSION ($ea_ver) does not match latest CHANGELOG entry ($cl_ver)."
+            echo "Update EA_VERSION in MSPB_Expert_Advisor.mq5 or add a new CHANGELOG entry."
+            exit 1
+          fi
+
+  python-tools:
+    name: Python tools — lint and test coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+
+      # ---------------------------------------------------------------
+      # Run unit tests for the Python tools with coverage reporting.
+      # A minimum coverage threshold keeps regressions from going
+      # unnoticed as the tool suite grows.
+      # ---------------------------------------------------------------
+      - name: Run Python tests with coverage
+        run: |
+          pytest tools/ --cov=tools --cov-report=term-missing --cov-fail-under=70 -v
+        continue-on-error: false
