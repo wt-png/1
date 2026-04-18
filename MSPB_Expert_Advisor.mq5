@@ -494,6 +494,8 @@ input double   InpExecQual_MaxBadFillRate      = 0.35;
 input double   InpExecQual_SpreadAvgMult       = 2.5;
 input int      InpExecQual_BlockCooldownSec    = 120;
 input int      InpExecQual_TelegramCooldownSec = 120;
+input bool     InpExecQual_Persist            = true;   // Save/load ExecQual baselines across restarts
+input string   InpExecQual_PersistFile        = "MSPB_ExecQual_State.csv"; // Persistence file
 input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
 
 // --- SL/TP
@@ -623,6 +625,16 @@ input int      InpDSP_MinHoldBars         = 3; // NEW: avoid closing too early d
 input bool     InpEnableTelegram          = false;
 input string   InpTGMessagePrefix         = "EA";
 input bool     InpTGEnableIncoming        = false;   // Incoming commands are not implemented in this build.
+
+// --- Daily Telegram performance report
+input bool     InpTGDailyReport           = true;    // Send daily performance summary via Telegram
+input int      InpTGDailyReportHour       = 0;       // Server hour to send daily report (0 = midnight)
+input int      InpTGDailyReportMinute     = 5;       // Server minute to send daily report
+
+// --- Incoming Telegram commands
+input bool     InpTGIncomingEnable        = false;   // Enable incoming Telegram commands
+input string   InpTGIncomingSecret        = "";      // Secret prefix required for commands
+input int      InpTGPollIntervalSec       = 30;      // How often to poll for new messages (seconds)
 
 // Telegram credentials are loaded from a config file (avoid keeping secrets in Inputs/code).
 // Place the file in:  MQL5\\Files\\  (or enable InpTGConfig_UseCommonFolder to use the common folder).
@@ -1216,6 +1228,14 @@ double   g_execWorstSlip[64][EXEC_QUAL_BUCKETS];
 datetime g_execLastEntryIntent[64];
 datetime g_execBlockUntil[64];
 datetime g_execQualLastTG=0;
+datetime g_execQual_lastSave=0;  // Feature 4A: last ExecQual CSV save time
+
+// --- Feature 5A/5B state
+datetime g_lastDailyReport    = 0;
+long     g_tgLastUpdateId     = 0;
+datetime g_tgLastPollTime     = 0;
+bool     g_tradingPaused      = false;
+double   g_riskMultiplierOverride = 1.0;
 
 // --- Sanity mode runtime state (NEW)
 datetime g_startTime=0;       // EA start time for sanity warm-up
@@ -3819,6 +3839,300 @@ bool ExecQual_AllowsEntry(const int symIdx,
 }
 
 // -----------------------------------------
+// Feature 4A: ExecQual CSV persistence
+// -----------------------------------------
+void ExecQual_SaveState()
+{
+   if(!InpExecQual_Persist) return;
+   if(TrimStr(InpExecQual_PersistFile)=="") return;
+
+   int h = FileOpen(InpExecQual_PersistFile, FILE_WRITE|FILE_CSV|FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      Print("[ExecQual] SaveState: FileOpen failed err=", GetLastError());
+      return;
+   }
+   FileWrite(h, "sym", "bucket", "avgSpread", "avgSlip", "badRate", "samples");
+   for(int s=0; s<g_symCount; s++)
+   {
+      for(int b=0; b<EXEC_QUAL_BUCKETS; b++)
+      {
+         int n=0;
+         double avgSpread=0.0, avgSlip=0.0, worstSlip=0.0, badRate=0.0;
+         ExecQual_GetStats(s, b, n, avgSpread, avgSlip, worstSlip, badRate);
+         FileWrite(h, g_syms[s], b,
+                   DoubleToString(avgSpread,6),
+                   DoubleToString(avgSlip,6),
+                   DoubleToString(badRate,6),
+                   n);
+      }
+   }
+   FileClose(h);
+   g_execQual_lastSave = TimeCurrent();
+   if(InpDebug) Print("[ExecQual] State saved to ", InpExecQual_PersistFile);
+}
+
+bool ExecQual_LoadState()
+{
+   if(!InpExecQual_Persist) return false;
+   if(TrimStr(InpExecQual_PersistFile)=="") return false;
+
+   ResetLastError();
+   int h = FileOpen(InpExecQual_PersistFile, FILE_READ|FILE_CSV|FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      if(InpDebug) Print("[ExecQual] LoadState: file not found (", InpExecQual_PersistFile, "), starting fresh.");
+      return false;
+   }
+   // skip header row
+   if(!FileIsEnding(h))
+   {
+      for(int col=0; col<6; col++) FileReadString(h);
+   }
+   int loaded=0;
+   while(!FileIsEnding(h))
+   {
+      string symName = FileReadString(h);
+      string bucketStr = FileReadString(h);
+      string avgSpreadStr = FileReadString(h);
+      string avgSlipStr   = FileReadString(h);
+      string badRateStr   = FileReadString(h);
+      string samplesStr   = FileReadString(h);
+      if(symName=="") continue;
+      int bucket   = (int)StringToInteger(bucketStr);
+      double avgSp = StringToDouble(avgSpreadStr);
+      double avgSl = StringToDouble(avgSlipStr);
+      double badRt = StringToDouble(badRateStr);
+      int    nSamp = (int)StringToInteger(samplesStr);
+      if(bucket<0 || bucket>=EXEC_QUAL_BUCKETS) continue;
+      if(nSamp<=0) continue;
+      int symIdx = SymIndexByNameLoose(symName);
+      if(symIdx<0 || symIdx>=g_symCount) continue;
+      // Inject synthetic samples to seed baselines
+      int injectN = MathMin(nSamp, 5);
+      for(int i=0; i<injectN; i++)
+         ExecQual_AddSample(symIdx, bucket, avgSp, avgSl);
+      loaded++;
+   }
+   FileClose(h);
+   if(InpDebug) Print("[ExecQual] LoadState: loaded ", loaded, " bucket rows from ", InpExecQual_PersistFile);
+   return loaded>0;
+}
+
+// -----------------------------------------
+// Feature 5A: Daily Telegram Performance Report
+// -----------------------------------------
+void TG_SendDailyReport()
+{
+   if(!InpEnableTelegram || !TG_Config_IsReady()) return;
+
+   datetime now = TimeCurrent();
+   MqlDateTime dt; TimeToStruct(now, dt);
+
+   // Compute today's date range
+   MqlDateTime dayStart_dt; TimeToStruct(now, dayStart_dt);
+   dayStart_dt.hour=0; dayStart_dt.min=0; dayStart_dt.sec=0;
+   datetime todayStart = StructToTime(dayStart_dt);
+   datetime todayEnd   = now;
+
+   double totalPnl    = 0.0;
+   int    nWins       = 0;
+   int    nLosses     = 0;
+   double maxDDMoney  = 0.0;
+   double peakCum     = 0.0;
+   double cumPnl      = 0.0;
+   double pipsPnl     = 0.0;
+
+   if(HistorySelect(todayStart, todayEnd))
+   {
+      int nd = HistoryDealsTotal();
+      for(int i=0; i<nd; i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket==0) continue;
+         if(!IsMyMagic((long)HistoryDealGetInteger(ticket, DEAL_MAGIC))) continue;
+         long entry = (long)HistoryDealGetInteger(ticket, DEAL_ENTRY);
+         if(entry != DEAL_ENTRY_OUT) continue;
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                       + HistoryDealGetDouble(ticket, DEAL_SWAP)
+                       + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+         totalPnl += profit;
+         cumPnl   += profit;
+         if(cumPnl > peakCum) peakCum = cumPnl;
+         double dd = peakCum - cumPnl;
+         if(dd > maxDDMoney) maxDDMoney = dd;
+         if(profit >= 0.0) nWins++;
+         else              nLosses++;
+         // Approximate pips: use deal volume and symbol pip
+         string sym = HistoryDealGetString(ticket, DEAL_SYMBOL);
+         double vol = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+         double pip = PipSize(sym);
+         double tickSz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+         double tickVal = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+         if(tickSz>0.0 && tickVal>0.0 && vol>0.0 && pip>0.0)
+            pipsPnl += profit / (tickVal / tickSz * vol * pip);
+      }
+   }
+
+   int nTrades = nWins + nLosses;
+   double winRate = (nTrades>0 ? (double)nWins/nTrades*100.0 : 0.0);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double maxDDPct = (balance>0.0 ? maxDDMoney/balance*100.0 : 0.0);
+   int nPositions = PositionsTotal();
+
+   string msg = StringFormat(
+      "📊 Daily Report | %s\n"
+      "Total P&L: %.2f | Pips: %.1f\n"
+      "✅ Wins: %d | ❌ Losses: %d | Win%%: %.1f%%\n"
+      "Max Intraday DD: %.2f%%\n"
+      "Active positions: %d\n"
+      "Equity: %.2f | Balance: %.2f",
+      TimeToString(now, TIME_DATE),
+      totalPnl, pipsPnl,
+      nWins, nLosses, winRate,
+      maxDDPct,
+      nPositions,
+      equity, balance
+   );
+   TelegramSendMessage(msg, TGC_SYSTEM);
+}
+
+// -----------------------------------------
+// Feature 5B: Incoming Telegram Commands
+// -----------------------------------------
+void TG_CloseAllPositions()
+{
+   CTrade trade;
+   trade.SetExpertMagicNumber((ulong)InpMagic);
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket==0) continue;
+      if(!IsMyMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
+      trade.PositionClose(ticket);
+   }
+}
+
+void TG_HandleCommand(const string rawText)
+{
+   string text = rawText;
+   // Strip secret prefix if configured
+   if(TrimStr(InpTGIncomingSecret)!="" &&
+      StringFind(text, InpTGIncomingSecret)==0)
+      text = TrimStr(StringSubstr(text, StringLen(InpTGIncomingSecret)));
+   else if(TrimStr(InpTGIncomingSecret)!="")
+      return; // secret not present, ignore
+
+   string tl = text;
+   StringToLower(tl);
+
+   if(StringFind(tl, "/status")==0)
+   {
+      double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+      double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+      int nPos = PositionsTotal();
+      string regime = (g_tradingPaused ? "PAUSED" : "ACTIVE");
+      double ddPct = (g_dayStartBalance>0.0 ?
+                      (g_dayStartBalance - eq)/g_dayStartBalance*100.0 : 0.0);
+      string status = StringFormat(
+         "📊 Status\nRegime: %s\nEquity: %.2f | Balance: %.2f\n"
+         "Positions: %d | Daily DD: %.2f%%\n"
+         "RiskMult: %.2f",
+         regime, eq, bal, nPos, ddPct, g_riskMultiplierOverride);
+      TelegramSendMessage(status, TGC_SYSTEM);
+   }
+   else if(StringFind(tl, "/pause")==0)
+   {
+      g_tradingPaused = true;
+      TelegramSendMessage("⏸ Trading PAUSED via Telegram command.", TGC_SYSTEM);
+   }
+   else if(StringFind(tl, "/resume")==0)
+   {
+      g_tradingPaused = false;
+      TelegramSendMessage("▶️ Trading RESUMED via Telegram command.", TGC_SYSTEM);
+   }
+   else if(StringFind(tl, "/risk ")==0)
+   {
+      string valStr = TrimStr(StringSubstr(text, 6));
+      double mult = StringToDouble(valStr);
+      if(mult > 0.0 && mult <= 10.0)
+      {
+         g_riskMultiplierOverride = mult;
+         TelegramSendMessage(StringFormat("⚙️ Risk multiplier set to %.2f", mult), TGC_SYSTEM);
+      }
+      else
+         TelegramSendMessage("⚠️ Invalid /risk value. Use /risk <0.1..10>", TGC_SYSTEM);
+   }
+   else if(StringFind(tl, "/close all")==0)
+   {
+      TG_CloseAllPositions();
+      TelegramSendMessage("🔴 Close all positions command executed.", TGC_SYSTEM);
+   }
+}
+
+void TG_PollCommands()
+{
+   if(!InpTGIncomingEnable) return;
+   if(!InpEnableTelegram || !TG_Config_IsReady()) return;
+
+   datetime now = TimeCurrent();
+   int pollSec = MathMax(5, InpTGPollIntervalSec);
+   if(g_tgLastPollTime>0 && (now - g_tgLastPollTime) < pollSec) return;
+   g_tgLastPollTime = now;
+
+   string url = StringFormat(
+      "https://api.telegram.org/bot%s/getUpdates?offset=%I64d&limit=10&timeout=0",
+      g_tgBotToken, g_tgLastUpdateId + 1);
+
+   uchar post_dummy[]; ArrayResize(post_dummy, 0);
+   uchar result[];
+   string result_headers = "";
+   ResetLastError();
+   int http = WebRequest("GET", url, "", InpTGTimeoutMS, post_dummy, result, result_headers);
+   if(http == -1) { return; }
+   if(http != 200) { return; }
+
+   string resp = CharArrayToString(result, 0, -1, CP_UTF8);
+   if(StringFind(resp, "\"ok\":true") < 0) return;
+
+   // Simple text extraction loop
+   int searchPos = 0;
+   while(true)
+   {
+      // Find update_id
+      int p = StringFind(resp, "\"update_id\":", searchPos);
+      if(p < 0) break;
+      p += StringLen("\"update_id\":");
+      int pEnd = p;
+      while(pEnd < StringLen(resp) && StringGetCharacter(resp,pEnd)>='0' && StringGetCharacter(resp,pEnd)<='9') pEnd++;
+      long updateId = (long)StringToInteger(StringSubstr(resp, p, pEnd-p));
+      searchPos = pEnd;
+
+      if(updateId > g_tgLastUpdateId)
+         g_tgLastUpdateId = updateId;
+
+      // Find "text":" after this update_id position
+      int tp = StringFind(resp, "\"text\":\"", searchPos-20 < 0 ? 0 : searchPos-20);
+      // Ensure text belongs to this update (within next 500 chars)
+      if(tp < 0 || tp > pEnd + 500) continue;
+      tp += StringLen("\"text\":\"");
+      int tpEnd = tp;
+      while(tpEnd < StringLen(resp))
+      {
+         int ch = StringGetCharacter(resp, tpEnd);
+         if(ch == '"' && (tpEnd==0 || StringGetCharacter(resp, tpEnd-1)!='\\')) break;
+         tpEnd++;
+      }
+      string msgText = StringSubstr(resp, tp, tpEnd-tp);
+      if(msgText != "")
+         TG_HandleCommand(msgText);
+
+      searchPos = tpEnd;
+   }
+}
+
+// -----------------------------------------
 // Session / Spread checks
 // -----------------------------------------
 bool SessionAllows()
@@ -4601,6 +4915,40 @@ string BuildSuggestion(const SymPerf &st)
    return sug;
 }
 
+// -----------------------------------------
+// Feature 6B: Proposal → .set file writer
+// -----------------------------------------
+void WriteProposalSetFile(const string baseFileName)
+{
+   if(!InpProposalSaveToFile) return;
+   string setFileName = StripTxtExt(baseFileName) + ".set";
+   int flags = FILE_WRITE | FILE_ANSI;
+   if(InpProposalUseCommonFolder) flags |= FILE_COMMON;
+   int h = FileOpen(setFileName, flags);
+   if(h == INVALID_HANDLE)
+   {
+      Print("[Proposal] WriteProposalSetFile: cannot open ", setFileName, " err=", GetLastError());
+      return;
+   }
+   FileWriteString(h, "; Auto-generated by MSPB EA\r\n");
+   FileWriteString(h, StringFormat("InpMagic=%d||0||0||99999999||N\r\n",          (int)InpMagic));
+   FileWriteString(h, StringFormat("InpRiskPercent=%.2f||0||0||5.0||N\r\n",       InpRiskPercent));
+   FileWriteString(h, StringFormat("InpMinADXForEntry=%.1f||0||0||50.0||N\r\n",   InpMinADXForEntry));
+   FileWriteString(h, StringFormat("InpMinADXEntryFilter=%.1f||0||0||50.0||N\r\n",InpMinADXEntryFilter));
+   FileWriteString(h, StringFormat("InpMinATR_Pips=%.2f||0||0||50.0||N\r\n",      InpMinATR_Pips));
+   FileWriteString(h, StringFormat("InpMinBodyPips=%.2f||0||0||20.0||N\r\n",      InpMinBodyPips));
+   FileWriteString(h, StringFormat("InpTP_RR=%.2f||0||0||5.0||N\r\n",             InpTP_RR));
+   FileWriteString(h, StringFormat("InpSL_ATR_Mult=%.2f||0||0||5.0||N\r\n",       InpSL_ATR_Mult));
+   FileWriteString(h, StringFormat("InpADX_Asia=%.1f||0||0||50.0||N\r\n",         InpADX_Asia));
+   FileWriteString(h, StringFormat("InpADX_London=%.1f||0||0||50.0||N\r\n",       InpADX_London));
+   FileWriteString(h, StringFormat("InpADX_NY=%.1f||0||0||50.0||N\r\n",           InpADX_NY));
+   FileWriteString(h, StringFormat("InpATR_Min_Asia=%.4f||0||0||0.01||N\r\n",     InpATR_Min_Asia));
+   FileWriteString(h, StringFormat("InpATR_Min_London=%.4f||0||0||0.01||N\r\n",   InpATR_Min_London));
+   FileWriteString(h, StringFormat("InpATR_Min_NY=%.4f||0||0||0.01||N\r\n",       InpATR_Min_NY));
+   FileClose(h);
+   Print("[Proposal] .set file written: ", setFileName);
+}
+
 void GenerateTradeCountProposal()
 {
    int need = InpProposalClosedTradesTrigger;
@@ -4788,6 +5136,8 @@ void GenerateTradeCountProposal()
          Print("AUTO PROPOSAL: Kon rapport niet wegschrijven (FileOpen failed). Check rechten/FILE_COMMON.");
       else
          Print(StringFormat("AUTO PROPOSAL: Rapport opgeslagen naar %s (%s)", InpProposalFileName, (InpProposalUseCommonFolder?"Common\\Files":"MQL5\\Files")));
+
+      WriteProposalSetFile(InpProposalFileName);
    }
 }
 
@@ -6341,6 +6691,13 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
+   // Feature 5B: trading pause via Telegram command
+   if(g_tradingPaused)
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
    // 3C: daily loss limit guard
    if(DailyLoss_IsTripped())
    {
@@ -7339,6 +7696,9 @@ int OnInit()
    ArrayInitialize(g_execBadHist,    0);
    ArrayInitialize(g_tgLastSendTime, 0);
 
+   // Feature 4A: load ExecQual baselines from CSV if available
+   ExecQual_LoadState();
+
    // timer
    EventSetTimer(MathMax(1, InpTimerSec));
 
@@ -7360,6 +7720,9 @@ void OnDeinit(const int reason)
    DashClear();
    ML_Close();
    Audit_Close();
+
+   // Feature 4A: persist ExecQual baselines
+   ExecQual_SaveState();
 
    // tune state save (v11)
    if(InpTune_Enable) TuneState_Save();
@@ -7566,6 +7929,32 @@ void OnTimer()
    // Optional hot-reload of Telegram config (also used by queue processor).
    TG_Config_UpdateIfDue(false);
    TelegramQueue_Process();
+
+   // Feature 4A: periodic ExecQual state save (every 30 minutes)
+   if(InpExecQual_Persist)
+   {
+      datetime now_timer = TimeCurrent();
+      if(g_execQual_lastSave==0 || (now_timer - g_execQual_lastSave) >= 1800)
+         ExecQual_SaveState();
+   }
+
+   // Feature 5A: daily Telegram performance report
+   if(InpTGDailyReport && InpEnableTelegram)
+   {
+      datetime now_dr = TimeCurrent();
+      MqlDateTime dt_dr; TimeToStruct(now_dr, dt_dr);
+      MqlDateTime last_dr; TimeToStruct(g_lastDailyReport, last_dr);
+      bool sameDay = (g_lastDailyReport>0 && last_dr.day==dt_dr.day &&
+                      last_dr.mon==dt_dr.mon && last_dr.year==dt_dr.year);
+      if(!sameDay && dt_dr.hour==InpTGDailyReportHour && dt_dr.min==InpTGDailyReportMinute)
+      {
+         TG_SendDailyReport();
+         g_lastDailyReport = now_dr;
+      }
+   }
+
+   // Feature 5B: poll incoming Telegram commands
+   TG_PollCommands();
 }
 
 // -----------------------------------------
