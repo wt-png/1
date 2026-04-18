@@ -101,11 +101,11 @@ bool TG_Config_Load()
    // Security check: warn when the config file resides in a path that is
    // accessible to other programs (MetaTrader "Common" shared folder).
    // Tokens stored in a shared location can be read by any process on the machine.
+   // Normalise separators to '/' first so a single StringFind covers both platforms.
    string cfgLower = InpTGConfigFile;
    StringToLower(cfgLower);
-   if(StringFind(cfgLower, "\\shared\\") >= 0 ||
-      StringFind(cfgLower, "/shared/")  >= 0 ||
-      InpTGConfig_UseCommonFolder)
+   StringReplace(cfgLower, "\\", "/");
+   if(StringFind(cfgLower, "/shared/") >= 0 || InpTGConfig_UseCommonFolder)
    {
       Print("[SECURITY WARNING] TG config file is in a shared/common folder (",
             InpTGConfigFile, "). "

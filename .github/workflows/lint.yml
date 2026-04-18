@@ -48,12 +48,13 @@ jobs:
 
       # ---------------------------------------------------------------
       # 2. No stray debug Print() calls that contain known debug-only
-      #    markers that should never reach production code.
+      #    markers.  The pattern matches any Print call whose message
+      #    *contains* [DEBUG] or [TEST] anywhere in the string.
       # ---------------------------------------------------------------
       - name: Check for debug-only markers
         run: |
           fail=0
-          # Pattern: Print( calls whose message starts with [DEBUG] or [TEST]
+          # Reject Print() calls whose message string contains [DEBUG] or [TEST].
           if grep -rn 'Print.*"\[DEBUG\]\|Print.*"\[TEST\]' *.mq5 *.mqh 2>/dev/null; then
             echo "FAIL: debug-only Print() markers found (see above)"
             fail=1

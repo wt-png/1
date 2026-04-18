@@ -2840,13 +2840,19 @@ void EqRegime_Update()
 
    double cauPct = MathMax(0.1, InpEqDD_Caution_Pct);
    double defPct = MathMax(cauPct + EQ_DD_MIN_THRESHOLD_GAP, InpEqDD_Defensive_Pct);
-   // warn once if Defensive threshold was clamped (user misconfiguration: Defensive <= Caution)
+   // warn once if Defensive threshold was clamped (user misconfiguration:
+   // Defensive <= Caution or gap < EQ_DD_MIN_THRESHOLD_GAP)
    static bool s_warnedDefClamp = false;
-   if(!s_warnedDefClamp && InpEqDD_Defensive_Pct <= InpEqDD_Caution_Pct)
+   if(!s_warnedDefClamp &&
+      (InpEqDD_Defensive_Pct <= InpEqDD_Caution_Pct ||
+       (InpEqDD_Defensive_Pct - InpEqDD_Caution_Pct) < EQ_DD_MIN_THRESHOLD_GAP))
    {
       s_warnedDefClamp = true;
-      PrintFormat("[EqRegime] WARNING: InpEqDD_Defensive_Pct (%.2f) <= InpEqDD_Caution_Pct (%.2f). Defensive threshold auto-clamped to %.2f%%.",
-                  InpEqDD_Defensive_Pct, InpEqDD_Caution_Pct, defPct);
+      PrintFormat("[EqRegime] WARNING: InpEqDD_Defensive_Pct (%.2f) is too close to or below "
+                  "InpEqDD_Caution_Pct (%.2f) (min gap %.2f%%). "
+                  "Defensive threshold auto-clamped to %.2f%%.",
+                  InpEqDD_Defensive_Pct, InpEqDD_Caution_Pct,
+                  EQ_DD_MIN_THRESHOLD_GAP, defPct);
    }
 
    if(ddPct < cauPct)       g_eqRegime = EQ_NEUTRAL;

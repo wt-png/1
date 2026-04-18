@@ -3,6 +3,7 @@
 Monte Carlo simulation for MSPB EA trade sequence analysis.
 Usage: python3 monte_carlo_analysis.py <trades_csv_file> [--iterations 10000]
                                        [--confidence 95] [--risk-pct 1.0]
+                                       [--starting-equity 10000] [--ruin-threshold 0.5]
 
 Input CSV format (from EA ml_export_v2.csv or a custom trades file):
   time,symbol,direction,profit_r (profit in R-multiples)

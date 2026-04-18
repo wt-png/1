@@ -187,6 +187,92 @@ void Test_DailyLossLimit()
    Assert(loss3 > limitAbs, "1000 loss > 300 limit: tripped");
 }
 
+// ---- Partial-TP ring buffer (inline re-implementation for test isolation) ----
+// Mirrors the three helpers in MSPB_Expert_Advisor.mq5 exactly, with a
+// configurable capacity so edge-case (full buffer) scenarios can be forced.
+#define TEST_PARTIAL_TP_CAP 4
+ulong  g_testTpTick[TEST_PARTIAL_TP_CAP];
+int    g_testTpN = 0;
+
+bool TestPartialTP_AlreadyDone(const ulong ticket)
+{
+   for(int i = 0; i < g_testTpN; i++)
+      if(g_testTpTick[i] == ticket) return true;
+   return false;
+}
+
+void TestPartialTP_MarkDone(const ulong ticket)
+{
+   if(g_testTpN < TEST_PARTIAL_TP_CAP)
+      g_testTpTick[g_testTpN++] = ticket;
+   // silently drop when full — mirrors EA behaviour
+}
+
+void TestPartialTP_Remove(const ulong ticket)
+{
+   for(int i = 0; i < g_testTpN; i++)
+   {
+      if(g_testTpTick[i] == ticket)
+      {
+         g_testTpTick[i] = g_testTpTick[--g_testTpN];
+         return;
+      }
+   }
+}
+
+void TestPartialTP_Reset()
+{
+   g_testTpN = 0;
+   ArrayInitialize(g_testTpTick, 0);
+}
+
+void Test_PartialTP()
+{
+   PrintFormat("--- PartialTP ring buffer ---");
+   TestPartialTP_Reset();
+
+   // Empty buffer: ticket not present
+   Assert(!TestPartialTP_AlreadyDone(100), "Empty buffer: ticket 100 not done");
+
+   // Mark and detect
+   TestPartialTP_MarkDone(100);
+   Assert(TestPartialTP_AlreadyDone(100),  "After MarkDone: ticket 100 is done");
+   Assert(!TestPartialTP_AlreadyDone(200), "Ticket 200 still not done");
+
+   // Remove and verify
+   TestPartialTP_Remove(100);
+   Assert(!TestPartialTP_AlreadyDone(100), "After Remove: ticket 100 no longer done");
+
+   // Multiple tickets
+   TestPartialTP_MarkDone(1); TestPartialTP_MarkDone(2); TestPartialTP_MarkDone(3);
+   Assert(TestPartialTP_AlreadyDone(1), "Multi: ticket 1 done");
+   Assert(TestPartialTP_AlreadyDone(2), "Multi: ticket 2 done");
+   Assert(TestPartialTP_AlreadyDone(3), "Multi: ticket 3 done");
+
+   // Remove middle element (swap-with-last pattern)
+   TestPartialTP_Remove(2);
+   Assert(!TestPartialTP_AlreadyDone(2), "After removing middle ticket 2: gone");
+   Assert(TestPartialTP_AlreadyDone(1),  "Ticket 1 still present after removing 2");
+   Assert(TestPartialTP_AlreadyDone(3),  "Ticket 3 still present after removing 2");
+
+   // Remove from a ticket that is not in the list (no-op)
+   int nBefore = g_testTpN;
+   TestPartialTP_Remove(999);
+   Assert(g_testTpN == nBefore, "Remove non-existent ticket: count unchanged");
+
+   // Duplicate MarkDone does not crash (ticket already present, just add again)
+   TestPartialTP_MarkDone(1);
+   Assert(g_testTpN == nBefore + 1, "Duplicate MarkDone increments count (no dedup in ring)");
+
+   // Full-buffer edge case: at capacity, further MarkDone is silently dropped
+   TestPartialTP_Reset();
+   for(int f = 0; f < TEST_PARTIAL_TP_CAP; f++) TestPartialTP_MarkDone((ulong)(10 + f));
+   Assert(g_testTpN == TEST_PARTIAL_TP_CAP, "Buffer full: count equals capacity");
+   TestPartialTP_MarkDone(999);  // should be silently dropped
+   Assert(g_testTpN == TEST_PARTIAL_TP_CAP, "Full buffer: overflow ticket silently dropped");
+   Assert(!TestPartialTP_AlreadyDone(999), "Full buffer: dropped ticket not marked as done");
+}
+
 // ---- Main ----
 
 void OnStart()
@@ -201,6 +287,7 @@ void OnStart()
    Test_ExecIdx();
    Test_RiskMultiplierBounds();
    Test_DailyLossLimit();
+   Test_PartialTP();
 
    Print("========================================");
    PrintFormat("  Results: %d passed, %d failed", g_testsPassed, g_testsFailed);
