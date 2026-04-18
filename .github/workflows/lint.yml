@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: ["**"]
 
+# Minimal permissions — this workflow only reads repository contents.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint MQL5 source files
     runs-on: ubuntu-latest
+
+    env:
+      # Alert when the main EA file grows beyond this many lines.
+      # The threshold keeps the monolithic file manageable after module extraction.
+      MAX_EA_LINES: 10000
 
     steps:
       - name: Checkout
@@ -93,14 +102,14 @@ jobs:
 
       # ---------------------------------------------------------------
       # 6. File-size guard: warn when the main EA file grows beyond
-      #    10 000 lines (indicates that extracted modules are drifting
-      #    back into the monolithic file).
+      #    MAX_EA_LINES lines (indicates that extracted modules are
+      #    drifting back into the monolithic file).
       # ---------------------------------------------------------------
       - name: Check main EA file line count
         run: |
           lines=$(wc -l < MSPB_Expert_Advisor.mq5)
           echo "MSPB_Expert_Advisor.mq5: $lines lines"
-          if [ "$lines" -gt 10000 ]; then
-            echo "FAIL: main EA file exceeds 10 000 lines ($lines). Extract modules."
+          if [ "$lines" -gt "$MAX_EA_LINES" ]; then
+            echo "FAIL: main EA file exceeds ${MAX_EA_LINES} lines ($lines). Extract modules."
             exit 1
           fi

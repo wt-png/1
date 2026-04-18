@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Monte Carlo simulation for MSPB EA trade sequence analysis.
-Usage: python3 monte_carlo_analysis.py <trades_csv_file> [--iterations 10000] [--confidence 95]
+Usage: python3 monte_carlo_analysis.py <trades_csv_file> [--iterations 10000]
+                                       [--confidence 95] [--risk-pct 1.0]
 
 Input CSV format (from EA ml_export_v2.csv or a custom trades file):
   time,symbol,direction,profit_r (profit in R-multiples)
@@ -57,8 +58,19 @@ def run_simulation(
     iterations: int = 10000,
     confidence: float = 95.0,
     ruin_threshold: float = 0.5,
+    risk_pct: float = 1.0,
 ) -> dict:
-    """Run Monte Carlo by reshuffling the trade sequence."""
+    """Run Monte Carlo by reshuffling the trade sequence.
+
+    Args:
+        trades: List of trade results expressed as R-multiples.
+        starting_equity: Starting account balance for each simulation path.
+        iterations: Number of Monte Carlo paths to simulate.
+        confidence: Confidence level for percentile reporting (0-100).
+        ruin_threshold: Fraction of starting equity below which a path is
+            considered a ruin event (default 0.5 = 50% drawdown).
+        risk_pct: Percentage of starting equity risked per trade (default 1.0).
+    """
     final_equities = []
     max_drawdowns = []
     ruin_count = 0
@@ -68,7 +80,7 @@ def run_simulation(
         shuffled = random.sample(trades, n)
         eq = [starting_equity]
         for r in shuffled:
-            eq.append(eq[-1] + r * (starting_equity * 0.01))  # 1% risk per trade
+            eq.append(eq[-1] + r * (starting_equity * risk_pct / 100.0))
         final_equities.append(eq[-1])
         dd = max_drawdown(eq)
         max_drawdowns.append(dd)
@@ -143,6 +155,8 @@ def main():
     parser.add_argument("--confidence", type=float, default=95.0)
     parser.add_argument("--starting-equity", type=float, default=10000.0)
     parser.add_argument("--ruin-threshold", type=float, default=0.5)
+    parser.add_argument("--risk-pct", type=float, default=1.0,
+                        help="Percentage of starting equity risked per trade (default: 1.0)")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -164,6 +178,7 @@ def main():
         iterations=args.iterations,
         confidence=args.confidence,
         ruin_threshold=args.ruin_threshold,
+        risk_pct=args.risk_pct,
     )
     print_report(result)
 

@@ -7,6 +7,11 @@
 // Messages older than this are silently discarded to prevent replay attacks.
 #define TG_MAX_MSG_AGE_SEC 120
 
+// Backward search window (characters) when locating the "date" field relative
+// to the update_id end position.  Mirrors TG_JSON_TEXT_SEARCH_WINDOW in the main
+// file but is defined here because this module owns the polling loop.
+#define TG_JSON_DATE_SEARCH_WINDOW 200
+
 // -----------------------------------------
 // Telegram (Bot API via WebRequest)
 // -----------------------------------------
@@ -625,7 +630,9 @@ void TG_PollCommands()
 
       // --- Replay-attack guard ---
       // Extract message.date (Unix timestamp) and reject stale messages.
-      long msgDate = JsonGetLong(resp, "date", searchPos - 200 < 0 ? 0 : searchPos - 200);
+      long msgDate = JsonGetLong(resp, "date",
+                                 searchPos - TG_JSON_DATE_SEARCH_WINDOW < 0
+                                    ? 0 : searchPos - TG_JSON_DATE_SEARCH_WINDOW);
       if(msgDate != JSON_LONG_NOT_FOUND && msgDate > 0)
       {
          long ageSec = (long)now - msgDate;

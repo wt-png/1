@@ -284,8 +284,10 @@ void ExecQual_AdaptThresholds()
    double lr         = MathMax(0.0, MathMin(1.0, InpExecQual_LearnRate));
    int    w          = ExecQual_WindowSize();
 
-   // Pre-allocate to the theoretical maximum to avoid O(n²) ArrayResize inside the loop.
-   int maxSamples = MAX_SYMBOLS * w;
+   // Pre-allocate to the actual tracked symbols count (not the theoretical MAX_SYMBOLS
+   // ceiling) to avoid unnecessary memory use while still avoiding O(n²) ArrayResize.
+   int maxSamples = g_symCount * w;
+   if(maxSamples <= 0) return;   // no symbols loaded yet
    double spreadArr[];
    double slipArr[];
    ArrayResize(spreadArr, maxSamples);
