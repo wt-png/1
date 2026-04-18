@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.7 hotfix: Setup2 only if Setup1 fails by BreakPrev (TREND-only). ML-export CSV (v2 schema), News-aware trailing (no API) w/ rollover ignore, Equity-curve regime filter (DD in R), correlation-guard w/ per-bar cache, Telegram queue+rate limit, broker stops/freeze safe, exact exit logging via HistoryDeal queue. Trades EURUSD/GBPUSD/CUCUSD/XAUUSD (suffix ok)."
+#property description "MultiSymbol Pullback Scalper: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -21,6 +21,10 @@
    #define FILE_SHARE_READ 0
 #endif
 // --------------------------------------------------------------------------------
+
+// Maximum number of symbols the EA tracks simultaneously.
+// Raise this value if you need more than 64 instruments.
+#define MAX_SYMBOLS 64
 
 // Read a full line from a FILE_TXT handle (safe when fields contain spaces).
 bool FileReadLineTxt(const int handle, string &line)
@@ -45,7 +49,7 @@ bool FileReadLineTxt(const int handle, string &line)
    return true;
 }
 
-// v14.7 hotfix summary:
+// Changelog:
 // 1) News CSV: throttle reload attempts when cache file missing + robust line reading (spaces safe)
 // 2) BreakPrev: only count rejection when Setup2 fallback is not used
 // 3) ManagePositions: pip guards + iterate PositionsTotal()-1..0 (avoid skipping on closes)
@@ -62,8 +66,8 @@ bool FileReadLineTxt(const int handle, string &line)
 
 // --- Symbols / TF
 input string   InpSymbols                 = "EURUSD,GBPUSD,CUCUSD";
-input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M1;  // DATA mode: more signals
-input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_M5;  // DATA mode: faster confirm
+input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M1;  // entry timeframe
+input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_M5;  // confirmation timeframe
 
 
 // --- Optional: auto-resolve + per-symbol overrides (CSV in MQL5/Files)
@@ -143,8 +147,8 @@ input int      InpExecQual_LearnIntervalMin   = 60;    // Interval in minutes be
 input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
 
 // --- SL/TP
-input double   InpSL_ATR_Mult             = 1.2;  // DATA mode: slightly tighter SL for more turnover
-input double   InpTP_RR                   = 0.8;  // DATA mode: faster TP
+input double   InpSL_ATR_Mult             = 1.2;  // ATR multiplier for stop-loss
+input double   InpTP_RR                   = 0.8;  // risk:reward target
 
 // --- Partial take-profit (scale out at first target)
 input bool     InpTP_Partial_Enable       = false;
@@ -157,8 +161,8 @@ input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
 input double   InpMinATR_Pips             = 10.0;
 input bool     InpUseADXFilter            = true;
-input int      InpADX_Period              = 7;   // DATA mode: faster warm-up
-input int      InpATR_Period             = 7;   // DATA mode: ATR period (was hardcoded 14)
+input int      InpADX_Period              = 7;   // ADX period
+input int      InpATR_Period             = 7;   // ATR period
 input double   InpMinADXForEntry          = 20.0;
 input double   InpMinADXEntryFilter       = 20.0;
 input bool     InpUseBodyFilter           = false;
@@ -259,7 +263,7 @@ input bool     InpNewsFreezeBE            = true;
 input double   InpNewsSpike_MinATRPips     = 0.0;   // NEW: minimum ATR(pips) required for spike detection (0 => disabled)
 // --- Exits
 input bool     InpUseTimeStop             = true;
-input int      InpTimeStopBars            = 2;    // DATA mode: faster timeout on M1
+input int      InpTimeStopBars            = 2;    // max bars before time-stop
 input bool     InpUseProtectMode          = true;
 input bool     InpDSP_CloseWinnerBelowPipsIfNoSL = true;
 input double   InpDSP_CloseWinnerBelowPips = 3.0;
@@ -279,6 +283,7 @@ input int      InpTGDailyReportMinute     = 5;       // Server minute to send da
 input bool     InpTGIncomingEnable        = false;   // Enable incoming Telegram commands
 input string   InpTGIncomingSecret        = "";      // Secret prefix required for commands
 input int      InpTGPollIntervalSec       = 30;      // How often to poll for new messages (seconds)
+input double   InpMaxRiskMultiplier       = 3.0;     // Maximum allowed risk multiplier (Telegram /risk and dashboard)
 
 // Telegram credentials are loaded from a config file (avoid keeping secrets in Inputs/code).
 // Place the file in:  MQL5\\Files\\  (or enable InpTGConfig_UseCommonFolder to use the common folder).
@@ -372,13 +377,14 @@ input int      InpSanityMode_Seconds       = 15;     // disable spike/trailing a
 // --- Debug / Dashboard
 input bool     InpDebug                   = true;
 input bool     InpShowDashboard           = true;
-input bool     InpShowRejHeatmap          = false;  // 8B: show per-hour rejection heatmap on dashboard
-input bool     InpDashButtons             = false; // Show interactive Pause/Resume/Risk buttons on dashboard
+input bool     InpShowRejHeatmap          = false;  // show per-hour rejection heatmap on dashboard
+input bool     InpDashButtons             = false;  // Show interactive Pause/Resume/Risk buttons on dashboard
+input string   InpRuntimeStatePersistFile = "MSPB_RuntimeState.csv"; // Persist g_tradingPaused and g_riskMultiplierOverride across restarts
 
 
 
 
-// --- Tester / robustness / diagnostics (NEW v12)
+// --- Tester / robustness / diagnostics
 input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% spread stress (affects spread checks + deviation only)
 input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
@@ -415,7 +421,7 @@ enum RejectReason
    REJ_BIAS_FAIL,
    REJ_CORR_GUARD,
    REJ_VOL_REGIME,
-   REJ_COOLDOWN,    // NEW v10
+   REJ_COOLDOWN,
    REJ_FAILSAFE,     // NEW
    REJ_MAX
 };
@@ -425,14 +431,14 @@ string g_rejNames[REJ_MAX] = {
 };
 
 int g_rejCounts[REJ_MAX];
-int g_rejCountsSym[64][REJ_MAX];
+int g_rejCountsSym[MAX_SYMBOLS][REJ_MAX];
 int g_rejHour[24];   // 8B: per-hour rejection counts
 
 void IncReject(const int symIdx, const RejectReason rr)
 {
    if(rr<=REJ_NONE || rr>=REJ_MAX) return;
    g_rejCounts[rr]++;
-   if(symIdx>=0 && symIdx<64) g_rejCountsSym[symIdx][rr]++;
+   if(symIdx>=0 && symIdx<MAX_SYMBOLS) g_rejCountsSym[symIdx][rr]++;
    // 8B: track rejection by hour
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    int h = dt.hour;
@@ -440,7 +446,7 @@ void IncReject(const int symIdx, const RejectReason rr)
 }
 
 // --- Symbol handling
-string g_syms[64];
+string g_syms[MAX_SYMBOLS];
 int    g_symCount=0;
 
 // --- Per-cycle tick cache (micro-perf)
@@ -453,7 +459,7 @@ struct SymTickCache
    double ask;
    bool   valid;
 };
-SymTickCache g_tickCache[64];
+SymTickCache g_tickCache[MAX_SYMBOLS];
 
 // --- Fail-safe runtime state (NEW)
 bool     g_failSafeStopEntries=false;
@@ -465,12 +471,16 @@ void     FailSafe_Trip(const string why); // forward declaration
 double SessionADXMin();
 double SessionATRMin();
 
-// --- Tune state / auto-rollback (v11)
+// --- Tune state / auto-rollback
 void     TuneState_Load();
 void     TuneState_Save();
 void     Tune_SyncWithOverrides(const bool onInit=false);
 void     Tune_MaybeCheckRollback();
 void     Tune_MaybeMonthlyNotify();
+
+// --- Runtime state persistence (forward declarations; definitions below ExecQual)
+void     RuntimeState_Save();
+void     RuntimeState_Load();
 
 
 // --- Per-symbol parameter overrides (CSV)
@@ -792,7 +802,7 @@ struct SymbolState
    datetime lastBar;
    datetime lastConfirmBar;
    datetime lastNewsSpike; // for spike cooldown
-   // v9 caches
+   // HTF bias / volatility regime caches
    datetime lastBiasBar;
    int      biasDir;
    datetime lastVolBar;
@@ -800,11 +810,11 @@ struct SymbolState
    bool     volBlock;
    double   volPct;
    bool     volValid;
-   // v10 cooldown (entry throttle after exit)
+   // per-symbol cooldown (entry throttle after exit)
    datetime cooldownUntil;
    int      cooldownReason; // 0 none, 2 SL, 3 TP, 4 MANUAL/OTHER
 };
-SymbolState g_sym[64];
+SymbolState g_sym[MAX_SYMBOLS];
 
 // --- Equity regime
 enum EqRegime { EQ_NEUTRAL=0, EQ_CAUTION=1, EQ_DEFENSIVE=2 };
@@ -845,7 +855,7 @@ enum SessionBucket
 #define EXEC_QUAL_INT_MAX 2147483647
 #define EXEC_QUAL_EPS 1e-12
 #define EXEC_QUAL_SEC_PER_MIN 60
-// Flatten 3D [64][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW] into 1D index
+// Flatten 3D [MAX_SYMBOLS][EXEC_QUAL_BUCKETS][EXEC_QUAL_MAX_WINDOW] into 1D index
 #define ExecIdx(sym,bucket,pos) ((sym)*EXEC_QUAL_BUCKETS*EXEC_QUAL_MAX_WINDOW+(bucket)*EXEC_QUAL_MAX_WINDOW+(pos))
 
 string   g_execIntentSym[EXEC_QUAL_INTENT_MAX];
@@ -863,20 +873,21 @@ int      g_execSeenDealsHead=0;
 double   g_execSpreadHist[];
 double   g_execSlipHist[];
 uchar    g_execBadHist[];
-int      g_execHistN[64][EXEC_QUAL_BUCKETS];
-int      g_execHistPos[64][EXEC_QUAL_BUCKETS];
-double   g_execSpreadSum[64][EXEC_QUAL_BUCKETS];
-double   g_execSlipSum[64][EXEC_QUAL_BUCKETS];
-int      g_execBadCount[64][EXEC_QUAL_BUCKETS];
-double   g_execWorstSlip[64][EXEC_QUAL_BUCKETS];
+int      g_execHistN[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
+int      g_execHistPos[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
+double   g_execSpreadSum[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
+double   g_execSlipSum[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
+int      g_execBadCount[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
+double   g_execWorstSlip[MAX_SYMBOLS][EXEC_QUAL_BUCKETS];
 
-datetime g_execLastEntryIntent[64];
-datetime g_execBlockUntil[64];
+datetime g_execLastEntryIntent[MAX_SYMBOLS];
+datetime g_execBlockUntil[MAX_SYMBOLS];
 datetime g_execQualLastTG=0;
-datetime g_execQual_lastSave=0;  // Feature 4A: last ExecQual CSV save time
-datetime g_execQual_lastLearn=0; // Feature 6C: last threshold adaptation time
-double   g_execSlipThresh[EXEC_QUAL_BUCKETS];   // Feature 6C: per-bucket adaptive slip threshold
-double   g_execSpreadThresh[EXEC_QUAL_BUCKETS]; // Feature 6C: per-bucket adaptive spread threshold
+datetime g_execQual_lastSave=0;
+datetime g_execQual_lastLearn=0;
+bool     g_execQual_dirty=false;       // true when ExecQual state has changed since last save
+double   g_execSlipThresh[EXEC_QUAL_BUCKETS];
+double   g_execSpreadThresh[EXEC_QUAL_BUCKETS];
 
 // --- Feature 5A/5B state
 datetime g_lastDailyReport    = 0;
@@ -888,7 +899,7 @@ double   g_riskMultiplierOverride = 1.0;
 // --- Sanity mode runtime state (NEW)
 datetime g_startTime=0;       // EA start time for sanity warm-up
 datetime g_sanityNextCheck=0; // next time we probe indicator readiness
-bool     g_indReady[64];      // per-symbol indicator readiness (ATR+ADX buffers ready)
+bool     g_indReady[MAX_SYMBOLS];      // per-symbol indicator readiness (ATR+ADX buffers ready)
 // --- entry loop re-entrancy guard
 bool g_entryLoopBusy=false;
 // --- Auto proposal counters
@@ -926,7 +937,7 @@ int    g_posTrackN=0;
 // -----------------------------------------
 long EffectiveMagic(const int symIdx)
 {
-   if(InpMagicPerSymbol && symIdx >= 0 && symIdx < 64)
+   if(InpMagicPerSymbol && symIdx >= 0 && symIdx < MAX_SYMBOLS)
       return (long)InpMagic + symIdx;
    return (long)InpMagic;
 }
@@ -1346,7 +1357,7 @@ void Cycle_Begin()
 
 bool GetBidAskCached(const int symIdx, const string sym, double &bid, double &ask)
 {
-   if(symIdx>=0 && symIdx<64 &&
+   if(symIdx>=0 && symIdx<MAX_SYMBOLS &&
       g_tickCache[symIdx].valid &&
       g_tickCache[symIdx].cycleId==g_cycleId)
    {
@@ -1361,9 +1372,7 @@ bool GetBidAskCached(const int symIdx, const string sym, double &bid, double &as
    bid=tk.bid;
    ask=tk.ask;
 
-   if(symIdx>=0 && symIdx<64)
-   {
-      g_tickCache[symIdx].cycleId=g_cycleId;
+   if(symIdx>=0 && symIdx<MAX_SYMBOLS)
       g_tickCache[symIdx].valid=true;
       g_tickCache[symIdx].bid=bid;
       g_tickCache[symIdx].ask=ask;
@@ -1479,7 +1488,7 @@ void Cooldown_Apply(const string sym,
 {
    if(!InpUseSymbolCooldown) return;
 
-   // v12: apply cooldown only when net position P/L < 0 (optional)
+   // Apply cooldown only when net position P/L < 0 (optional)
    // and optionally only when the loss exceeds a minimum in R (micro-loss filter).
    if(InpCooldownLossOnly)
    {
@@ -1891,7 +1900,7 @@ bool RiskCap_AllowsEntry(const int symIdx,
 }
 
 // -----------------------------------------
-// v9: Correlation guard / HTF bias / Volatility regime
+// Correlation guard / HTF bias / Volatility regime
 // -----------------------------------------
 bool IsFXLikeSymbol(const string sym)
 {
@@ -1913,7 +1922,7 @@ int      g_corrCacheBars=0;
 double   g_corrCacheMat[];   // flat [n*n]
 uchar    g_corrCacheOk[];    // flat [n*n], 1 => ok
 double   g_corrCacheCloses[];// flat [n*nBars]
-int      g_corrCacheGot[64];
+int      g_corrCacheGot[MAX_SYMBOLS];
 
 datetime CorrCache_GetBarTime()
 {
@@ -2173,7 +2182,7 @@ bool CorrelationAllowsEntry(const int symIdx,
       if(!ok) continue;
       if(MathAbs(corr) < InpCorrAbsThreshold) continue;
 
-      // v10/v11: block only if this entry increases exposure (direction-aware).
+      // Block only if this entry increases exposure (direction-aware).
       if(InpCorrSameExposureOnly)
       {
          int sign = (corr>=0.0 ? 1 : -1);
@@ -2196,7 +2205,7 @@ bool CorrelationAllowsEntry(const int symIdx,
 
    if(sumWeightedLots <= 0.0) return true;
 
-   // v11: weighted exposure mode (recommended)
+   // Weighted exposure mode (recommended)
    if(InpCorrUseWeightedExposure)
    {
       double totalEff = sumWeightedLots + newLots; // newLots ~ self-corr=1.0
@@ -2485,14 +2494,14 @@ bool PortfolioRiskAllows(const double addRiskMoney)
 // -----------------------------------------
 // Indicators per symbol
 // -----------------------------------------
-int g_emaHandle[64];
-int g_atrHandle[64];
-int g_adxHandle[64];      // ADX on confirm TF (trend)
-int g_adxEntryHandle[64]; // NEW: ADX on entry TF (entry filter)
-int g_biasFastHandle[64]; // v9: HTF bias EMA fast
-int g_biasSlowHandle[64]; // v9: HTF bias EMA slow
-int g_atrVolHandle[64];   // v9: volatility regime ATR on InpVolRegimeTF
-int g_h4EmaHandle[64];    // H4 EMA for MTF trend confirmation
+int g_emaHandle[MAX_SYMBOLS];
+int g_atrHandle[MAX_SYMBOLS];
+int g_adxHandle[MAX_SYMBOLS];
+int g_adxEntryHandle[MAX_SYMBOLS];
+int g_biasFastHandle[MAX_SYMBOLS];
+int g_biasSlowHandle[MAX_SYMBOLS];
+int g_atrVolHandle[MAX_SYMBOLS];
+int g_h4EmaHandle[MAX_SYMBOLS];
 
 
 // Copy buffer helper
@@ -2664,7 +2673,7 @@ int ExecQual_WindowSize()
 
 void ExecQual_RecomputeWorstSlip(const int symIdx, const int bucket)
 {
-   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   if(symIdx<0 || symIdx>=MAX_SYMBOLS || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
    int n=g_execHistN[symIdx][bucket];
    if(n<=0) { g_execWorstSlip[symIdx][bucket]=0.0; return; }
    double w=0.0;
@@ -2679,7 +2688,7 @@ void ExecQual_AddSample(const int symIdx,
                         const double spreadPips,
                         const double absSlipPips)
 {
-   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   if(symIdx<0 || symIdx>=MAX_SYMBOLS || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
    int w=ExecQual_WindowSize();
    int n=g_execHistN[symIdx][bucket];
    int p=g_execHistPos[symIdx][bucket];
@@ -2712,6 +2721,7 @@ void ExecQual_AddSample(const int symIdx,
    g_execBadCount[symIdx][bucket] += (bad-oldBad);
    if(absSlipPips>=g_execWorstSlip[symIdx][bucket]) g_execWorstSlip[symIdx][bucket]=absSlipPips;
    else if(oldSlip>=g_execWorstSlip[symIdx][bucket]-EXEC_QUAL_EPS) ExecQual_RecomputeWorstSlip(symIdx, bucket);
+   g_execQual_dirty = true;
 }
 
 void ExecQual_GetStats(const int symIdx,
@@ -2723,7 +2733,7 @@ void ExecQual_GetStats(const int symIdx,
                        double &badRateOut)
 {
    nOut=0; avgSpreadOut=0.0; avgSlipOut=0.0; worstSlipOut=0.0; badRateOut=0.0;
-   if(symIdx<0 || symIdx>=64 || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
+   if(symIdx<0 || symIdx>=MAX_SYMBOLS || bucket<0 || bucket>=EXEC_QUAL_BUCKETS) return;
    int n=g_execHistN[symIdx][bucket];
    if(n<=0) return;
    nOut=n;
@@ -2769,7 +2779,7 @@ void ExecQual_RecordEntryIntent(const int symIdx,
    g_execIntentTs[i]=now;
    g_execIntentSetup[i]=setup;
    g_execIntentHead=(g_execIntentHead+1)%EXEC_QUAL_INTENT_MAX;
-   if(symIdx>=0 && symIdx<64) g_execLastEntryIntent[symIdx]=now;
+   if(symIdx>=0 && symIdx<MAX_SYMBOLS) g_execLastEntryIntent[symIdx]=now;
 }
 
 int ExecQual_FindIntent(const string sym, const int dir, const datetime dealTime)
@@ -2850,7 +2860,7 @@ void ExecQual_TryCaptureDeal(const ulong dealTicket)
    ExecQual_HandleEntryFill(dealTicket, sym, dir, dealTime, dealPrice);
 }
 
-// Feature 6C: Online learning of ExecQual thresholds
+// Online learning of ExecQual thresholds
 void ExecQual_AdaptThresholds()
 {
    if(!InpExecQual_AdaptThresholds) return;
@@ -2872,7 +2882,7 @@ void ExecQual_AdaptThresholds()
       ArrayResize(spreadArr, 0);
       ArrayResize(slipArr, 0);
 
-      for(int s = 0; s < 64; s++)
+      for(int s = 0; s < MAX_SYMBOLS; s++)
       {
          int n = g_execHistN[s][b];
          if(n <= 0) continue;
@@ -2911,6 +2921,7 @@ void ExecQual_AdaptThresholds()
 
       g_execSpreadThresh[b] = MathMax(0.1, newSpreadMult);
       g_execSlipThresh[b]   = MathMax(0.0, newSlipThresh);
+      g_execQual_dirty = true;
 
       Print(StringFormat("[ExecQual_Adapt] bucket=%d N=%d p75_spread=%.4f p75_slip=%.4f new_spread_mult=%.4f new_slip_thresh=%.4f",
             b, totalN, p75spread, p75slip, g_execSpreadThresh[b], g_execSlipThresh[b]));
@@ -3000,12 +3011,13 @@ bool ExecQual_AllowsEntry(const int symIdx,
 }
 
 // -----------------------------------------
-// Feature 4A: ExecQual CSV persistence
+// ExecQual CSV persistence
 // -----------------------------------------
 void ExecQual_SaveState()
 {
    if(!InpExecQual_Persist) return;
    if(TrimStr(InpExecQual_PersistFile)=="") return;
+   if(!g_execQual_dirty) return;   // skip write when nothing changed
 
    int h = FileOpen(InpExecQual_PersistFile, FILE_WRITE|FILE_CSV|FILE_ANSI);
    if(h == INVALID_HANDLE)
@@ -3030,6 +3042,7 @@ void ExecQual_SaveState()
    }
    FileClose(h);
    g_execQual_lastSave = TimeCurrent();
+   g_execQual_dirty    = false;
    if(InpDebug) Print("[ExecQual] State saved to ", InpExecQual_PersistFile);
 }
 
@@ -3081,7 +3094,64 @@ bool ExecQual_LoadState()
 }
 
 // -----------------------------------------
-// Feature 5A: Daily Telegram Performance Report + TG_PollCommands
+// Runtime state persistence
+// Saves g_tradingPaused, g_riskMultiplierOverride, g_dailyLossTripped, g_consecLosses
+// so they survive EA/MT5 restarts.
+// -----------------------------------------
+void RuntimeState_Save()
+{
+   if(TrimStr(InpRuntimeStatePersistFile)=="") return;
+   int h = FileOpen(InpRuntimeStatePersistFile, FILE_WRITE|FILE_CSV|FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      Print("[RuntimeState] Save failed: ", GetLastError());
+      return;
+   }
+   FileWrite(h, "key", "value");
+   FileWrite(h, "tradingPaused",         (g_tradingPaused ? "1" : "0"));
+   FileWrite(h, "riskMultiplierOverride", DoubleToString(g_riskMultiplierOverride, 6));
+   FileWrite(h, "dailyLossTripped",       (g_dailyLossTripped ? "1" : "0"));
+   FileWrite(h, "consecLosses",           IntegerToString(g_consecLosses));
+   FileClose(h);
+}
+
+void RuntimeState_Load()
+{
+   if(TrimStr(InpRuntimeStatePersistFile)=="") return;
+   int h = FileOpen(InpRuntimeStatePersistFile, FILE_READ|FILE_CSV|FILE_ANSI);
+   if(h == INVALID_HANDLE) return;  // no saved state yet — use defaults
+   // skip header row
+   if(!FileIsEnding(h)) { FileReadString(h); FileReadString(h); }
+   while(!FileIsEnding(h))
+   {
+      string key = FileReadString(h);
+      string val = FileReadString(h);
+      if(key == "tradingPaused")
+         g_tradingPaused = (val == "1");
+      else if(key == "riskMultiplierOverride")
+      {
+         double v = StringToDouble(val);
+         if(v > 0.0 && v <= InpMaxRiskMultiplier)
+            g_riskMultiplierOverride = v;
+      }
+      else if(key == "dailyLossTripped")
+         g_dailyLossTripped = (val == "1");
+      else if(key == "consecLosses")
+      {
+         int n = (int)StringToInteger(val);
+         if(n >= 0) g_consecLosses = n;
+      }
+   }
+   FileClose(h);
+   if(InpDebug)
+      Print("[RuntimeState] Loaded: paused=", g_tradingPaused,
+            " riskMult=", g_riskMultiplierOverride,
+            " dailyTripped=", g_dailyLossTripped,
+            " consecLosses=", g_consecLosses);
+}
+
+// -----------------------------------------
+// Daily Telegram Performance Report + TG_PollCommands
 // Extracted to MSPB_EA_Telegram.mqh
 // -----------------------------------------
 
@@ -3869,7 +3939,7 @@ string BuildSuggestion(const SymPerf &st)
 }
 
 // -----------------------------------------
-// Feature 6B: Proposal → .set file writer
+// Proposal → .set file writer
 // -----------------------------------------
 void WriteProposalSetFile(const string baseFileName)
 {
@@ -4451,7 +4521,7 @@ void TuneState_Save()
 
    FileClose(h);
 }
-// --- Applied-settings audit log (NEW v12)
+// --- Applied-settings audit log
 // Records whenever the EA's effective tunable settings change (inputs / overrides / spread-stress multiplier).
 string g_appliedLastHash = "";
 
@@ -5316,255 +5386,7 @@ bool ClosePositionByTicketSafe(const string sym,
 
    return ok;
 }
-
-// -----------------------------------------
-// Feature 8A: Interactive Dashboard Buttons
-// -----------------------------------------
-void DashButtons_Create()
-{
-   if(!InpDashButtons) return;
-   string names[4] = {"MSPB_BTN_PAUSE", "MSPB_BTN_RESUME", "MSPB_BTN_RISK_UP", "MSPB_BTN_RISK_DN"};
-   string labels[4] = {"⏸ PAUSE", "▶ RESUME", "📈 RISK +", "📉 RISK -"};
-   int yPos[4] = {120, 145, 170, 195};
-   for(int i = 0; i < 4; i++)
-   {
-      if(ObjectFind(0, names[i]) < 0)
-         ObjectCreate(0, names[i], OBJ_BUTTON, 0, 0, 0);
-      ObjectSetInteger(0, names[i], OBJPROP_CORNER,    CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, names[i], OBJPROP_XDISTANCE, 10);
-      ObjectSetInteger(0, names[i], OBJPROP_YDISTANCE, yPos[i]);
-      ObjectSetInteger(0, names[i], OBJPROP_XSIZE,     100);
-      ObjectSetInteger(0, names[i], OBJPROP_YSIZE,     20);
-      ObjectSetInteger(0, names[i], OBJPROP_FONTSIZE,  8);
-      ObjectSetString(0,  names[i], OBJPROP_TEXT,      labels[i]);
-   }
-   // Set PAUSE button color based on trading state
-   color pauseCol = g_tradingPaused ? clrRed : clrGreen;
-   ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
-   ChartRedraw(0);
-}
-
-void DashButtons_Delete()
-{
-   string names[4] = {"MSPB_BTN_PAUSE", "MSPB_BTN_RESUME", "MSPB_BTN_RISK_UP", "MSPB_BTN_RISK_DN"};
-   for(int i = 0; i < 4; i++)
-      ObjectDelete(0, names[i]);
-}
-
-void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
-{
-   if(id != CHARTEVENT_OBJECT_CLICK) return;
-   if(!InpDashButtons) return;
-
-   bool handled = false;
-   if(sparam == "MSPB_BTN_PAUSE")
-   {
-      g_tradingPaused = true;
-      Print("[DashBtn] Trading PAUSED via dashboard button.");
-      if(InpEnableTelegram) TelegramSendMessage("⏸ Trading PAUSED via dashboard button.", TGC_SYSTEM);
-      handled = true;
-   }
-   else if(sparam == "MSPB_BTN_RESUME")
-   {
-      g_tradingPaused = false;
-      Print("[DashBtn] Trading RESUMED via dashboard button.");
-      if(InpEnableTelegram) TelegramSendMessage("▶ Trading RESUMED via dashboard button.", TGC_SYSTEM);
-      handled = true;
-   }
-   else if(sparam == "MSPB_BTN_RISK_UP")
-   {
-      g_riskMultiplierOverride = MathMin(2.0, g_riskMultiplierOverride * 1.1);
-      Print(StringFormat("[DashBtn] Risk multiplier increased to %.3f", g_riskMultiplierOverride));
-      handled = true;
-   }
-   else if(sparam == "MSPB_BTN_RISK_DN")
-   {
-      g_riskMultiplierOverride = MathMax(0.1, g_riskMultiplierOverride * 0.9);
-      Print(StringFormat("[DashBtn] Risk multiplier decreased to %.3f", g_riskMultiplierOverride));
-      handled = true;
-   }
-
-   if(handled)
-   {
-      // Reset button pressed state
-      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
-      // Update PAUSE button color
-      color pauseCol = g_tradingPaused ? clrRed : clrGreen;
-      ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
-      DashboardUpdate();
-      ChartRedraw(0);
-   }
-}
-
-// -----------------------------------------
-// Dashboard
-// -----------------------------------------
-void DashClear()
-{
-   if(!InpShowDashboard) return;
-   int total=ObjectsTotal(0,0,-1);
-   for(int i=total-1;i>=0;i--)
-   {
-      string name=ObjectName(0,i,0,-1);
-      if(StringFind(name,g_dashObjPrefix)==0)
-         ObjectDelete(0,name);
-   }
-}
-
-void DashSetLine(const int idx, const string text, const color col=clrWhite)
-{
-   if(!InpShowDashboard) return;
-   string name=g_dashObjPrefix+(string)idx;
-   // MQL5: ObjectFind() returns an index (>=0) when found, and -1 when not found.
-   // Do NOT use '!ObjectFind(...)' because index 0 is valid and '-1' is truthy in C-like contexts.
-   if(ObjectFind(0,name) < 0)
-   {
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetInteger(0,name,OBJPROP_XDISTANCE,10);
-      ObjectSetInteger(0,name,OBJPROP_YDISTANCE,10+idx*16);
-      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,10);
-      ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-   }
-   ObjectSetString(0,name,OBJPROP_TEXT,text);
-   ObjectSetInteger(0,name,OBJPROP_COLOR,col);
-}
-
-void DashboardUpdate()
-{
-   if(!InpShowDashboard) return;
-
-   int line=0;
-   string ts=NowStr();
-   DashSetLine(line++, StringFormat("%s | %s", TG_GetPrefix(), ts), clrWhite);
-
-   string status="OK";
-   color statusCol=clrLime;
-
-   if(g_failSafeStopEntries)
-   {
-      status="FAILSAFE_"+g_failSafeReason;
-      statusCol=clrRed;
-   }
-   else if(InpNews_Enable && News_LastError()!="" && InpNews_FailClosedOnError)
-   {
-      status="NEWS_FAIL_CLOSED";
-      statusCol=clrOrange;
-   }
-
-   DashSetLine(line++, StringFormat("Status: %s | EqReg: %s | RiskMult: %.2f", status, EqRegToStr(g_eqRegime), g_riskMult), statusCol);
-
-   // 3C/3D: daily loss and consecutive loss guard status
-   if(InpDailyLossLimit_Enable || InpConsecLoss_Enable)
-   {
-      string guardLine = "";
-      if(InpDailyLossLimit_Enable)
-      {
-         double ddPct = (g_dayStartBalance > 0 ? (g_dayStartBalance - AccountInfoDouble(ACCOUNT_EQUITY)) / g_dayStartBalance * 100.0 : 0.0);
-         guardLine += StringFormat("DailyLoss:%.2f%%/%s%.1f%% ", ddPct, (g_dailyLossTripped?"BLOCKED/":""), InpDailyLossLimitPct);
-      }
-      if(InpConsecLoss_Enable)
-      {
-         bool blocked = ConsecLoss_IsBlocked();
-         guardLine += StringFormat("ConsecL:%d/%d%s", g_consecLosses, InpConsecLoss_MaxN, (blocked?" PAUSED":""));
-      }
-      color gc = (g_dailyLossTripped || ConsecLoss_IsBlocked()) ? clrOrange : clrSilver;
-      DashSetLine(line++, TrimStr(guardLine), gc);
-   }
-
-   // driver + news mode summary
-   string entryDrv = (InpUseTimerForEntries ? "TIMER" : "TICK");
-   string mgmtDrv  = (InpManageOnTick ? "TICK" : "TIMER");
-   string newsLine = StringFormat("%s | SpikeNews:%s | AvoidNewsEntries:%s",
-                                 News_StatusLine(),
-                                 (InpUseNewsAwareTrailing?"ON":"OFF"),
-                                 (InpAvoidEntriesDuringNews?"Y":"N"));
-   DashSetLine(line++, StringFormat("Driver: entries=%s manage=%s | %s", entryDrv, mgmtDrv, newsLine), clrSilver);
-
-   // sanity mode status (startup guard for spike/trailing)
-   if(InpSanityMode_Enable)
-   {
-      int ready=Sanity_ReadyCount();
-      int rem=Sanity_RemainingSeconds();
-      bool warm = (rem>0 || (g_symCount>0 && ready<g_symCount));
-      color sc = (warm ? clrOrange : clrSilver);
-      string extra = (rem>0 ? StringFormat(" | %ds", rem) : "");
-      DashSetLine(line++, StringFormat("Sanity: %s | indReady=%d/%d%s", (warm?"WARMUP":"OK"), ready, g_symCount, extra), sc);
-   }
-
-   double bal=AccountInfoDouble(ACCOUNT_BALANCE);
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   DashSetLine(line++, StringFormat("Balance: %.2f | Equity: %.2f", bal, eq), clrWhite);
-
-   double pr=CurrentPortfolioRiskPct();
-   DashSetLine(line++, StringFormat("PortRisk: %.2f%% (max %.2f%%)", pr, InpMaxPortfolioRiskPct), clrSilver);
-
-   // Rejections summary
-   string rej="Rej:";
-   for(int i=1;i<REJ_MAX;i++)
-      if(g_rejCounts[i]>0)
-         rej += StringFormat(" %s=%d", g_rejNames[i], g_rejCounts[i]);
-   DashSetLine(line++, rej, clrSilver);
-
-   // per symbol short
-   for(int s=0;s<g_symCount && line<20;s++)
-   {
-      string sym=g_syms[s];
-      int open=CountOpenPositionsOurMagic(sym);
-      double sp=SpreadPips(sym);
-      int cdSec=0;
-      if(InpUseSymbolCooldown && g_sym[s].cooldownUntil>0)
-      {
-         datetime now2=TimeCurrent();
-         if(now2 < g_sym[s].cooldownUntil) cdSec=(int)(g_sym[s].cooldownUntil - now2);
-      }
-      if(cdSec>0)
-         DashSetLine(line++, StringFormat("%s | open=%d | spread=%.2f | cd=%ds", sym, open, sp, cdSec), clrWhite);
-      else
-         DashSetLine(line++, StringFormat("%s | open=%d | spread=%.2f", sym, open, sp), clrWhite);
-   }
-
-   // 4C: Execution quality summary per session bucket
-   static const string _bucketNames[4] = {"Asia","London","NY","Other"};
-   DashSetLine(line++, "=== EXEC QUALITY ===", clrYellow);
-   for(int b=0;b<EXEC_QUAL_BUCKETS;b++)
-   {
-      // aggregate across all active symbols for this bucket
-      double spreadSum=0.0;
-      int    totalN=0;
-      for(int s=0;s<g_symCount;s++)
-      {
-         int sn=0; double sa=0.0,sl2=0.0,sw=0.0,sbr=0.0;
-         ExecQual_GetStats(s, b, sn, sa, sl2, sw, sbr);
-         if(sn>0){ spreadSum+=sa*sn; totalN+=sn; }
-      }
-      string avgStr = (totalN>0 ? StringFormat("%.2f", spreadSum/totalN) : "n/a");
-      DashSetLine(line++, StringFormat("%-6s avg_spd=%s n=%d", _bucketNames[b], avgStr, totalN), clrSilver);
-   }
-
-   // 8B: Rejection heatmap (optional)
-   if(InpShowRejHeatmap)
-   {
-      DashSetLine(line++, "=== REJECTION HEATMAP ===", clrYellow);
-      int maxRej=1;
-      for(int h=0;h<24;h++) if(g_rejHour[h]>maxRej) maxRej=g_rejHour[h];
-      for(int h=0;h<24;h++)
-      {
-         if(g_rejHour[h]<=0) continue;
-         int barLen = (int)MathRound((double)g_rejHour[h]/maxRej*7);
-         string bar="";
-         for(int k=0;k<barLen;k++)       bar+="█";
-         for(int k=barLen;k<7;k++)       bar+="░";
-         DashSetLine(line++, StringFormat("H%02d: %s (%d)", h, bar, g_rejHour[h]), clrSilver);
-      }
-   }
-   // Feature 8A: update PAUSE button color
-   if(InpDashButtons)
-   {
-      color pauseCol = g_tradingPaused ? clrRed : clrGreen;
-      ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
-   }
-}
+#include "MSPB_EA_Dashboard.mqh"
 
 // -----------------------------------------
 // Core: entry logic (Setup1 / Setup2)
@@ -5790,7 +5612,7 @@ void ProcessSymbol(const int idx, const string sym)
    }
 
 
-   // v10: per-symbol cooldown after exits
+   // Per-symbol cooldown after exits
    if(InpUseSymbolCooldown && g_sym[idx].cooldownUntil>0 && TimeCurrent() < g_sym[idx].cooldownUntil)
    {
       IncReject(idx, REJ_COOLDOWN);
@@ -5863,7 +5685,7 @@ void ProcessSymbol(const int idx, const string sym)
    if(isBuy && !Sym_AllowBuy(sym)) return;
    if(!isBuy && !Sym_AllowSell(sym)) return;
 
-   // v9: volatility regime (ATR percentile)
+   // Volatility regime filter (ATR percentile)
    double volMult=1.0; bool volBlock=false; double volPct=50.0;
    VolRegime_Get(idx, sym, volMult, volBlock, volPct);
    if(volBlock)
@@ -5873,7 +5695,7 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
-   // v9: higher timeframe bias filter
+   // Higher timeframe bias filter
    if(InpUseHTFBias)
    {
       double bf=0.0, bs=0.0;
@@ -5987,7 +5809,7 @@ void ProcessSymbol(const int idx, const string sym)
          return;
       }
 
-      // v11: correlation exposure guard (direction-aware + weighted by lots)
+      // Correlation exposure guard (direction-aware + weighted by lots)
       if(InpUseCorrelationGuard)
       {
          string cdet="";
@@ -6116,7 +5938,7 @@ void ProcessSymbol(const int idx, const string sym)
          return;
       }
 
-      // v11: correlation exposure guard (direction-aware + weighted by lots)
+      // Correlation exposure guard (direction-aware + weighted by lots)
       if(InpUseCorrelationGuard)
       {
          string cdet="";
@@ -6399,7 +6221,7 @@ void ManagePositions()
 // EA init/deinit/tick/timer
 // -----------------------------------------
 
-// --- Data completeness check (NEW v12)
+// --- Data completeness check
 // Ensures required bar history exists for each symbol/TF combination.
 // If history is missing (common for some CFDs/stocks in multi-symbol tests), we skip that symbol.
 int Data_CopyRatesCount(const string sym, ENUM_TIMEFRAMES tf, int need)
@@ -6723,25 +6545,28 @@ int OnInit()
    // seed closed-position counter helper (important after terminal/EA restart)
    PosTrackSeedOpenPositions();
 
-   // 1B: initialise dynamic arrays
+   // Initialise dynamic arrays
    ArrayResize(g_posTrackId, 256);
    ArrayResize(g_dealQueueTickets, 4096);
-   ArrayResize(g_execSpreadHist, 64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
-   ArrayResize(g_execSlipHist,   64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
-   ArrayResize(g_execBadHist,    64 * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayResize(g_execSpreadHist, MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayResize(g_execSlipHist,   MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
+   ArrayResize(g_execBadHist,    MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
    ArrayInitialize(g_execSpreadHist, 0.0);
    ArrayInitialize(g_execSlipHist,   0.0);
    ArrayInitialize(g_execBadHist,    0);
    ArrayInitialize(g_tgLastSendTime, 0);
-   // Feature 6C: initialize per-bucket adaptive thresholds from static inputs
+   // Initialize per-bucket adaptive thresholds from static inputs
    for(int _b=0; _b<EXEC_QUAL_BUCKETS; _b++)
    {
       g_execSlipThresh[_b]   = InpExecQual_BadSlipPips;
       g_execSpreadThresh[_b] = InpExecQual_SpreadAvgMult; // stored as multiplier baseline
    }
 
-   // Feature 4A: load ExecQual baselines from CSV if available
+   // Load ExecQual baselines from CSV if available
    ExecQual_LoadState();
+
+   // Restore runtime state persisted from previous run (pause flag, risk multiplier, etc.)
+   RuntimeState_Load();
 
    // timer
    EventSetTimer(MathMax(1, InpTimerSec));
@@ -6767,10 +6592,11 @@ void OnDeinit(const int reason)
    ML_Close();
    Audit_Close();
 
-   // Feature 4A: persist ExecQual baselines
+   // Persist ExecQual baselines and runtime state
+   g_execQual_dirty = true;   // force final save
    ExecQual_SaveState();
+   RuntimeState_Save();
 
-   // tune state save (v11)
    if(InpTune_Enable) TuneState_Save();
 
    // release indicators
@@ -6847,7 +6673,7 @@ void OnTick()
 }
 
 
-// --- Trade-density warning (NEW v12)
+// --- Trade-density warning
 // Warns if the EA isn't generating enough closed trades for some symbols (often due to too many filters or missing data).
 void TradeDensity_Check()
 {
@@ -6976,18 +6802,19 @@ void OnTimer()
    TG_Config_UpdateIfDue(false);
    TelegramQueue_Process();
 
-   // Feature 4A: periodic ExecQual state save (every 30 minutes)
-   if(InpExecQual_Persist)
+   // Periodic ExecQual state save — only writes when state has changed (dirty flag)
+   // and at most once every 30 minutes to limit I/O.
+   if(InpExecQual_Persist && g_execQual_dirty)
    {
       datetime now_timer = TimeCurrent();
       if(g_execQual_lastSave==0 || (now_timer - g_execQual_lastSave) >= 1800)
          ExecQual_SaveState();
    }
 
-   // Feature 6C: adaptive threshold learning
+   // Adaptive threshold learning
    ExecQual_AdaptThresholds();
 
-   // Feature 5A: daily Telegram performance report
+   // Daily Telegram performance report
    if(InpTGDailyReport && InpEnableTelegram)
    {
       datetime now_dr = TimeCurrent();
@@ -7002,7 +6829,7 @@ void OnTimer()
       }
    }
 
-   // Feature 5B: poll incoming Telegram commands
+   // Poll incoming Telegram commands
    TG_PollCommands();
 }
 
@@ -7015,7 +6842,7 @@ double AutoTuneScore()
 }
 
 // -----------------------------------------
-// Strategy Tester custom score (NEW v12)
+// Strategy Tester custom score
 // Enable via: InpTester_UseCustomCriterion = true
 // -----------------------------------------
 double OnTester()
@@ -7034,7 +6861,7 @@ double OnTester()
    if(InpTester_DDCapPct>0.0 && ddPct > InpTester_DDCapPct)
       return -1e9;
 
-   // Feature 7A: Walk-Forward IS/OOS harness
+   // Walk-Forward IS/OOS harness
    if(InpWF_Enable)
    {
       datetime tester_start = (datetime)TesterStatistics(STAT_INITIAL_DEPOSIT); // placeholder - use deal times

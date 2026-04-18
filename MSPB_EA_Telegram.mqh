@@ -534,24 +534,28 @@ void TG_HandleCommand(const string rawText)
    else if(StringFind(tl, "/pause")==0)
    {
       g_tradingPaused = true;
+      RuntimeState_Save();
       TelegramSendMessage("⏸ Trading PAUSED via Telegram command.", TGC_SYSTEM);
    }
    else if(StringFind(tl, "/resume")==0)
    {
       g_tradingPaused = false;
+      RuntimeState_Save();
       TelegramSendMessage("▶️ Trading RESUMED via Telegram command.", TGC_SYSTEM);
    }
    else if(StringFind(tl, "/risk ")==0)
    {
       string valStr = TrimStr(StringSubstr(text, 6));
       double mult = StringToDouble(valStr);
-      if(mult > 0.0 && mult <= 10.0)
+      double maxMult = MathMax(0.1, InpMaxRiskMultiplier);
+      if(mult >= 0.1 && mult <= maxMult)
       {
          g_riskMultiplierOverride = mult;
+         RuntimeState_Save();
          TelegramSendMessage(StringFormat("⚙️ Risk multiplier set to %.2f", mult), TGC_SYSTEM);
       }
       else
-         TelegramSendMessage("⚠️ Invalid /risk value. Use /risk <0.1..10>", TGC_SYSTEM);
+         TelegramSendMessage(StringFormat("⚠️ Invalid /risk value. Use /risk <0.1..%.1f>", maxMult), TGC_SYSTEM);
    }
    else if(StringFind(tl, "/close all")==0)
    {
