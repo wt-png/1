@@ -26,6 +26,10 @@
 // Raise this value if you need more than 64 instruments.
 #define MAX_SYMBOLS 64
 
+// Capacity constants for fixed-size tracking arrays.
+#define MAX_POSITION_TRACK 256   // max simultaneously tracked open/closed positions
+#define DEAL_QUEUE_MAX     4096  // ring-buffer capacity for deal-capture queue
+
 // Read a full line from a FILE_TXT handle (safe when fields contain spaces).
 bool FileReadLineTxt(const int handle, string &line)
 {
@@ -916,18 +920,18 @@ int      g_consecLosses           = 0;
 datetime g_consecLossPauseUntil   = 0;
 
 // --- Partial TP tracking (ring buffer of ticket IDs that already had partial close)
-ulong    g_partialDoneTick[256];
+ulong    g_partialDoneTick[MAX_POSITION_TRACK];
 int      g_partialDoneN = 0;
 
 // --- Position closure tracker (to count *closed positions* reliably, even with multi-fill exit deals)
 long   g_posTrackId[];
-double g_posTrackVolIn[256];
-double g_posTrackVolOut[256];
-double g_posTrackProfit[256];
-double g_posTrackRiskMoney[256];
-double g_posTrackOpenSum[256];
-double g_posTrackSL0[256];
-long   g_posTrackLastReason[256];
+double g_posTrackVolIn[MAX_POSITION_TRACK];
+double g_posTrackVolOut[MAX_POSITION_TRACK];
+double g_posTrackProfit[MAX_POSITION_TRACK];
+double g_posTrackRiskMoney[MAX_POSITION_TRACK];
+double g_posTrackOpenSum[MAX_POSITION_TRACK];
+double g_posTrackSL0[MAX_POSITION_TRACK];
+long   g_posTrackLastReason[MAX_POSITION_TRACK];
 int    g_posTrackN=0;
 
 
@@ -1373,6 +1377,8 @@ bool GetBidAskCached(const int symIdx, const string sym, double &bid, double &as
    ask=tk.ask;
 
    if(symIdx>=0 && symIdx<MAX_SYMBOLS)
+   {
+      g_tickCache[symIdx].cycleId=g_cycleId;
       g_tickCache[symIdx].valid=true;
       g_tickCache[symIdx].bid=bid;
       g_tickCache[symIdx].ask=ask;
@@ -3306,7 +3312,7 @@ void EqRegime_Update()
 bool DealQ_IsEmpty(){ return g_dealQHead==g_dealQTail; }
 bool DealQ_Push(const ulong dealTicket)
 {
-   int next=(g_dealQTail+1)%4096;
+   int next=(g_dealQTail+1)%DEAL_QUEUE_MAX;
    if(next==g_dealQHead) return false; // full
    g_dealQueueTickets[g_dealQTail]=dealTicket;
    g_dealQTail=next;
@@ -3316,7 +3322,7 @@ bool DealQ_Pop(ulong &dealTicket)
 {
    if(DealQ_IsEmpty()) return false;
    dealTicket=g_dealQueueTickets[g_dealQHead];
-   g_dealQHead=(g_dealQHead+1)%4096;
+   g_dealQHead=(g_dealQHead+1)%DEAL_QUEUE_MAX;
    return true;
 }
 
@@ -6546,8 +6552,8 @@ int OnInit()
    PosTrackSeedOpenPositions();
 
    // Initialise dynamic arrays
-   ArrayResize(g_posTrackId, 256);
-   ArrayResize(g_dealQueueTickets, 4096);
+   ArrayResize(g_posTrackId, MAX_POSITION_TRACK);
+   ArrayResize(g_dealQueueTickets, DEAL_QUEUE_MAX);
    ArrayResize(g_execSpreadHist, MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
    ArrayResize(g_execSlipHist,   MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
    ArrayResize(g_execBadHist,    MAX_SYMBOLS * EXEC_QUAL_BUCKETS * EXEC_QUAL_MAX_WINDOW);
