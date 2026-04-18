@@ -496,6 +496,10 @@ input int      InpExecQual_BlockCooldownSec    = 120;
 input int      InpExecQual_TelegramCooldownSec = 120;
 input bool     InpExecQual_Persist            = true;   // Save/load ExecQual baselines across restarts
 input string   InpExecQual_PersistFile        = "MSPB_ExecQual_State.csv"; // Persistence file
+input bool     InpExecQual_AdaptThresholds    = false; // Auto-update ExecQual thresholds via percentile learning
+input double   InpExecQual_LearnRate          = 0.1;   // Learning rate (0.0-1.0, how fast thresholds adapt)
+input int      InpExecQual_LearnMinSamples    = 30;    // Minimum samples before adapting thresholds
+input int      InpExecQual_LearnIntervalMin   = 60;    // Interval in minutes between threshold updates
 input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
 
 // --- SL/TP
@@ -729,6 +733,7 @@ input int      InpSanityMode_Seconds       = 15;     // disable spike/trailing a
 input bool     InpDebug                   = true;
 input bool     InpShowDashboard           = true;
 input bool     InpShowRejHeatmap          = false;  // 8B: show per-hour rejection heatmap on dashboard
+input bool     InpDashButtons             = false; // Show interactive Pause/Resume/Risk buttons on dashboard
 
 
 
@@ -738,6 +743,10 @@ input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% sp
 input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
 input double   InpTester_DDCapPct         = 20.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
+input bool     InpWF_Enable               = false;  // Enable walk-forward IS/OOS mode in OnTester
+input double   InpWF_IS_FractionPct       = 70.0;   // In-sample fraction % (e.g. 70 = first 70% is IS)
+input double   InpWF_IS_SharpeWeight      = 0.5;    // Weight of IS Sharpe in combined score
+input double   InpWF_OOS_SharpeWeight     = 0.5;    // Weight of OOS Sharpe in combined score
 input bool     InpAppliedLog_Enable       = true;  // append applied settings snapshot to CSV when changed
 input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
@@ -1229,6 +1238,9 @@ datetime g_execLastEntryIntent[64];
 datetime g_execBlockUntil[64];
 datetime g_execQualLastTG=0;
 datetime g_execQual_lastSave=0;  // Feature 4A: last ExecQual CSV save time
+datetime g_execQual_lastLearn=0; // Feature 6C: last threshold adaptation time
+double   g_execSlipThresh[EXEC_QUAL_BUCKETS];   // Feature 6C: per-bucket adaptive slip threshold
+double   g_execSpreadThresh[EXEC_QUAL_BUCKETS]; // Feature 6C: per-bucket adaptive spread threshold
 
 // --- Feature 5A/5B state
 datetime g_lastDailyReport    = 0;
@@ -3756,6 +3768,73 @@ void ExecQual_TryCaptureDeal(const ulong dealTicket)
    ExecQual_HandleEntryFill(dealTicket, sym, dir, dealTime, dealPrice);
 }
 
+// Feature 6C: Online learning of ExecQual thresholds
+void ExecQual_AdaptThresholds()
+{
+   if(!InpExecQual_AdaptThresholds) return;
+   datetime now = TimeCurrent();
+   int intervalSec = MathMax(1, InpExecQual_LearnIntervalMin) * 60;
+   if(g_execQual_lastLearn > 0 && (now - g_execQual_lastLearn) < intervalSec) return;
+   g_execQual_lastLearn = now;
+
+   int minSamples = MathMax(1, InpExecQual_LearnMinSamples);
+   double lr = MathMax(0.0, MathMin(1.0, InpExecQual_LearnRate));
+   int w = ExecQual_WindowSize();
+
+   for(int b = 0; b < EXEC_QUAL_BUCKETS; b++)
+   {
+      // Aggregate samples across all symbols for this bucket
+      double spreadArr[];
+      double slipArr[];
+      int totalN = 0;
+      ArrayResize(spreadArr, 0);
+      ArrayResize(slipArr, 0);
+
+      for(int s = 0; s < 64; s++)
+      {
+         int n = g_execHistN[s][b];
+         if(n <= 0) continue;
+         int cnt = MathMin(n, w);
+         int head = g_execHistPos[s][b]; // next write pos
+         for(int k = 0; k < cnt; k++)
+         {
+            int pos = (head - cnt + k + w) % w;
+            double sp = g_execSpreadHist[ExecIdx(s, b, pos)];
+            double sl = g_execSlipHist[ExecIdx(s, b, pos)];
+            ArrayResize(spreadArr, totalN + 1);
+            ArrayResize(slipArr,   totalN + 1);
+            spreadArr[totalN] = sp;
+            slipArr[totalN]   = sl;
+            totalN++;
+         }
+      }
+
+      if(totalN < minSamples) continue;
+
+      // Sort to find 75th percentile
+      double spreadSorted[];
+      double slipSorted[];
+      ArrayCopy(spreadSorted, spreadArr);
+      ArrayCopy(slipSorted,   slipArr);
+      ArraySort(spreadSorted);
+      ArraySort(slipSorted);
+      int p75idx = (int)MathFloor(totalN * 0.75);
+      if(p75idx >= totalN) p75idx = totalN - 1;
+      double p75spread = spreadSorted[p75idx];
+      double p75slip   = slipSorted[p75idx];
+
+      // Adaptive update with 20% tolerance above 75th percentile
+      double newSpreadMult = g_execSpreadThresh[b] * (1.0 - lr) + (p75spread * 1.2) * lr;
+      double newSlipThresh = g_execSlipThresh[b]   * (1.0 - lr) + (p75slip   * 1.2) * lr;
+
+      g_execSpreadThresh[b] = MathMax(0.1, newSpreadMult);
+      g_execSlipThresh[b]   = MathMax(0.0, newSlipThresh);
+
+      Print(StringFormat("[ExecQual_Adapt] bucket=%d N=%d p75_spread=%.4f p75_slip=%.4f new_spread_mult=%.4f new_slip_thresh=%.4f",
+            b, totalN, p75spread, p75slip, g_execSpreadThresh[b], g_execSlipThresh[b]));
+   }
+}
+
 bool ExecQual_AllowsEntry(const int symIdx,
                           const string sym,
                           const string dir,
@@ -3791,7 +3870,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
 
    if(reason=="" && n>0 && avgSpread>0.0)
    {
-      double mult=MathMax(0.1, InpExecQual_SpreadAvgMult);
+      double mult=MathMax(0.1, g_execSpreadThresh[bucket]);
       if(spreadNowPips > (avgSpread*mult))
          reason="SPREAD_SHOCK";
    }
@@ -3799,7 +3878,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
    {
       if(badRate > MathMax(0.0, InpExecQual_MaxBadFillRate))
          reason="BAD_FILL_RATE_DEGRADED";
-      else if(avgSlip > MathMax(0.0, InpExecQual_BadSlipPips))
+      else if(avgSlip > MathMax(0.0, g_execSlipThresh[bucket]))
          reason="AVG_SLIPPAGE_DEGRADED";
    }
 
@@ -6365,6 +6444,85 @@ bool ClosePositionByTicketSafe(const string sym,
 }
 
 // -----------------------------------------
+// Feature 8A: Interactive Dashboard Buttons
+// -----------------------------------------
+void DashButtons_Create()
+{
+   if(!InpDashButtons) return;
+   string names[4] = {"MSPB_BTN_PAUSE", "MSPB_BTN_RESUME", "MSPB_BTN_RISK_UP", "MSPB_BTN_RISK_DN"};
+   string labels[4] = {"⏸ PAUSE", "▶ RESUME", "📈 RISK +", "📉 RISK -"};
+   int yPos[4] = {120, 145, 170, 195};
+   for(int i = 0; i < 4; i++)
+   {
+      if(ObjectFind(0, names[i]) < 0)
+         ObjectCreate(0, names[i], OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, names[i], OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, names[i], OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, names[i], OBJPROP_YDISTANCE, yPos[i]);
+      ObjectSetInteger(0, names[i], OBJPROP_XSIZE,     100);
+      ObjectSetInteger(0, names[i], OBJPROP_YSIZE,     20);
+      ObjectSetInteger(0, names[i], OBJPROP_FONTSIZE,  8);
+      ObjectSetString(0,  names[i], OBJPROP_TEXT,      labels[i]);
+   }
+   // Set PAUSE button color based on trading state
+   color pauseCol = g_tradingPaused ? clrRed : clrGreen;
+   ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
+   ChartRedraw(0);
+}
+
+void DashButtons_Delete()
+{
+   string names[4] = {"MSPB_BTN_PAUSE", "MSPB_BTN_RESUME", "MSPB_BTN_RISK_UP", "MSPB_BTN_RISK_DN"};
+   for(int i = 0; i < 4; i++)
+      ObjectDelete(0, names[i]);
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+   if(!InpDashButtons) return;
+
+   bool handled = false;
+   if(sparam == "MSPB_BTN_PAUSE")
+   {
+      g_tradingPaused = true;
+      Print("[DashBtn] Trading PAUSED via dashboard button.");
+      if(InpEnableTelegram) TelegramSendMessage("⏸ Trading PAUSED via dashboard button.", TGC_SYSTEM);
+      handled = true;
+   }
+   else if(sparam == "MSPB_BTN_RESUME")
+   {
+      g_tradingPaused = false;
+      Print("[DashBtn] Trading RESUMED via dashboard button.");
+      if(InpEnableTelegram) TelegramSendMessage("▶ Trading RESUMED via dashboard button.", TGC_SYSTEM);
+      handled = true;
+   }
+   else if(sparam == "MSPB_BTN_RISK_UP")
+   {
+      g_riskMultiplierOverride = MathMin(2.0, g_riskMultiplierOverride * 1.1);
+      Print(StringFormat("[DashBtn] Risk multiplier increased to %.3f", g_riskMultiplierOverride));
+      handled = true;
+   }
+   else if(sparam == "MSPB_BTN_RISK_DN")
+   {
+      g_riskMultiplierOverride = MathMax(0.1, g_riskMultiplierOverride * 0.9);
+      Print(StringFormat("[DashBtn] Risk multiplier decreased to %.3f", g_riskMultiplierOverride));
+      handled = true;
+   }
+
+   if(handled)
+   {
+      // Reset button pressed state
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      // Update PAUSE button color
+      color pauseCol = g_tradingPaused ? clrRed : clrGreen;
+      ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
+      DashboardUpdate();
+      ChartRedraw(0);
+   }
+}
+
+// -----------------------------------------
 // Dashboard
 // -----------------------------------------
 void DashClear()
@@ -6525,6 +6683,12 @@ void DashboardUpdate()
          for(int k=barLen;k<7;k++)       bar+="░";
          DashSetLine(line++, StringFormat("H%02d: %s (%d)", h, bar, g_rejHour[h]), clrSilver);
       }
+   }
+   // Feature 8A: update PAUSE button color
+   if(InpDashButtons)
+   {
+      color pauseCol = g_tradingPaused ? clrRed : clrGreen;
+      ObjectSetInteger(0, "MSPB_BTN_PAUSE", OBJPROP_BGCOLOR, pauseCol);
    }
 }
 
@@ -7695,6 +7859,12 @@ int OnInit()
    ArrayInitialize(g_execSlipHist,   0.0);
    ArrayInitialize(g_execBadHist,    0);
    ArrayInitialize(g_tgLastSendTime, 0);
+   // Feature 6C: initialize per-bucket adaptive thresholds from static inputs
+   for(int _b=0; _b<EXEC_QUAL_BUCKETS; _b++)
+   {
+      g_execSlipThresh[_b]   = InpExecQual_BadSlipPips;
+      g_execSpreadThresh[_b] = InpExecQual_SpreadAvgMult; // stored as multiplier baseline
+   }
 
    // Feature 4A: load ExecQual baselines from CSV if available
    ExecQual_LoadState();
@@ -7703,6 +7873,7 @@ int OnInit()
    EventSetTimer(MathMax(1, InpTimerSec));
 
    DashClear();
+   DashButtons_Create();
    DashboardUpdate();
 
    // Telegram startup test (optional)
@@ -7717,6 +7888,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   DashButtons_Delete();
    DashClear();
    ML_Close();
    Audit_Close();
@@ -7938,6 +8110,9 @@ void OnTimer()
          ExecQual_SaveState();
    }
 
+   // Feature 6C: adaptive threshold learning
+   ExecQual_AdaptThresholds();
+
    // Feature 5A: daily Telegram performance report
    if(InpTGDailyReport && InpEnableTelegram)
    {
@@ -7984,6 +8159,103 @@ double OnTester()
 
    if(InpTester_DDCapPct>0.0 && ddPct > InpTester_DDCapPct)
       return -1e9;
+
+   // Feature 7A: Walk-Forward IS/OOS harness
+   if(InpWF_Enable)
+   {
+      datetime tester_start = (datetime)TesterStatistics(STAT_INITIAL_DEPOSIT); // placeholder - use deal times
+      // Select all deals to determine date range
+      HistorySelect(0, INT_MAX);
+      int totalDeals = HistoryDealsTotal();
+
+      // Find actual date range from deals
+      datetime first_deal_time = 0, last_deal_time = 0;
+      for(int _d = 0; _d < totalDeals; _d++)
+      {
+         ulong tk = HistoryDealGetTicket(_d);
+         if(tk == 0) continue;
+         if(!IsMyMagic((long)HistoryDealGetInteger(tk, DEAL_MAGIC))) continue;
+         if((long)HistoryDealGetInteger(tk, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+         datetime dt = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+         if(first_deal_time == 0 || dt < first_deal_time) first_deal_time = dt;
+         if(dt > last_deal_time) last_deal_time = dt;
+      }
+
+      if(first_deal_time > 0 && last_deal_time > first_deal_time)
+      {
+         datetime split = first_deal_time + (datetime)((last_deal_time - first_deal_time) * InpWF_IS_FractionPct / 100.0);
+
+         // Collect IS and OOS daily returns
+         double isReturns[];
+         double oosReturns[];
+         ArrayResize(isReturns, 0);
+         ArrayResize(oosReturns, 0);
+
+         for(int _d = 0; _d < totalDeals; _d++)
+         {
+            ulong tk = HistoryDealGetTicket(_d);
+            if(tk == 0) continue;
+            if(!IsMyMagic((long)HistoryDealGetInteger(tk, DEAL_MAGIC))) continue;
+            if((long)HistoryDealGetInteger(tk, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+            datetime dt  = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+            double profit = HistoryDealGetDouble(tk, DEAL_PROFIT)
+                          + HistoryDealGetDouble(tk, DEAL_SWAP)
+                          + HistoryDealGetDouble(tk, DEAL_COMMISSION);
+            double vol = HistoryDealGetDouble(tk, DEAL_VOLUME);
+            if(vol <= 0.0) continue;
+            double ret = profit / (vol * 100000.0); // normalised return proxy
+            if(dt <= split)
+            {
+               int sz = ArraySize(isReturns);
+               ArrayResize(isReturns, sz + 1);
+               isReturns[sz] = ret;
+            }
+            else
+            {
+               int sz = ArraySize(oosReturns);
+               ArrayResize(oosReturns, sz + 1);
+               oosReturns[sz] = ret;
+            }
+         }
+
+         // Compute Sharpe: mean/stddev * sqrt(252)
+         double isSharpe = 0.0, oosSharpe = 0.0;
+         int isN = ArraySize(isReturns), oosN = ArraySize(oosReturns);
+
+         if(isN > 1)
+         {
+            double sumIS = 0.0;
+            for(int k = 0; k < isN; k++) sumIS += isReturns[k];
+            double meanIS = sumIS / isN;
+            double varIS = 0.0;
+            for(int k = 0; k < isN; k++) varIS += (isReturns[k] - meanIS) * (isReturns[k] - meanIS);
+            varIS /= (isN - 1);
+            if(varIS > 1e-12) isSharpe = meanIS / MathSqrt(varIS) * MathSqrt(252.0);
+         }
+         if(oosN > 1)
+         {
+            double sumOOS = 0.0;
+            for(int k = 0; k < oosN; k++) sumOOS += oosReturns[k];
+            double meanOOS = sumOOS / oosN;
+            double varOOS = 0.0;
+            for(int k = 0; k < oosN; k++) varOOS += (oosReturns[k] - meanOOS) * (oosReturns[k] - meanOOS);
+            varOOS /= (oosN - 1);
+            if(varOOS > 1e-12) oosSharpe = meanOOS / MathSqrt(varOOS) * MathSqrt(252.0);
+         }
+
+         double wfScore = isSharpe * InpWF_IS_SharpeWeight + oosSharpe * InpWF_OOS_SharpeWeight;
+
+         // Overfitting penalty: OOS Sharpe below 50% of IS Sharpe
+         double penalty = 1.0;
+         if(isSharpe > 0.0 && oosSharpe < 0.5 * isSharpe)
+            penalty = 0.5;
+         wfScore *= penalty;
+
+         Print(StringFormat("[WF_IS_OOS] split=%s IS_N=%d IS_Sharpe=%.3f OOS_N=%d OOS_Sharpe=%.3f WF_score=%.4f penalty=%.1f",
+               TimeToString(split), isN, isSharpe, oosN, oosSharpe, wfScore, penalty));
+         return wfScore;
+      }
+   }
 
    // Cap extreme PF values (usually caused by too few trades)
    if(pf > 10.0) pf = 10.0;
