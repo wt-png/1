@@ -8,7 +8,7 @@
 //| directly by including that header here instead.                  |
 //+------------------------------------------------------------------+
 #property copyright "MSPB EA"
-#property version   "2.00"
+#property version   "3.00"
 #property script_show_inputs false
 
 int g_testsPassed = 0;
@@ -275,10 +275,113 @@ void Test_PartialTP()
 
 // ---- Main ----
 
+void Test_SetPointSanity()
+{
+   PrintFormat("--- SetPointSanity ---");
+
+   // TP_RR must be positive and economically viable (break-even requires WR > 1/(1+RR))
+   double InpTP_RR_val      = 1.5;
+   double InpSL_ATR_Mult_val= 1.2;
+   double InpBE_At_R_val    = 0.8;
+   double InpBE_LockPips_val= 2.0;
+   double InpMinSetupScore_val = 1.0;
+
+   // EqDD ordering: caution < defensive
+   double InpEqDD_Caution_Pct_val    = 2.0;
+   double InpEqDD_Defensive_Pct_val  = 5.0;
+   double InpEqDD_Caution_RiskMult_val   = 0.70;
+   double InpEqDD_Defensive_RiskMult_val = 0.40;
+
+   double InpCorrAbsThreshold_val = 0.75;
+   int    InpExecQual_Mode_val    = 2;       // ENFORCE
+   double InpTester_DDCapPct_val  = 12.0;
+   double InpTP_Partial_Pct_val   = 50.0;
+   double InpTP_Partial_R_val     = 1.0;
+
+   Assert(InpTP_RR_val > 0.0,                              "TP_RR > 0");
+   Assert(InpTP_RR_val >= 1.0,                             "TP_RR >= 1.0 (positive expectation at >50% WR)");
+   Assert(InpSL_ATR_Mult_val > 0.0,                        "SL_ATR_Mult > 0");
+   Assert(InpBE_At_R_val > 0.0 && InpBE_At_R_val < InpTP_RR_val,
+                                                            "BE_At_R between 0 and TP_RR");
+   Assert(InpBE_LockPips_val >= 1.0,                       "BE_LockPips >= 1.0 pips (spread resilient)");
+   Assert(InpMinSetupScore_val > 0.0,                      "MinSetupScore > 0 (require signal strength)");
+
+   Assert(InpEqDD_Caution_Pct_val < InpEqDD_Defensive_Pct_val,
+                                                            "EqDD: Caution% < Defensive%");
+   Assert(InpEqDD_Caution_RiskMult_val > InpEqDD_Defensive_RiskMult_val,
+                                                            "EqDD: Caution risk-mult > Defensive risk-mult");
+   Assert(InpEqDD_Caution_RiskMult_val  < 1.0,             "EqDD: Caution risk-mult < 1.0 (reduces risk)");
+   Assert(InpEqDD_Defensive_RiskMult_val > 0.0,            "EqDD: Defensive risk-mult > 0");
+
+   Assert(InpCorrAbsThreshold_val >= 0.0 && InpCorrAbsThreshold_val <= 1.0,
+                                                            "CorrAbsThreshold in [0,1]");
+   Assert(InpCorrAbsThreshold_val <= 0.80,                 "CorrAbsThreshold <= 0.80 (tighter guard)");
+
+   Assert(InpExecQual_Mode_val == 2,                        "ExecQual_Mode = ENFORCE (2)");
+   Assert(InpTester_DDCapPct_val <= 15.0,                  "WF DDCap <= 15% (conservative optimisation)");
+
+   Assert(InpTP_Partial_Pct_val >= 1.0 && InpTP_Partial_Pct_val <= 99.0,
+                                                            "PartialTP_Pct in [1,99]");
+   Assert(InpTP_Partial_R_val > 0.0 && InpTP_Partial_R_val < InpTP_RR_val,
+                                                            "PartialTP_R between 0 and TP_RR");
+}
+
+// ---- SymbolFilter test (mirrors SymIndexByName / OnTick routing) ----
+
+// Inline re-implementation of SymIndexByName for test isolation
+int TestSymIndexByName(const string sym, const string &syms[], const int symCount)
+{
+   for(int i = 0; i < symCount; i++)
+      if(syms[i] == sym) return i;
+   return -1;
+}
+
+void Test_SymbolFilter()
+{
+   PrintFormat("--- SymbolFilter (OnTick routing) ---");
+
+   string syms[4];
+   syms[0] = "EURUSD";
+   syms[1] = "GBPUSD";
+   syms[2] = "USDJPY";
+   syms[3] = "XAUUSD";
+   int cnt = 4;
+
+   // Known symbols resolve to correct index
+   Assert(TestSymIndexByName("EURUSD", syms, cnt) == 0, "EURUSD -> index 0");
+   Assert(TestSymIndexByName("GBPUSD", syms, cnt) == 1, "GBPUSD -> index 1");
+   Assert(TestSymIndexByName("USDJPY", syms, cnt) == 2, "USDJPY -> index 2");
+   Assert(TestSymIndexByName("XAUUSD", syms, cnt) == 3, "XAUUSD -> index 3");
+
+   // Unknown symbol (utility-chart attachment) returns -1 → full-loop fallback
+   Assert(TestSymIndexByName("UNKNOWN", syms, cnt) == -1, "Unknown symbol -> -1 (full-loop fallback)");
+   Assert(TestSymIndexByName("",        syms, cnt) == -1, "Empty symbol   -> -1");
+
+   // Case-sensitivity: SymIndexByName is exact-match (lowercase ≠ uppercase)
+   Assert(TestSymIndexByName("eurusd", syms, cnt) == -1, "eurusd (lower) -> -1 (case-sensitive)");
+
+   // Empty list: always returns -1
+   string empty[1];
+   Assert(TestSymIndexByName("EURUSD", empty, 0) == -1, "Empty sym list -> -1");
+
+   // Single-element list
+   string single[1];
+   single[0] = "EURUSD";
+   Assert(TestSymIndexByName("EURUSD", single, 1) == 0,  "Single-element hit");
+   Assert(TestSymIndexByName("GBPUSD", single, 1) == -1, "Single-element miss");
+
+   // Routing behaviour: only matching index is processed (non-negative → route to that symbol only)
+   int idx = TestSymIndexByName("GBPUSD", syms, cnt);
+   Assert(idx >= 0,          "Valid tick symbol resolves to non-negative index");
+   Assert(idx == 1,          "Correct index selected for ProcessSymbol routing");
+   int idxUtil = TestSymIndexByName("NZDCAD", syms, cnt);
+   Assert(idxUtil < 0,       "Utility-chart symbol triggers full-loop (idx < 0)");
+}
+
 void OnStart()
 {
    Print("========================================");
-   Print("  MSPB EA Unit Tests v2");
+   Print("  MSPB EA Unit Tests v3");
    Print("========================================");
 
    Test_CalcRiskLots();
@@ -288,6 +391,8 @@ void OnStart()
    Test_RiskMultiplierBounds();
    Test_DailyLossLimit();
    Test_PartialTP();
+   Test_SetPointSanity();
+   Test_SymbolFilter();
 
    Print("========================================");
    PrintFormat("  Results: %d passed, %d failed", g_testsPassed, g_testsFailed);

@@ -1,9 +1,9 @@
 #property strict
 #property description "MultiSymbol Pullback Scalper: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
-#property version   "15.1"
+#property version   "15.2"
 
 // Semantic version exposed at runtime — used in startup logs and Telegram messages.
-#define EA_VERSION "15.1"
+#define EA_VERSION "15.2"
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -133,11 +133,11 @@ input double   InpEqDD_Caution_RiskMult   = 0.70;  // risk multiplier in CAUTION
 input double   InpEqDD_Defensive_RiskMult = 0.40;  // risk multiplier in DEFENSIVE
 
 // --- Daily loss limit
-input bool     InpDailyLossLimit_Enable   = false;
+input bool     InpDailyLossLimit_Enable   = true;
 input double   InpDailyLossLimitPct       = 2.0;   // max daily loss as % of balance at day start (stops new entries)
 
 // --- Consecutive loss guard
-input bool     InpConsecLoss_Enable       = false;
+input bool     InpConsecLoss_Enable       = true;
 input int      InpConsecLoss_MaxN         = 5;      // pause entries after N consecutive losses
 input int      InpConsecLoss_CooldownMin  = 60;     // pause duration in minutes
 
@@ -148,7 +148,7 @@ enum ExecQualMode
    EXEC_QUAL_SHADOW=1,
    EXEC_QUAL_ENFORCE=2
 };
-input int      InpExecQual_Mode                 = 1;      // 0=Off, 1=Shadow, 2=Enforce
+input int      InpExecQual_Mode                 = 2;      // 0=Off, 1=Shadow, 2=Enforce
 input bool     InpAllowAsiaEntries             = false;
 input int      InpExecQual_WindowPerBucket     = 50;
 input double   InpExecQual_BadSlipPips         = 1.2;
@@ -166,10 +166,10 @@ input int      InpMinMinutesBetweenEntriesPerSymbol = 30;
 
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.2;  // ATR multiplier for stop-loss
-input double   InpTP_RR                   = 0.8;  // risk:reward target
+input double   InpTP_RR                   = 1.5;  // risk:reward target (break-even at 40% win-rate)
 
 // --- Partial take-profit (scale out at first target)
-input bool     InpTP_Partial_Enable       = false;
+input bool     InpTP_Partial_Enable       = true;
 input double   InpTP_Partial_R            = 1.0;  // float-R at which to close partial portion
 input double   InpTP_Partial_Pct          = 50.0; // % of position to close at partial target (1–99)
 
@@ -187,7 +187,7 @@ input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
 
 // --- Setup scoring
-input double InpMinSetupScore  = 0.0;   // Minimum setup score to allow entry (0=disabled)
+input double InpMinSetupScore  = 1.0;   // Minimum setup score to allow entry (0=disabled)
 input bool   InpLogSetupScore  = false; // Log setup score for each candidate entry
 
 // --- Advanced filters / regimes (v9)
@@ -195,12 +195,12 @@ input bool     InpUseHTFBias              = true;
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H1;
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
-input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
+input bool     InpBias_FailClosed         = true; // if true: block entries when bias data not ready
 
 input bool     InpUseCorrelationGuard     = true;
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
-input double   InpCorrAbsThreshold        = 0.85;  // abs(corr) >= threshold blocks entry
+input double   InpCorrAbsThreshold        = 0.75;  // abs(corr) >= threshold blocks entry
 input bool     InpCorrFXLikeOnly          = true;  // only apply to FX-like symbols (base!=profit)
 
 // --- Execution / safety (v10)
@@ -238,7 +238,7 @@ input bool     InpUseSetup2               = true;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = false;
+input bool     InpUseSessions             = true;
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
@@ -265,7 +265,7 @@ input double   InpMaxSpreadPips_STOCK     = 50.0;   // stocks/CFDs default (if n
 // --- Break-even / trailing
 input bool     InpUseBreakEven            = true;
 input double   InpBE_At_R                 = 0.8;
-input double   InpBE_LockPips             = 1.0;
+input double   InpBE_LockPips             = 2.0;
 input double   InpBE_MinStepPips          = 0.5;
 
 input bool     InpUseATRTrailing          = true;
@@ -332,7 +332,7 @@ input int InpTGRateLimit_Alert_Ms  = 0;     // Rate limit ms for alerts (0=no li
 input bool     InpEnableAuditLog          = true;
 input bool     InpAuditFlushAlways        = false;
 
-input bool     InpEnableMLExport          = false;
+input bool     InpEnableMLExport          = true;
 input string   InpMLFile                  = "ml_export_v2.csv";
 input string   InpMLDelimiter             = ";";
 input int      InpMLFlushEveryNRows       = 50; // increased for IO perf
@@ -397,7 +397,7 @@ input int      InpSanityMode_Seconds       = 15;     // disable spike/trailing a
 input bool     InpDebug                   = true;
 input bool     InpShowDashboard           = true;
 input bool     InpShowRejHeatmap          = false;  // show per-hour rejection heatmap on dashboard
-input bool     InpDashButtons             = false;  // Show interactive Pause/Resume/Risk buttons on dashboard
+input bool     InpDashButtons             = true;   // Show interactive Pause/Resume/Risk buttons on dashboard
 input string   InpRuntimeStatePersistFile = "MSPB_RuntimeState.csv"; // Persist g_tradingPaused and g_riskMultiplierOverride across restarts
 
 
@@ -407,8 +407,8 @@ input string   InpRuntimeStatePersistFile = "MSPB_RuntimeState.csv"; // Persist 
 input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% spread stress (affects spread checks + deviation only)
 input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
-input double   InpTester_DDCapPct         = 20.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
-input bool     InpWF_Enable               = false;  // Enable walk-forward IS/OOS mode in OnTester
+input double   InpTester_DDCapPct         = 12.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
+input bool     InpWF_Enable               = true;  // Enable walk-forward IS/OOS mode in OnTester
 input double   InpWF_IS_FractionPct       = 70.0;   // In-sample fraction % (e.g. 70 = first 70% is IS)
 input double   InpWF_IS_SharpeWeight      = 0.5;    // Weight of IS Sharpe in combined score
 input double   InpWF_OOS_SharpeWeight     = 0.5;    // Weight of OOS Sharpe in combined score

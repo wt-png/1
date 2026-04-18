@@ -1,0 +1,314 @@
+; MSPB_Expert_Advisor.set — Production parameter file  v15.2
+; Generated: 2026-04-18
+;
+; Optimizer step/range annotations for the 5 highest-impact parameters:
+;   InpSL_ATR_Mult   : step 0.1  | range 0.8 – 2.0
+;   InpTP_RR         : step 0.1  | range 1.0 – 3.0
+;   InpMinADXForEntry: step 2    | range 14 – 30
+;   InpRiskPercent   : step 0.05 | range 0.10 – 0.60
+;   InpEqDD_Defensive_Pct: step 0.5 | range 3.0 – 8.0
+;
+; ── Symbols / TF ──────────────────────────────────────────────────────────────
+InpSymbols=EURUSD,GBPUSD,USDJPY,XAUUSD
+InpEntryTF=1
+InpConfirmTF=5
+;
+; ── Symbol resolution / overrides ────────────────────────────────────────────
+InpAutoResolveSymbols=true
+InpResolveAllowContainsMatch=false
+InpSymbolOverrides_Enable=true
+InpSymbolOverrides_File=MSPB_SymbolOverrides.csv
+InpSymbolOverrides_UseCommonFolder=false
+InpSymbolOverrides_HotReload=true
+InpSymbolOverrides_ReloadSec=60
+InpSymbolOverrides_PrintOnLoad=true
+;
+; ── General ──────────────────────────────────────────────────────────────────
+InpMagic=20250213
+InpMagicPerSymbol=false
+InpAllowBuy=true
+InpAllowSell=true
+InpMaxPositionsPerSymbol=2
+InpMaxPositionsTotal=6
+;
+; ── Entry driver / management ────────────────────────────────────────────────
+InpMTF_H4_Enable=false
+InpMTF_H4_EMA_Period=50
+InpUseTimerForEntries=true
+InpManageOnTick=true
+InpTimerSec=1
+;
+; ── Risk ─────────────────────────────────────────────────────────────────────
+InpUseRiskPercent=true
+InpRiskPercent=0.3                     ; [opt] step=0.05 range=0.10–0.60
+InpLots=0.01
+InpUsePortfolioRiskGuard=true
+InpMaxPortfolioRiskPct=2.0
+InpRisk_Cap_Mode=1
+InpRisk_Cap_USD_R=1.0
+InpRisk_Cap_EUR_R=1.0
+InpRisk_Cap_GBP_R=1.0
+InpRisk_Cap_Other_R=1.0
+InpRisk_Cap_LogDetail=true
+InpRisk_Cap_TelegramCooldownSec=120
+;
+; ── Equity-regime drawdown thresholds ────────────────────────────────────────
+InpEqDD_Caution_Pct=2.0
+InpEqDD_Defensive_Pct=5.0              ; [opt] step=0.5 range=3.0–8.0
+InpEqDD_Caution_RiskMult=0.7
+InpEqDD_Defensive_RiskMult=0.4
+;
+; ── Daily loss limit (ENABLED — critical safety net) ─────────────────────────
+InpDailyLossLimit_Enable=true
+InpDailyLossLimitPct=2.0
+;
+; ── Consecutive loss guard (ENABLED) ─────────────────────────────────────────
+InpConsecLoss_Enable=true
+InpConsecLoss_MaxN=5
+InpConsecLoss_CooldownMin=60
+;
+; ── Execution quality gate — ENFORCE mode ────────────────────────────────────
+InpExecQual_Mode=2                     ; 2=Enforce (requires shadow data; set to 1 first week)
+InpAllowAsiaEntries=false
+InpExecQual_WindowPerBucket=50
+InpExecQual_BadSlipPips=1.2
+InpExecQual_MaxBadFillRate=0.35
+InpExecQual_SpreadAvgMult=2.5
+InpExecQual_BlockCooldownSec=120
+InpExecQual_TelegramCooldownSec=120
+InpExecQual_Persist=true
+InpExecQual_PersistFile=MSPB_ExecQual_State.csv
+InpExecQual_AdaptThresholds=false
+InpExecQual_LearnRate=0.1
+InpExecQual_LearnMinSamples=30
+InpExecQual_LearnIntervalMin=60
+InpMinMinutesBetweenEntriesPerSymbol=30
+;
+; ── SL/TP ─────────────────────────────────────────────────────────────────────
+InpSL_ATR_Mult=1.2                     ; [opt] step=0.1 range=0.8–2.0
+InpTP_RR=1.5                           ; [opt] step=0.1 range=1.0–3.0
+;
+; ── Partial TP (ENABLED) ─────────────────────────────────────────────────────
+InpTP_Partial_Enable=true
+InpTP_Partial_R=1.0
+InpTP_Partial_Pct=50.0
+;
+; ── Filters ──────────────────────────────────────────────────────────────────
+InpUsePullbackEMA=false
+InpEMA_Period=50
+InpUseATRFilter=true
+InpMinATR_Pips=10.0
+InpUseADXFilter=true
+InpADX_Period=7
+InpATR_Period=7
+InpMinADXForEntry=20.0                 ; [opt] step=2 range=14–30
+InpMinADXEntryFilter=20.0
+InpUseBodyFilter=false
+InpMinBodyPips=2.0
+;
+; ── Setup scoring ─────────────────────────────────────────────────────────────
+InpMinSetupScore=1.0
+InpLogSetupScore=false
+;
+; ── HTF Bias (FailClosed = true — safe cold-start behaviour) ─────────────────
+InpUseHTFBias=true
+InpBiasTF=16385
+InpBiasEMAFast=50
+InpBiasEMASlow=200
+InpBias_FailClosed=true
+;
+; ── Correlation guard (threshold tightened to 0.75) ──────────────────────────
+InpUseCorrelationGuard=true
+InpCorrTF=5
+InpCorrLookbackBars=120
+InpCorrAbsThreshold=0.75
+InpCorrFXLikeOnly=true
+InpCorrSameExposureOnly=true
+InpCorrUseWeightedExposure=true
+InpCorrMaxWeightedLots=2.0
+;
+; ── Execution / safety ───────────────────────────────────────────────────────
+InpUseMarketOrdersNoPrice=true
+InpUseAdaptiveDeviation=true
+InpDev_MinPoints=10
+InpDev_SpreadMult=2.0
+InpDev_ATRMult=0.1
+InpDev_MaxPoints=200
+;
+; ── Cooldown ─────────────────────────────────────────────────────────────────
+InpUseSymbolCooldown=true
+InpCooldownLossOnly=true
+InpCooldownLossMinR=0.1
+InpCooldownSLMin=5
+InpCooldownTPMin=0
+InpCooldownManualMin=1
+;
+; ── Volatility regime ────────────────────────────────────────────────────────
+InpUseVolRegime=true
+InpVolRegimeTF=5
+InpVolRegimeLookbackBars=200
+InpVolLowPct=20.0
+InpVolHighPct=80.0
+InpVolLowBlockEntries=true
+InpVolHighRiskMult=0.5
+;
+; ── Setup2 ───────────────────────────────────────────────────────────────────
+InpUseSetup2=true
+InpUseBreakPrevHighLow=true
+;
+; ── Sessions (ENABLED — London + NY only) ────────────────────────────────────
+InpUseSessions=true
+InpLondonStartHour=7
+InpLondonEndHour=17
+InpNYStartHour=12
+InpNYEndHour=21
+;
+; ── Session-adaptive ADX/ATR ─────────────────────────────────────────────────
+InpADX_Asia=20.0
+InpADX_London=22.0
+InpADX_NY=20.0
+InpATR_Min_Asia=0.0003
+InpATR_Min_London=0.0004
+InpATR_Min_NY=0.0003
+;
+; ── ExecQual session-bucket boundaries ───────────────────────────────────────
+InpExecQual_AsiaEndH=6
+InpExecQual_LondonEndH=11
+InpExecQual_NYEndH=20
+;
+; ── Spread ───────────────────────────────────────────────────────────────────
+InpMaxSpreadPips_FX=25.0
+InpMaxSpreadPips_XAU=500.0
+InpMaxSpreadPips_STOCK=50.0
+;
+; ── Break-even / trailing ────────────────────────────────────────────────────
+InpUseBreakEven=true
+InpBE_At_R=0.8
+InpBE_LockPips=2.0
+InpBE_MinStepPips=0.5
+InpUseATRTrailing=true
+InpTrail_ATR_Mult=1.2
+InpTrail_MinStepPips=0.8
+InpUseNewsAwareTrailing=true
+InpIgnoreNewsTriggersDuringRollover=false
+InpNewsSpike_ATR_Mult=2.5
+InpNewsSpike_TightenMult=0.6
+InpNewsSpike_CooldownMin=30
+InpNewsFreezeBE=true
+InpNewsSpike_MinATRPips=0.0
+;
+; ── Exits ────────────────────────────────────────────────────────────────────
+InpUseTimeStop=true
+InpTimeStopBars=2
+InpUseProtectMode=true
+InpDSP_CloseWinnerBelowPipsIfNoSL=true
+InpDSP_CloseWinnerBelowPips=3.0
+InpDSP_MinHoldBars=3
+;
+; ── Telegram ─────────────────────────────────────────────────────────────────
+InpEnableTelegram=false               ; set true after placing MSPB_Telegram.cfg
+InpTGMessagePrefix=EA
+InpTGEnableIncoming=false
+InpTGDailyReport=true
+InpTGDailyReportHour=0
+InpTGDailyReportMinute=5
+InpTGIncomingEnable=false
+InpTGIncomingSecret=
+InpTGPollIntervalSec=30
+InpMaxRiskMultiplier=3.0
+InpTGConfigFile=MSPB_Telegram.cfg
+InpTGConfig_UseCommonFolder=false
+InpTGConfig_HotReload=true
+InpTGConfig_ReloadSec=300
+InpTGTimeoutMS=5000
+InpTGDisableWebPreview=true
+InpTGTestOnInit=true
+InpTGNotifyEntries=false
+InpTGNotifyExitDeals=false
+InpTGUseQueue=true
+InpTGRateLimitMs=1000
+InpTGBackoffMaxSec=60
+InpTGRateLimit_Trade_Ms=500
+InpTGRateLimit_Risk_Ms=1000
+InpTGRateLimit_System_Ms=2000
+InpTGRateLimit_Alert_Ms=0
+;
+; ── Audit / ML export (ML ENABLED) ───────────────────────────────────────────
+InpEnableAuditLog=true
+InpAuditFlushAlways=false
+InpEnableMLExport=true
+InpMLFile=ml_export_v2.csv
+InpMLDelimiter=;
+InpMLFlushEveryNRows=50
+InpMLLogSLMods=true
+InpMLLogFailedOrders=false
+;
+; ── Auto-proposal ─────────────────────────────────────────────────────────────
+InpProposalOnClosedTrades=true
+InpProposalClosedTradesTrigger=30
+InpProposalMinMinutesBetween=60
+InpProposalLookbackDays=365
+InpProposalSaveToFile=true
+InpProposalFileName=MSPB_OptimizationProposal.txt
+InpProposalAppendToFile=true
+InpProposalUseCommonFolder=false
+InpProposalSplitPerSymbolFiles=true
+InpProposalMAEMFETF=1
+InpProposalMAEMFE_MaxBars=5000
+InpProposalMinTradesPerSymbol=5
+InpProposalMAEMFE_MinTradeMinutes=0
+;
+; ── Monthly tuning ────────────────────────────────────────────────────────────
+InpTune_Enable=false
+InpTune_StateFile=MSPB_TuneState.csv
+InpTune_StateUseCommonFolder=false
+InpProposalTradesPerSymbol=300
+InpTune_BaselineTrades=300
+InpTune_MonthlyNotify_Enable=true
+InpTune_RunHour=2
+InpTune_RunMinute=0
+InpTune_RunWindowMinutes=10
+InpTune_Rollback_Enable=true
+InpTune_Rollback_MinDays=14
+InpTune_Rollback_MinTrades=50
+InpTune_Rollback_PF_Drop=0.1
+InpTune_Rollback_DD_IncreasePct=10.0
+InpTune_Rollback_AvgR_Drop=0.0
+InpTune_CheckEverySec=1800
+InpTune_Rollback_AutoApply=true
+InpTune_Rollback_StopEntries=true
+;
+; ── SL modify retries ────────────────────────────────────────────────────────
+InpSLModRetryTransient=true
+InpSLModMaxRetries=1
+InpSLModRetrySleepMS=100
+;
+; ── Fail-safe ────────────────────────────────────────────────────────────────
+InpFailSafeStopEntriesOnMLFail=true
+InpFailSafeStopEntriesOnAuditFail=false
+;
+; ── Sanity mode ──────────────────────────────────────────────────────────────
+InpSanityMode_Enable=true
+InpSanityMode_Seconds=15
+;
+; ── Debug / Dashboard ────────────────────────────────────────────────────────
+InpDebug=true
+InpShowDashboard=true
+InpShowRejHeatmap=false
+InpDashButtons=true
+InpRuntimeStatePersistFile=MSPB_RuntimeState.csv
+;
+; ── Tester / Walk-forward (WF ENABLED, DD cap 12%) ───────────────────────────
+InpSpreadStressMult=1.0
+InpTester_UseCustomCriterion=false
+InpTester_MinTradesForFullScore=200
+InpTester_DDCapPct=12.0
+InpWF_Enable=true
+InpWF_IS_FractionPct=70.0
+InpWF_IS_SharpeWeight=0.5
+InpWF_OOS_SharpeWeight=0.5
+InpAppliedLog_Enable=true
+InpAppliedLog_File=MSPB_AppliedSettings.csv
+InpAppliedLog_UseCommonFolder=false
+InpTradeDensity_MinTrades30d_Warn=30
+InpTradeDensity_CheckSec=3600
