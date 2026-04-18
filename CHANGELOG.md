@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [17.0] — 2026-04-18
+
+### Architecture
+- **`MSPB_EA_PositionManager.mqh`** extracted — deal-queue ring-buffer, position closure tracker, and `ProcessDealQueue` moved out of monolith (~345 lines removed)
+- **`MSPB_EA_SymbolConfig.mqh`** extracted — `SymbolOverrides` struct, CSV load/hot-reload, convenience getters (~220 lines removed)
+- **`MSPB_EA_OrderExec.mqh`** extracted — `IsTransientRetcode`, `SendSLTPModifyByTicket`, `ModifySL_Safe`, `ClosePositionByTicketSafe` (~250 lines removed)
+
+### Robustness
+- **Broker disconnect recovery** in `OnTimer` — detects loss/restoration of broker connection; logs and sends Telegram alert on each state change
+
+### Performance
+- **`SymIndexByName` O(1) HashMap** — 128-slot open-addressing hash map replaces O(n) linear scan; `SymMap_Rebuild()` called once after symbol list is finalised in `OnInit`
+
+### Tooling
+- **`tools/walk_forward.py`** — standalone CLI walk-forward IS/OOS validator; reads EA ML export CSV, computes per-window Sharpe/Calmar/PF, prints summary table with OOS efficiency warnings
+- **`tools/test_walk_forward.py`** — 16 pytest tests covering all statistical helpers and the walk-forward engine
+
+---
+
 ## [16.0] — 2026-04-18
 
 ### Added
