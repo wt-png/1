@@ -444,6 +444,8 @@ input int      InpMaxPositionsPerSymbol   = 2;
 input int      InpMaxPositionsTotal       = 6;
 
 // --- Entry driver / management
+input bool   InpMTF_H4_Enable       = false;  // Enable H4 trend filter
+input int    InpMTF_H4_EMA_Period   = 50;     // H4 EMA period for trend direction
 input bool     InpUseTimerForEntries      = true;   // if true, entries evaluated in OnTimer; else in OnTick
 input bool     InpManageOnTick            = true;   // if true, position mgmt runs on tick; else in timer
 input int      InpTimerSec                = 1;
@@ -516,6 +518,9 @@ input double   InpMinADXEntryFilter       = 20.0;
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
 
+// --- Setup scoring
+input double InpMinSetupScore  = 0.0;   // Minimum setup score to allow entry (0=disabled)
+input bool   InpLogSetupScore  = false; // Log setup score for each candidate entry
 
 // --- Advanced filters / regimes (v9)
 input bool     InpUseHTFBias              = true;
@@ -569,6 +574,14 @@ input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
+
+// --- Session-adaptive ADX/ATR thresholds
+input double InpADX_Asia    = 20.0;  // Min ADX during Asia session
+input double InpADX_London  = 22.0;  // Min ADX during London session
+input double InpADX_NY      = 20.0;  // Min ADX during NY session
+input double InpATR_Min_Asia   = 0.0003; // Min ATR during Asia (0=use global)
+input double InpATR_Min_London = 0.0004; // Min ATR during London (0=use global)
+input double InpATR_Min_NY     = 0.0003; // Min ATR during NY (0=use global)
 
 // --- ExecQual session-bucket hour boundaries (broker server time, inclusive end)
 input int      InpExecQual_AsiaEndH       = 6;    // hours 0..AsiaEndH → ASIA bucket
@@ -629,6 +642,12 @@ input bool     InpTGNotifyExitDeals       = false;  // send exit-deal notificati
 input bool     InpTGUseQueue              = true;   // queue + rate limit (recommended to avoid blocking/spam)
 input int      InpTGRateLimitMs           = 1000;   // min delay between Telegram sends (ms). 1000 => 1 msg/sec
 input int      InpTGBackoffMaxSec         = 60;     // max backoff on Telegram errors/429
+
+// --- Per-category Telegram rate limits
+input int InpTGRateLimit_Trade_Ms  = 500;   // Rate limit ms for trade messages
+input int InpTGRateLimit_Risk_Ms   = 1000;  // Rate limit ms for risk alerts
+input int InpTGRateLimit_System_Ms = 2000;  // Rate limit ms for system messages
+input int InpTGRateLimit_Alert_Ms  = 0;     // Rate limit ms for alerts (0=no limit)
 
 input bool     InpEnableAuditLog          = true;
 input bool     InpAuditFlushAlways        = false;
@@ -780,6 +799,10 @@ bool     g_failSafeStopEntries=false;
 string   g_failSafeReason="";
 datetime g_failSafeSince=0;
 void     FailSafe_Trip(const string why); // forward declaration
+
+// --- Session-adaptive threshold helpers (defined later, after GetSessionBucket)
+double SessionADXMin();
+double SessionATRMin();
 
 // --- Tune state / auto-rollback (v11)
 void     TuneState_Load();
@@ -968,19 +991,19 @@ double Sym_MinATR_Pips(const string sym)
 {
    int k=FindOverrideIndex(sym);
    if(k>=0 && g_ovr[k].minATR_Pips>0) return g_ovr[k].minATR_Pips;
-   return InpMinATR_Pips;
+   return SessionATRMin();
 }
 double Sym_MinADXTrend(const string sym)
 {
    int k=FindOverrideIndex(sym);
    if(k>=0 && g_ovr[k].minADXTrend>0) return g_ovr[k].minADXTrend;
-   return InpMinADXForEntry;
+   return SessionADXMin();
 }
 double Sym_MinADXEntry(const string sym)
 {
    int k=FindOverrideIndex(sym);
    if(k>=0 && g_ovr[k].minADXEntry>0) return g_ovr[k].minADXEntry;
-   return InpMinADXEntryFilter;
+   return SessionADXMin();
 }
 double Sym_MinBodyPips(const string sym)
 {
@@ -1314,7 +1337,7 @@ bool DailyLoss_IsTripped()
       g_dailyLossTripped = true;
       string msg = StringFormat("DAILY_LOSS_LIMIT hit: %.2f%% (limit=%.2f%%)", ddPct, InpDailyLossLimitPct);
       Print(msg);
-      if(InpEnableTelegram) TelegramSendMessage(msg);
+      if(InpEnableTelegram) TelegramSendMessage(msg, TGC_RISK);
    }
    return g_dailyLossTripped;
 }
@@ -1341,7 +1364,7 @@ void ConsecLoss_OnTradeClosed(const double profitMoney)
          string msg = StringFormat("CONSEC_LOSS_BLOCK: %d consecutive losses → entries paused for %d min.",
                                    InpConsecLoss_MaxN, InpConsecLoss_CooldownMin);
          Print(msg);
-         if(InpEnableTelegram) TelegramSendMessage(msg);
+         if(InpEnableTelegram) TelegramSendMessage(msg, TGC_RISK);
       }
    }
    else
@@ -1749,6 +1772,19 @@ int      g_tgQHead=0, g_tgQTail=0;
 datetime g_tgNextSend=0;
 int      g_tgBackoffSec=0;
 
+// Per-category rate limiting
+enum ETGCategory { TGC_TRADE=0, TGC_RISK=1, TGC_SYSTEM=2, TGC_ALERT=3, TGC_COUNT=4 };
+datetime g_tgLastSendTime[TGC_COUNT];  // per-category last send timestamp (ms precision via GetTickCount)
+
+int TGCategoryRateLimitMs(const ETGCategory cat)
+{
+   if(cat==TGC_TRADE)  return InpTGRateLimit_Trade_Ms;
+   if(cat==TGC_RISK)   return InpTGRateLimit_Risk_Ms;
+   if(cat==TGC_SYSTEM) return InpTGRateLimit_System_Ms;
+   if(cat==TGC_ALERT)  return InpTGRateLimit_Alert_Ms;
+   return InpTGRateLimitMs;
+}
+
 bool TGQ_IsEmpty(){ return g_tgQHead==g_tgQTail; }
 int  TGQ_Next(const int x){ return (x+1)%TGQ_MAX; }
 
@@ -1880,9 +1916,21 @@ bool TelegramSendNow(const string msg, int &httpOut, string &respOut)
    return true;
 }
 
-bool TelegramSendMessage(const string msg)
+bool TelegramSendMessage(const string msg, const ETGCategory cat=TGC_TRADE)
 {
    if(!InpEnableTelegram) return false;
+
+   // Per-category rate limiting (using datetime seconds as proxy)
+   int catRateMs = TGCategoryRateLimitMs(cat);
+   if(catRateMs > 0)
+   {
+      datetime now = TimeCurrent();
+      int catRateSec = (int)MathCeil((double)catRateMs / 1000.0);
+      if(catRateSec < 1) catRateSec = 1;
+      if(g_tgLastSendTime[cat] > 0 && (now - g_tgLastSendTime[cat]) < catRateSec)
+         return false; // rate-limited for this category
+      g_tgLastSendTime[cat] = now;
+   }
 
    // Queue mode avoids blocking the trading thread and reduces 429 risk
    if(!InpTGUseQueue)
@@ -1949,7 +1997,7 @@ void FailSafe_Trip(const string why)
    Print("FAILSAFE: Entries stopped. Reason=", why);
 
    if(InpEnableTelegram)
-      TelegramSendMessage("FAILSAFE: Entries stopped. Reason=" + why);
+      TelegramSendMessage("FAILSAFE: Entries stopped. Reason=" + why, TGC_RISK);
 }
 
 // -----------------------------------------
@@ -2000,7 +2048,7 @@ void Audit_Log(const string ev, const string kv, const bool sendTelegram=false)
          FailSafe_Trip("AUDIT_WRITE_FAIL");
    }
 
-   if(sendTelegram) TelegramSendMessage(line);
+   if(sendTelegram) TelegramSendMessage(line, TGC_SYSTEM);
 }
 
 void Audit_Close()
@@ -2662,7 +2710,7 @@ void RiskCap_SendBlockedTelegram(const string msg)
       return;
    }
    g_riskCapLastTG=now;
-   TelegramSendMessage(msg);
+   TelegramSendMessage(msg, TGC_RISK);
 }
 
 bool RiskCap_AllowsEntry(const int symIdx,
@@ -3330,6 +3378,7 @@ int g_adxEntryHandle[64]; // NEW: ADX on entry TF (entry filter)
 int g_biasFastHandle[64]; // v9: HTF bias EMA fast
 int g_biasSlowHandle[64]; // v9: HTF bias EMA slow
 int g_atrVolHandle[64];   // v9: volatility regime ATR on InpVolRegimeTF
+int g_h4EmaHandle[64];    // H4 EMA for MTF trend confirmation
 
 
 // Copy buffer helper
@@ -3472,6 +3521,24 @@ int GetSessionBucket(const datetime serverTime)
    if(h <= InpExecQual_LondonEndH) return SESSION_LONDON;
    if(h <= InpExecQual_NYEndH)     return SESSION_NEWYORK;
    return SESSION_UNKNOWN;
+}
+
+double SessionADXMin()
+{
+   int bucket = GetSessionBucket(TimeCurrent());
+   if(bucket == SESSION_ASIA)    return InpADX_Asia;
+   if(bucket == SESSION_LONDON)  return InpADX_London;
+   if(bucket == SESSION_NEWYORK) return InpADX_NY;
+   return InpMinADXForEntry; // off-session fallback
+}
+
+double SessionATRMin()
+{
+   int bucket = GetSessionBucket(TimeCurrent());
+   if(bucket == SESSION_ASIA    && InpATR_Min_Asia   > 0) return InpATR_Min_Asia;
+   if(bucket == SESSION_LONDON  && InpATR_Min_London > 0) return InpATR_Min_London;
+   if(bucket == SESSION_NEWYORK && InpATR_Min_NY     > 0) return InpATR_Min_NY;
+   return InpMinATR_Pips; // fallback to global pip-based threshold
 }
 
 int ExecQual_WindowSize()
@@ -3741,7 +3808,7 @@ bool ExecQual_AllowsEntry(const int symIdx,
    }
 
    if(ExecQual_ShouldSendTelegram())
-      TelegramSendMessage(StringFormat("%s %s %s %s", ev, sym, dir, mlKv));
+      TelegramSendMessage(StringFormat("%s %s %s %s", ev, sym, dir, mlKv), TGC_ALERT);
 
    if(!enforce) return true;
 
@@ -4037,7 +4104,7 @@ void ProcessDealQueue()
       {
          int d=(int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
          TelegramSendMessage(StringFormat("EXIT %s | deal=%I64d | profit=%.2f | price=%s | %s",
-                                          sym, (long)dealTicket, profit, DoubleToString(price,d), Shorten(comment,40)));
+                                          sym, (long)dealTicket, profit, DoubleToString(price,d), Shorten(comment,40)), TGC_TRADE);
       }
 
       if(InpEnableMLExport)
@@ -4709,7 +4776,7 @@ void GenerateTradeCountProposal()
    {
       string tg = report;
       if(StringLen(tg) > 3500) tg = StringSubstr(tg, 0, 3500) + "...";
-      TelegramSendMessage(tg);
+      TelegramSendMessage(tg, TGC_SYSTEM);
    }
 
    // Save combined report
@@ -5499,7 +5566,7 @@ void Tune_StartTrial(const string symNorm, TuneStateRow &row, const SymbolOverri
 
    string msg = StringFormat("[TUNE] New settings detected for %s. Trial started. Baseline: trades=%d PF=%.2f DD=%.2f AvgR=%.3f Net=%.2f",
                              symNorm, row.base_trades, row.base_pf, row.base_dd, row.base_avgr, row.base_net);
-   TelegramSendMessage(msg);
+   TelegramSendMessage(msg, TGC_SYSTEM);
 
    TuneState_Save();
 }
@@ -5543,7 +5610,7 @@ void Tune_HandleRollback(const string symNorm, TuneStateRow &row, const TunePerf
    string msg=StringFormat("[TUNE][ROLLBACK] %s: Trial FAILED. Baseline(PF=%.2f DD=%.2f AvgR=%.3f) -> Trial(PF=%.2f DD=%.2f AvgR=%.3f trades=%d).",
                            symNorm, row.base_pf, row.base_dd, row.base_avgr, trial.pf, trial.maxDD, trial.avgR, trial.trades);
 
-   TelegramSendMessage(msg);
+   TelegramSendMessage(msg, TGC_SYSTEM);
 
    if(!InpTune_Rollback_AutoApply)
    {
@@ -5556,7 +5623,7 @@ void Tune_HandleRollback(const string symNorm, TuneStateRow &row, const TunePerf
 
    if(row.prev_sig=="" || row.prev_sig==row.active_sig)
    {
-      TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: No previous settings stored. Stopping entries.", symNorm));
+      TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: No previous settings stored. Stopping entries.", symNorm), TGC_SYSTEM);
       FailSafe_Trip("Tune rollback no prev");
       row.trial_active=false;
       TuneState_Save();
@@ -5565,7 +5632,7 @@ void Tune_HandleRollback(const string symNorm, TuneStateRow &row, const TunePerf
 
    if(!Tune_WriteOverrideRow(symNorm, row.prev_ovr))
    {
-      TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: FAILED to write overrides file. Stopping entries.", symNorm));
+      TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: FAILED to write overrides file. Stopping entries.", symNorm), TGC_SYSTEM);
       FailSafe_Trip("Tune rollback write failed");
       row.trial_active=false;
       TuneState_Save();
@@ -5582,7 +5649,7 @@ void Tune_HandleRollback(const string symNorm, TuneStateRow &row, const TunePerf
 
    TuneState_Save();
 
-   TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: Previous settings restored.", symNorm));
+   TelegramSendMessage(StringFormat("[TUNE][ROLLBACK] %s: Previous settings restored.", symNorm), TGC_SYSTEM);
 }
 
 void Tune_HandleAccept(const string symNorm, TuneStateRow &row, const TunePerf &trial)
@@ -5592,7 +5659,7 @@ void Tune_HandleAccept(const string symNorm, TuneStateRow &row, const TunePerf &
 
    string msg=StringFormat("[TUNE][ACCEPT] %s: Trial PASSED. Baseline(PF=%.2f DD=%.2f AvgR=%.3f) -> Trial(PF=%.2f DD=%.2f AvgR=%.3f trades=%d).",
                            symNorm, row.base_pf, row.base_dd, row.base_avgr, trial.pf, trial.maxDD, trial.avgR, trial.trades);
-   TelegramSendMessage(msg);
+   TelegramSendMessage(msg, TGC_SYSTEM);
 }
 
 void Tune_MaybeCheckRollback()
@@ -5653,7 +5720,7 @@ void Tune_MaybeMonthlyNotify()
    int nAll=BuildClosedTradesFromHistory(allTrades);
    if(nAll<=0)
    {
-      TelegramSendMessage("[TUNE] Monthly check: no closed trades found in history.");
+      TelegramSendMessage("[TUNE] Monthly check: no closed trades found in history.", TGC_SYSTEM);
       return;
    }
    SortTradesByCloseTime(allTrades);
@@ -5679,9 +5746,9 @@ void Tune_MaybeMonthlyNotify()
    }
 
    if(any)
-      TelegramSendMessage(msg + "Ready to run TRAIN/OOS optimization.");
+      TelegramSendMessage(msg + "Ready to run TRAIN/OOS optimization.", TGC_SYSTEM);
    else
-      TelegramSendMessage(msg + "No symbol has enough NEW trades yet.");
+      TelegramSendMessage(msg + "No symbol has enough NEW trades yet.", TGC_SYSTEM);
 }
 
 
@@ -6204,6 +6271,65 @@ double ComputeTP(const string sym, const bool isBuy, const double entry, const d
 }
 
 // -----------------------------------------
+// Setup scoring (0-100)
+// -----------------------------------------
+double CalcSetupScore(const int symIdx, const string sym, const bool isLong,
+                      const double adxTrend, const double atrPips,
+                      const double spreadPips, const bool htfAgrees)
+{
+   double score = 0.0;
+
+   // ADX strength: 0-25 pts (ADX 15→0, ADX 30→25 linear)
+   double adxClamp = MathMax(15.0, MathMin(30.0, adxTrend));
+   score += ((adxClamp - 15.0) / 15.0) * 25.0;
+
+   // ATR volatility regime: check percentile using VolRegime
+   double volMult=1.0; bool volBlock=false; double volPct=50.0;
+   VolRegime_Get(symIdx, sym, volMult, volBlock, volPct);
+   if(volBlock)
+      score += 0.0;   // extreme regime
+   else if(volPct <= InpVolLowPct || volPct >= InpVolHighPct)
+      score += 10.0;  // low or high vol
+   else
+      score += 20.0;  // normal vol
+
+   // Trend alignment (HTF bias agrees with signal): 0 or 20 pts
+   if(htfAgrees) score += 20.0;
+
+   // ExecQual gate: spread ok and not in block-cooldown
+   bool spreadOk = SpreadAllowsPrices(sym,
+                      SymbolInfoDouble(sym, SYMBOL_BID),
+                      SymbolInfoDouble(sym, SYMBOL_ASK));
+   bool execNotBlocked = !(InpExecQual_BlockCooldownSec>0 &&
+                           g_execBlockUntil[symIdx]>0 &&
+                           TimeCurrent()<g_execBlockUntil[symIdx]);
+   if(spreadOk && execNotBlocked) score += 15.0;
+
+   // Session bucket: London/NY=15, Asia/Other=5
+   int bucket = GetSessionBucket(TimeCurrent());
+   if(bucket == SESSION_LONDON || bucket == SESSION_NEWYORK)
+      score += 15.0;
+   else
+      score += 5.0;
+
+   // H4 MTF trend confirm bonus (+5 if enabled and confirmed)
+   if(InpMTF_H4_Enable && g_h4EmaHandle[symIdx]!=INVALID_HANDLE)
+   {
+      double h4buf[2];
+      ArraySetAsSeries(h4buf, true);
+      if(CopyBuffer(g_h4EmaHandle[symIdx], 0, 0, 2, h4buf) >= 2)
+      {
+         double h4price = iClose(sym, PERIOD_H4, 0);
+         bool h4bull = h4price > h4buf[0];
+         if((isLong && h4bull) || (!isLong && !h4bull))
+            score += 5.0;
+      }
+   }
+
+   return MathMin(100.0, score);
+}
+
+// -----------------------------------------
 // ProcessSymbol
 // -----------------------------------------
 void ProcessSymbol(const int idx, const string sym)
@@ -6367,6 +6493,42 @@ void ProcessSymbol(const int idx, const string sym)
       if(bdir<0 &&  isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
    }
 
+   // H4 trend confirmation
+   if(InpMTF_H4_Enable)
+   {
+      double h4ema[2];
+      if(CopyBuffer(g_h4EmaHandle[idx], 0, 0, 2, h4ema) >= 2)
+      {
+         double h4price = iClose(sym, PERIOD_H4, 0);
+         bool h4bullish = h4price > h4ema[0];
+         if(isBuy && !h4bullish)  { IncReject(idx, REJ_BIAS_FAIL); return; }
+         if(!isBuy && h4bullish)  { IncReject(idx, REJ_BIAS_FAIL); return; }
+      }
+   }
+
+   // Setup scoring gate
+   if(InpMinSetupScore > 0.0 || InpLogSetupScore)
+   {
+      bool htfAgrees = true;
+      if(InpUseHTFBias)
+      {
+         double bf2=0.0, bs2=0.0;
+         int bdir2 = GetBiasDirCached(idx, sym, bf2, bs2);
+         if(bdir2==1 && isBuy)   htfAgrees = true;
+         else if(bdir2==-1 && !isBuy) htfAgrees = true;
+         else if(bdir2==0)        htfAgrees = true;  // flat = neutral, don't penalise
+         else                     htfAgrees = false;
+      }
+      double score = CalcSetupScore(idx, sym, isBuy, adxTrend, atrPips, spreadPips, htfAgrees);
+      if(InpLogSetupScore)
+         PrintFormat("SETUP_SCORE %s %s score=%.1f", sym, (isBuy?"BUY":"SELL"), score);
+      if(InpMinSetupScore > 0.0 && score < InpMinSetupScore)
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         return;
+      }
+   }
+
 
    // combined risk multiplier (equity regime * vol regime)
    double tradeRiskMult = g_riskMult * volMult;
@@ -6507,7 +6669,7 @@ void ProcessSymbol(const int idx, const string sym)
                                              sym, setup, lots,
                                              DoubleToString(entry,d),
                                              DoubleToString(sl,d),
-                                             DoubleToString(tp,d)));
+                                             DoubleToString(tp,d)), TGC_TRADE);
          }
       }
    }
@@ -6635,7 +6797,7 @@ void ProcessSymbol(const int idx, const string sym)
                                              sym, setup, lots,
                                              DoubleToString(entry,d),
                                              DoubleToString(sl,d),
-                                             DoubleToString(tp,d)));
+                                             DoubleToString(tp,d)), TGC_TRADE);
          }
       }
    }
@@ -7060,6 +7222,7 @@ int OnInit()
       g_adxEntryHandle[i]=INVALID_HANDLE;
       g_biasFastHandle[i]=INVALID_HANDLE;
       g_biasSlowHandle[i]=INVALID_HANDLE;
+      g_h4EmaHandle[i]=INVALID_HANDLE;
    }
 
    // Initialize indicator handles. If one symbol fails (no data / invalid handle),
@@ -7101,12 +7264,17 @@ int OnInit()
          bs=iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
       }
 
+      int h4ema=INVALID_HANDLE;
+      if(InpMTF_H4_Enable)
+         h4ema=iMA(sym, PERIOD_H4, InpMTF_H4_EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+
       bool ok=true;
       if(atr==INVALID_HANDLE) ok=false;
       if(useEMA && ema==INVALID_HANDLE) ok=false;
       if(InpUseVolRegime && atrVol==INVALID_HANDLE) ok=false;
       if(InpUseADXFilter && (adx==INVALID_HANDLE || adxE==INVALID_HANDLE)) ok=false;
       if(InpUseHTFBias && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
+      if(InpMTF_H4_Enable && h4ema==INVALID_HANDLE) ok=false;
 
       if(!ok)
       {
@@ -7119,6 +7287,7 @@ int OnInit()
          if(adxE!=INVALID_HANDLE)    IndicatorRelease(adxE);
          if(bf!=INVALID_HANDLE)      IndicatorRelease(bf);
          if(bs!=INVALID_HANDLE)      IndicatorRelease(bs);
+         if(h4ema!=INVALID_HANDLE)   IndicatorRelease(h4ema);
 
          continue;
       }
@@ -7136,6 +7305,7 @@ int OnInit()
       g_adxEntryHandle[valid]=adxE;
       g_biasFastHandle[valid]=bf;
       g_biasSlowHandle[valid]=bs;
+      g_h4EmaHandle[valid]=h4ema;
 
       valid++;
    }
@@ -7167,6 +7337,7 @@ int OnInit()
    ArrayInitialize(g_execSpreadHist, 0.0);
    ArrayInitialize(g_execSlipHist,   0.0);
    ArrayInitialize(g_execBadHist,    0);
+   ArrayInitialize(g_tgLastSendTime, 0);
 
    // timer
    EventSetTimer(MathMax(1, InpTimerSec));
@@ -7176,7 +7347,7 @@ int OnInit()
 
    // Telegram startup test (optional)
    if(InpEnableTelegram && InpTGTestOnInit)
-      TelegramSendMessage(StringFormat("EA gestart | magic=%d | symbols=%d | TF=%s/%s", (int)InpMagic, g_symCount, EnumToString(InpEntryTF), EnumToString(InpConfirmTF)));
+      TelegramSendMessage(StringFormat("EA gestart | magic=%d | symbols=%d | TF=%s/%s", (int)InpMagic, g_symCount, EnumToString(InpEntryTF), EnumToString(InpConfirmTF)), TGC_SYSTEM);
 
    AppliedLog_AppendIfChanged();
 
@@ -7203,6 +7374,7 @@ void OnDeinit(const int reason)
       if(g_biasFastHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasFastHandle[i]);
       if(g_biasSlowHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasSlowHandle[i]);
       if(g_atrVolHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrVolHandle[i]);
+      if(g_h4EmaHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_h4EmaHandle[i]);
    }
 }
 
