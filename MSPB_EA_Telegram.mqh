@@ -1,6 +1,12 @@
 #ifndef MSPB_EA_TELEGRAM_MQH
 #define MSPB_EA_TELEGRAM_MQH
 
+#include "MSPB_EA_JSON.mqh"
+
+// Maximum age (seconds) of an incoming Telegram message that the EA will process.
+// Messages older than this are silently discarded to prevent replay attacks.
+#define TG_MAX_MSG_AGE_SEC 120
+
 // -----------------------------------------
 // Telegram (Bot API via WebRequest)
 // -----------------------------------------
@@ -85,6 +91,21 @@ bool TG_Config_Load()
    {
       g_tgCfgLastError="TGCFG_EMPTY_FILENAME";
       return false;
+   }
+
+   // Security check: warn when the config file resides in a path that is
+   // accessible to other programs (MetaTrader "Common" shared folder).
+   // Tokens stored in a shared location can be read by any process on the machine.
+   string cfgLower = InpTGConfigFile;
+   StringToLower(cfgLower);
+   if(StringFind(cfgLower, "\\shared\\") >= 0 ||
+      StringFind(cfgLower, "/shared/")  >= 0 ||
+      InpTGConfig_UseCommonFolder)
+   {
+      Print("[SECURITY WARNING] TG config file is in a shared/common folder (",
+            InpTGConfigFile, "). "
+            "Anyone with access to the machine can read the bot token. "
+            "Move the file to the MT5 data folder and disable InpTGConfig_UseCommonFolder.");
    }
 
    int flags = FILE_READ|FILE_TXT|FILE_ANSI|FILE_SHARE_READ;
@@ -571,7 +592,7 @@ void TG_PollCommands()
 
    datetime now = TimeCurrent();
    int pollSec = MathMax(5, InpTGPollIntervalSec);
-   if(g_tgLastPollTime>0 && (now - g_tgLastPollTime) < pollSec) return;
+   if(g_tgLastPollTime > 0 && (now - g_tgLastPollTime) < pollSec) return;
    g_tgLastPollTime = now;
 
    string url = StringFormat(
@@ -589,41 +610,40 @@ void TG_PollCommands()
    string resp = CharArrayToString(result, 0, -1, CP_UTF8);
    if(StringFind(resp, "\"ok\":true") < 0) return;
 
-   // Simple text extraction loop
+   // Walk through update objects using the JSON helpers from MSPB_EA_JSON.mqh.
    int searchPos = 0;
    while(true)
    {
-      // Find update_id
-      int p = StringFind(resp, "\"update_id\":", searchPos);
-      if(p < 0) break;
-      p += StringLen("\"update_id\":");
-      int pEnd = p;
-      while(pEnd < StringLen(resp) && StringGetCharacter(resp,pEnd)>='0' && StringGetCharacter(resp,pEnd)<='9') pEnd++;
-      long updateId = (long)StringToInteger(StringSubstr(resp, p, pEnd-p));
-      searchPos = pEnd;
+      // Locate the next update_id field.
+      int updateIdEnd = JsonGetLongEnd(resp, "update_id", searchPos);
+      if(updateIdEnd < 0) break;
+      long updateId = JsonGetLong(resp, "update_id", searchPos);
+      searchPos = updateIdEnd;
 
       if(updateId > g_tgLastUpdateId)
          g_tgLastUpdateId = updateId;
 
-      // Find "text":" near the current update_id position.
-      // TG_JSON_TEXT_SEARCH_WINDOW chars back avoids missing the field when the search
-      // cursor overshoots slightly; +500 ahead bounds it to this update object.
-      int tp = StringFind(resp, "\"text\":\"", searchPos-TG_JSON_TEXT_SEARCH_WINDOW < 0 ? 0 : searchPos-TG_JSON_TEXT_SEARCH_WINDOW);
-      // Ensure text belongs to this update (within next 500 chars)
-      if(tp < 0 || tp > pEnd + 500) continue;
-      tp += StringLen("\"text\":\"");
-      int tpEnd = tp;
-      while(tpEnd < StringLen(resp))
+      // --- Replay-attack guard ---
+      // Extract message.date (Unix timestamp) and reject stale messages.
+      long msgDate = JsonGetLong(resp, "date", searchPos - 200 < 0 ? 0 : searchPos - 200);
+      if(msgDate != JSON_LONG_NOT_FOUND && msgDate > 0)
       {
-         int ch = StringGetCharacter(resp, tpEnd);
-         if(ch == '"' && (tpEnd==0 || StringGetCharacter(resp, tpEnd-1)!='\\')) break;
-         tpEnd++;
+         long ageSec = (long)now - msgDate;
+         if(ageSec > TG_MAX_MSG_AGE_SEC)
+         {
+            if(InpDebug) Print(StringFormat("[TG] Discarded stale update_id=%I64d age=%I64ds (>%ds)",
+                               updateId, ageSec, TG_MAX_MSG_AGE_SEC));
+            continue;
+         }
       }
-      string msgText = StringSubstr(resp, tp, tpEnd-tp);
+
+      // Extract the text field; limit search to +500 chars from the update_id end
+      // position to stay within this update object.
+      string msgText = JsonGetString(resp, "text",
+                                     searchPos - TG_JSON_TEXT_SEARCH_WINDOW < 0
+                                        ? 0 : searchPos - TG_JSON_TEXT_SEARCH_WINDOW);
       if(msgText != "")
          TG_HandleCommand(msgText);
-
-      searchPos = tpEnd;
    }
 }
 
