@@ -6,6 +6,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [15.1] — 2026-04-18
+
+### Changed
+- `OnTick` entry loop (when `InpUseTimerForEntries = false`): replaced the unconditional `g_symCount`-wide loop with a `SymIndexByName(_Symbol)` route — only the symbol whose tick fired gets `ProcessSymbol` called on that tick. A full-loop fallback is retained for utility-chart attachments where the chart symbol is not in the trading list. This eliminates redundant entry-logic runs for every non-chart symbol on every incoming tick.
+
+---
+
 ## [15.0] — 2026-04-18
 
 ### Added

@@ -1,9 +1,9 @@
 #property strict
 #property description "MultiSymbol Pullback Scalper: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
-#property version   "15.0"
+#property version   "15.1"
 
 // Semantic version exposed at runtime — used in startup logs and Telegram messages.
-#define EA_VERSION "15.0"
+#define EA_VERSION "15.1"
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -6216,8 +6216,16 @@ void OnTick()
    {
       if(g_entryLoopBusy) return;
       g_entryLoopBusy=true;
-      for(int i=0;i<g_symCount;i++)
-         ProcessSymbol(i, g_syms[i]);
+      // Route to the symbol whose tick fired; avoids redundant entry-logic
+      // runs for every other symbol that has no new price on this tick.
+      // Fallback to full loop when the chart symbol is not in the trading
+      // list (utility-chart attachment).
+      int tickIdx = SymIndexByName(_Symbol);
+      if(tickIdx >= 0)
+         ProcessSymbol(tickIdx, _Symbol);
+      else
+         for(int i=0;i<g_symCount;i++)
+            ProcessSymbol(i, g_syms[i]);
       g_entryLoopBusy=false;
    }
 
