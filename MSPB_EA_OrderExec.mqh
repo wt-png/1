@@ -221,5 +221,33 @@ bool ClosePositionByTicketSafe(const string sym,
    if(!ok && comment=="")
       comment = "OrderSend failed err=" + (string)GetLastError();
 
+   // Retry on transient broker errors (requote, timeout, price off, etc.)
+   if(!ok && InpOrderRetryTransient)
+   {
+      int maxRetries = MathMax(0, InpOrderRetryMaxRetries);
+      for(int attempt = 1; attempt <= maxRetries; attempt++)
+      {
+         if(!IsTransientRetcode(retcode)) break;
+
+         if(InpOrderRetrySleepMS > 0)
+            Sleep(InpOrderRetrySleepMS);
+
+         // Refresh price before retry to avoid stale-price rejection
+         MqlTick tk2;
+         if(SymbolInfoTick(sym, tk2) && tk2.bid > 0.0 && tk2.ask > 0.0)
+            req.price = (posType == POSITION_TYPE_BUY) ? tk2.bid : tk2.ask;
+
+         ResetLastError();
+         ZeroMemory(res);
+         ok = OrderSend(req, res);
+         retcode = (int)res.retcode;
+         comment = res.comment;
+         if(!ok && comment == "")
+            comment = "OrderSend failed err=" + (string)GetLastError();
+
+         if(ok) break;
+      }
+   }
+
    return ok;
 }

@@ -717,6 +717,11 @@ input bool     InpSLModRetryTransient     = true;  // retry SL modify on transie
 input int      InpSLModMaxRetries         = 1;
 input int      InpSLModRetrySleepMS       = 100;   // NEW: delay between retries (ms), 0 => none
 
+// --- Order (close/entry) retry on transient broker errors
+input bool     InpOrderRetryTransient     = true;  // retry close/entry OrderSend on transient retcodes (requote, timeout, etc.)
+input int      InpOrderRetryMaxRetries    = 2;     // max extra attempts (total = 1 + this; 2 => up to 3 sends)
+input int      InpOrderRetrySleepMS       = 500;   // delay between retry attempts (ms)
+
 // --- Fail safe
 input bool     InpFailSafeStopEntriesOnMLFail = true;
 input bool     InpFailSafeStopEntriesOnAuditFail = false;
