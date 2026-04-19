@@ -384,3 +384,151 @@ void TelegramQueue_Process()
    g_tgBackoffSec = retry;
    g_tgNextSend = now + retry;
 }
+
+// =============================================================================
+// P5-17: Telegram inbound command polling
+// Polls getUpdates (offset tracking) when InpTGEnableIncoming=true.
+// Supported commands: /pause, /resume, /status, /closeall
+// =============================================================================
+
+long     g_tgPollOffset   = 0;    // last processed update_id + 1
+datetime g_tgNextPoll     = 0;    // rate-limit: next allowed poll time
+int      g_tgPollInterval = 5;    // seconds between polls
+bool     g_tgPaused       = false; // true => no new entries
+
+// Minimal JSON value extractor (key":value or key":"string")
+string TG_JsonStr(const string json, const string key)
+{
+   string pat = "\"" + key + "\":\"";
+   int p = StringFind(json, pat);
+   if(p >= 0)
+   {
+      int start = p + StringLen(pat);
+      int end   = StringFind(json, "\"", start);
+      if(end >= 0) return StringSubstr(json, start, end - start);
+      return "";
+   }
+   // numeric value
+   pat = "\"" + key + "\":";
+   p = StringFind(json, pat);
+   if(p < 0) return "";
+   int start = p + StringLen(pat);
+   int end   = start;
+   int total = StringLen(json);
+   while(end < total)
+   {
+      ushort c = StringGetCharacter(json, end);
+      if(c==',' || c=='}' || c=='\n' || c=='\r') break;
+      end++;
+   }
+   return StringSubstr(json, start, end - start);
+}
+
+long TG_JsonLong(const string json, const string key)
+{
+   string v = TG_JsonStr(json, key);
+   if(v == "") return 0;
+   return StringToInteger(v);
+}
+
+void TG_HandleCommand(const string text, const long fromUser)
+{
+   if(g_tgAllowedUserId != 0 && fromUser != g_tgAllowedUserId)
+   {
+      if(InpDebug) PrintFormat("[TG_CMD] Unauthorized user %I64d", fromUser);
+      return;
+   }
+
+   string cmd = text;
+   StringToLower(cmd);
+   StringTrimLeft(cmd);
+   StringTrimRight(cmd);
+
+   if(StringFind(cmd, "/pause") == 0)
+   {
+      g_tgPaused = true;
+      TelegramSendMessage(TG_GetPrefix() + " \xE2\x8F\xB8 EA paused — no new entries.");
+      Print("[TG_CMD] EA paused via Telegram.");
+   }
+   else if(StringFind(cmd, "/resume") == 0)
+   {
+      g_tgPaused = false;
+      TelegramSendMessage(TG_GetPrefix() + " \xE2\x96\xB6 EA resumed — entries re-enabled.");
+      Print("[TG_CMD] EA resumed via Telegram.");
+   }
+   else if(StringFind(cmd, "/status") == 0)
+   {
+      double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+      double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+      int    pos = PositionsTotal();
+      string paused = g_tgPaused ? "PAUSED" : "RUNNING";
+      TelegramSendMessage(StringFormat("%s | %s\nEq:%.2f Bal:%.2f Pos:%d",
+                                       TG_GetPrefix(), paused, eq, bal, pos));
+   }
+   else if(StringFind(cmd, "/closeall") == 0)
+   {
+      TelegramSendMessage(TG_GetPrefix() + " \xE2\x9A\xA0 /closeall — closing all EA positions.");
+      Print("[TG_CMD] /closeall received.");
+      CTrade localTrade;
+      for(int i = PositionsTotal()-1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(!PositionSelectByTicket(ticket)) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+         localTrade.PositionClose(ticket);
+      }
+   }
+   else
+   {
+      if(InpDebug) PrintFormat("[TG_CMD] Unknown: %s", text);
+   }
+}
+
+void TG_PollCommands()
+{
+   if(!InpEnableTelegram || !InpTGEnableIncoming) return;
+   if(!TG_Config_IsReady()) return;
+
+   datetime now = TimeCurrent();
+   if(now < g_tgNextPoll) return;
+   g_tgNextPoll = now + g_tgPollInterval;
+
+   string url = "https://api.telegram.org/bot" + g_tgBotToken
+              + "/getUpdates?offset=" + (string)g_tgPollOffset
+              + "&limit=10&timeout=0";
+
+   string headers = "Content-Type: application/json\r\n";
+   uchar  empty[]; uchar resp[]; string respHdr;
+   int http = WebRequest("GET", url, headers, MathMax(1000, InpTGTimeoutMS), empty, resp, respHdr);
+
+   if(http != 200)
+   {
+      if(InpDebug) PrintFormat("[TG_POLL] HTTP %d", http);
+      return;
+   }
+
+   string body = CharArrayToString(resp, 0, WHOLE_ARRAY, CP_UTF8);
+   int pos = 0;
+   while(true)
+   {
+      int uidPos = StringFind(body, "\"update_id\":", pos);
+      if(uidPos < 0) break;
+      int blockEnd = StringFind(body, "\"update_id\":", uidPos + 12);
+      string block = (blockEnd > 0)
+                     ? StringSubstr(body, uidPos, blockEnd - uidPos)
+                     : StringSubstr(body, uidPos);
+
+      long uid = TG_JsonLong(block, "update_id");
+      if(uid >= g_tgPollOffset) g_tgPollOffset = uid + 1;
+
+      string msgText = TG_JsonStr(block, "text");
+      long   fromId  = TG_JsonLong(block, "id");
+      if(msgText != "" && StringGetCharacter(msgText, 0) == '/')
+         TG_HandleCommand(msgText, fromId);
+
+      pos = (blockEnd > 0) ? blockEnd : StringLen(body);
+   }
+}
+
+bool TG_IsPaused() { return g_tgPaused; }

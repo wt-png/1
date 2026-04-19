@@ -1,5 +1,6 @@
-// MSPB_EA_Entry.mqh — v18.0
-// Entry signal logic: Setup1/Setup2, SL/TP computation, session-aware SL, swing S/R TP.
+// MSPB_EA_Entry.mqh — v19.0
+// Entry signal logic: Setup1/Setup2, SL/TP computation, session-aware SL, swing S/R TP,
+// body-ratio pinbar filter, RSI divergence filter.
 // All globals and inputs are defined in MSPB_Expert_Advisor.mq5 which #includes this file.
 #pragma once
 
@@ -29,7 +30,16 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
    if(pip<=0) return false;
 
    // Use last CLOSED candle for signal calculations (avoid intra-bar repaint).
-   bodyPips = MathAbs(r[1].close - r[1].open)/pip;
+   double candleRange = r[1].high - r[1].low;
+   double candleBody  = MathAbs(r[1].close - r[1].open);
+   bodyPips = candleBody / pip;
+
+   // P2-6: body-to-range ratio filter — reject doji/pinbar candles
+   if(InpUseBodyRatioFilter && candleRange > 0.0)
+   {
+      double bodyRatio = candleBody / candleRange;
+      if(bodyRatio < InpMinBodyRatio) return false;
+   }
 
    // ATR (use last closed bar value)
    double atrBuf[2];
@@ -68,6 +78,32 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
 
    // direction: simple - close above open => buy, else sell
    isBuy = (r[1].close > r[1].open);
+
+   // P2-4: RSI divergence filter (optional)
+   if(InpUseDivergenceFilter)
+   {
+      if(g_rsiHandle[symIdx] == INVALID_HANDLE) return false;
+      double rsiBuf[3];
+      if(!CopyLast(g_rsiHandle[symIdx], 0, 0, 3, rsiBuf)) return false;
+      // rsiBuf[0]=current(forming), rsiBuf[1]=last closed, rsiBuf[2]=bar before last closed
+      // Bullish divergence: price r[1].low < r[2].low AND RSI rsiBuf[1] > rsiBuf[2]
+      // Bearish divergence: price r[1].high > r[2].high AND RSI rsiBuf[1] < rsiBuf[2]
+      if(isBuy)
+      {
+         bool priceLower = (r[1].low < r[2].low);
+         bool rsiHigher  = (rsiBuf[1] > rsiBuf[2]);
+         if(priceLower && !rsiHigher) return false;  // no bullish divergence
+         if(!priceLower)              return false;   // no new low to diverge from
+      }
+      else
+      {
+         bool priceHigher = (r[1].high > r[2].high);
+         bool rsiLower    = (rsiBuf[1] < rsiBuf[2]);
+         if(priceHigher && !rsiLower) return false;  // no bearish divergence
+         if(!priceHigher)             return false;   // no new high to diverge from
+      }
+   }
+
    return true;
 }
 

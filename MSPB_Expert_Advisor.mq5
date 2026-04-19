@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper v18.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
+#property description "MultiSymbol Pullback Scalper v19.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -11,7 +11,7 @@
 #include "MSPB_EA_Entry.mqh"
 
 // EA version string -- used in startup logs and Telegram messages.
-#define EA_VERSION "18.0"
+#define EA_VERSION "19.0"
 
 // __TIME__ compatibility: some older MT5 builds do not expose this predefined macro.
 // This EA does not use __TIME__ directly; the guard prevents "undeclared identifier"
@@ -565,6 +565,46 @@ input int      InpSwingSR_Lookback       = 30;     // bars to look back for swin
 input double   InpSwingSR_MinRR          = 1.2;    // minimum RR required to use the S/R TP
 input double   InpSwingSR_MinDistPips    = 3.0;    // minimum distance (pips) between entry and S/R TP level
 input int      InpSwingSR_SwingBars      = 2;      // N bars each side required for a swing point (1=3-bar, 2=5-bar, etc.)
+
+// --- Body-to-range ratio filter — rejects doji/pinbar entries (P2-6)
+input bool     InpUseBodyRatioFilter     = false;   // block if body/range < InpMinBodyRatio
+input double   InpMinBodyRatio           = 0.30;    // min candle body fraction (0.0–1.0)
+
+// --- Dynamic spread/ATR filter applied to all setups (P2-5)
+input bool     InpUseDynamicSpreadFilter = false;   // block if spread/ATR > threshold (complements static InpMaxSpreadPips_FX)
+input double   InpDynSpread_ATRRatio     = 0.15;    // max allowed spread/ATR ratio (e.g. 0.15 = 15 % of ATR)
+
+// --- RSI divergence filter (P2-4)
+input bool     InpUseDivergenceFilter    = false;   // require RSI divergence confirmation
+input int      InpRSI_Period             = 14;      // RSI period for divergence check
+
+// --- Ultra-HTF bias: third TF alignment (P2-7)
+input bool     InpUseUltraHTFBias       = false;
+input ENUM_TIMEFRAMES InpUltraBiasTF    = PERIOD_H4;
+input int      InpUltraBiasEMAFast      = 50;
+input int      InpUltraBiasEMASlow      = 200;
+
+// --- Weekday filter (P3-8)
+input bool     InpBlockMonday           = false;   // skip entries on Monday open (00:00–InpLondonStartHour)
+input bool     InpBlockFriday           = false;   // skip entries on Friday from hour InpBlockFridayFromHour
+input int      InpBlockFridayFromHour   = 17;      // hour (broker time) from which Friday entries are blocked
+
+// --- Weekly loss limit (P3-9)
+input bool     InpWeeklyLossLimit_Enable = false;
+input double   InpWeeklyLossLimit_Pct    = 5.0;   // block new entries when week equity DD% exceeds this
+
+// --- Post-SL bar-based cooldown (P3-10)
+input bool     InpPostSL_CooldownBars_Enable = false;
+input int      InpPostSL_CooldownBars        = 3;  // bars on entryTF to block after SL hit (stacks with minute cooldown)
+
+// --- Adaptive ATR lookback based on EqRegime (P5-15)
+input bool     InpAdaptiveATR_Enable    = false;
+input int      InpATR_Period_Fast       = 5;       // ATR period in EQ_DEFENSIVE regime (shorter = more reactive)
+input int      InpATR_Period_Mid        = 10;      // ATR period in EQ_CAUTION regime
+
+// --- Slippage-adjusted OnTester score (P5-16)
+input bool     InpTester_SlippagePenalty      = false;
+input double   InpTester_SlippagePenalty_Mult = 0.1; // score deducted = mult * avg_slip_pips
 
 // --- Spread
 input double   InpMaxSpreadPips_FX        = 25.0;
@@ -1720,6 +1760,12 @@ void Cooldown_Apply(const string sym,
                     const double posProfit,
                     const double posRiskMoney)
 {
+   int i = SymIndexByNameLoose(sym);
+
+   // P3-10: bar-based cooldown on SL hit (unconditional — not subject to LossOnly filter)
+   if(closeReason == DEAL_REASON_SL && i >= 0 && i < g_symCount)
+      PostSL_CooldownBars_Trigger(i);
+
    if(!InpUseSymbolCooldown) return;
 
    // v12: apply cooldown only when net position P/L < 0 (optional)
@@ -1734,7 +1780,6 @@ void Cooldown_Apply(const string sym,
       }
    }
 
-   int i = SymIndexByNameLoose(sym);
    if(i<0 || i>=g_symCount) return;
 
    int mins=0;
@@ -1757,6 +1802,173 @@ void Cooldown_Apply(const string sym,
    else g_sym[i].cooldownReason = 4;
 }
 
+
+// -----------------------------------------
+// Weekday filter (P3-8)
+// -----------------------------------------
+bool WeekdayAllows()
+{
+   if(!InpBlockMonday && !InpBlockFriday) return true;
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int dow = dt.day_of_week; // 0=Sun,1=Mon,...,5=Fri,6=Sat
+   if(InpBlockMonday && dow == 1 && dt.hour < InpLondonStartHour)
+      return false;
+   if(InpBlockFriday && dow == 5 && dt.hour >= InpBlockFridayFromHour)
+      return false;
+   return true;
+}
+
+// -----------------------------------------
+// Weekly loss limit (P3-9)
+// -----------------------------------------
+void WeeklyLoss_UpdateIfNewWeek()
+{
+   if(!InpWeeklyLossLimit_Enable) return;
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int dow = dt.day_of_week;
+   if(dow == 0) dow = 7; // treat Sunday as day 7 so Monday is day 1
+   datetime monStart = TimeCurrent() - ((datetime)(dow - 1)) * 86400
+                     - (datetime)dt.hour * 3600 - (datetime)dt.min * 60 - (datetime)dt.sec;
+   if(monStart != g_weekStart)
+   {
+      g_weekStart   = monStart;
+      g_weekEqStart = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(g_weekEqStart <= 0.0) g_weekEqStart = AccountInfoDouble(ACCOUNT_BALANCE);
+   }
+}
+
+bool WeeklyLossAllows()
+{
+   if(!InpWeeklyLossLimit_Enable) return true;
+   if(g_weekEqStart <= 0.0) return true;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq <= 0.0) eq = AccountInfoDouble(ACCOUNT_BALANCE);
+   double ddPct = (g_weekEqStart - eq) / g_weekEqStart * 100.0;
+   if(ddPct >= InpWeeklyLossLimit_Pct)
+   {
+      if(InpDebug)
+         PrintFormat("WEEKLY_LOSS_BLOCK: weekDD=%.2f%% >= limit=%.2f%%", ddPct, InpWeeklyLossLimit_Pct);
+      return false;
+   }
+   return true;
+}
+
+// -----------------------------------------
+// Deal deduplication helpers (P1-3)
+// -----------------------------------------
+bool DealSeen_Add(const ulong ticket)
+{
+   // Returns true if newly added (not yet seen), false if duplicate.
+   int cap = ArraySize(g_processedDeals);
+   int check = MathMin(g_processedDealsN, cap);
+   for(int i = 0; i < check; i++)
+      if(g_processedDeals[i] == ticket) return false;
+   g_processedDeals[g_processedDealsN % cap] = ticket;
+   g_processedDealsN++;
+   return true;
+}
+
+// -----------------------------------------
+// Adaptive ATR period based on EqRegime (P5-15)
+// -----------------------------------------
+int GetCurrentATRPeriod()
+{
+   if(!InpAdaptiveATR_Enable) return MathMax(1, InpATR_Period);
+   if(g_eqRegime == EQ_DEFENSIVE) return MathMax(1, InpATR_Period_Fast);
+   if(g_eqRegime == EQ_CAUTION)   return MathMax(1, InpATR_Period_Mid);
+   return MathMax(1, InpATR_Period);
+}
+
+// -----------------------------------------
+// Indicator handle revalidation (P1-2)
+// Called from OnTimer; catches handles that became INVALID_HANDLE after reconnect.
+// -----------------------------------------
+void Handles_CheckAndReinit()
+{
+   bool needEMA_global = (InpUsePullbackEMA || InpSymbolOverrides_Enable);
+   for(int i = 0; i < g_symCount; i++)
+   {
+      string sym = g_syms[i];
+      bool needEMA = (needEMA_global || Sym_UsePullbackEMA(sym));
+      bool reinit  = false;
+
+      if(needEMA && g_emaHandle[i] == INVALID_HANDLE)           reinit = true;
+      if(g_atrHandle[i] == INVALID_HANDLE)                      reinit = true;
+      if(InpUseVolRegime && g_atrVolHandle[i] == INVALID_HANDLE) reinit = true;
+      if(InpUseADXFilter && (g_adxHandle[i] == INVALID_HANDLE ||
+                             g_adxEntryHandle[i] == INVALID_HANDLE)) reinit = true;
+      if(InpUseHTFBias && (g_biasFastHandle[i] == INVALID_HANDLE ||
+                           g_biasSlowHandle[i] == INVALID_HANDLE))  reinit = true;
+      if(InpUseDivergenceFilter && g_rsiHandle[i] == INVALID_HANDLE) reinit = true;
+      if(InpUseUltraHTFBias && (g_ultraBiasFastHandle[i] == INVALID_HANDLE ||
+                                g_ultraBiasSlowHandle[i] == INVALID_HANDLE)) reinit = true;
+
+      if(!reinit) continue;
+      if(InpDebug) PrintFormat("[HANDLE_REINIT] sym=%s — reinitialising invalid handles", sym);
+
+      int atrPer = GetCurrentATRPeriod();
+      if(needEMA && g_emaHandle[i] == INVALID_HANDLE)
+         g_emaHandle[i] = iMA(sym, InpEntryTF, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      if(g_atrHandle[i] == INVALID_HANDLE)
+         g_atrHandle[i] = iATR(sym, InpEntryTF, atrPer);
+      if(InpUseVolRegime && g_atrVolHandle[i] == INVALID_HANDLE)
+         g_atrVolHandle[i] = iATR(sym, InpVolRegimeTF, atrPer);
+      if(InpUseADXFilter)
+      {
+         if(g_adxHandle[i] == INVALID_HANDLE)
+            g_adxHandle[i] = iADX(sym, InpConfirmTF, InpADX_Period);
+         if(g_adxEntryHandle[i] == INVALID_HANDLE)
+            g_adxEntryHandle[i] = iADX(sym, InpEntryTF, InpADX_Period);
+      }
+      if(InpUseHTFBias)
+      {
+         if(g_biasFastHandle[i] == INVALID_HANDLE)
+            g_biasFastHandle[i] = iMA(sym, InpBiasTF, InpBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_biasSlowHandle[i] == INVALID_HANDLE)
+            g_biasSlowHandle[i] = iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+      }
+      if(InpUseDivergenceFilter && g_rsiHandle[i] == INVALID_HANDLE)
+         g_rsiHandle[i] = iRSI(sym, InpEntryTF, InpRSI_Period, PRICE_CLOSE);
+      if(InpUseUltraHTFBias)
+      {
+         if(g_ultraBiasFastHandle[i] == INVALID_HANDLE)
+            g_ultraBiasFastHandle[i] = iMA(sym, InpUltraBiasTF, InpUltraBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_ultraBiasSlowHandle[i] == INVALID_HANDLE)
+            g_ultraBiasSlowHandle[i] = iMA(sym, InpUltraBiasTF, InpUltraBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+      }
+   }
+}
+
+// -----------------------------------------
+// Bar-based SL cooldown (P3-10)
+// -----------------------------------------
+void PostSL_CooldownBars_Trigger(const int symIdx)
+{
+   if(!InpPostSL_CooldownBars_Enable) return;
+   if(symIdx < 0 || symIdx >= g_symCount) return;
+   // Capture current bar open time
+   datetime curBar[1];
+   if(CopyTime(g_syms[symIdx], InpEntryTF, 0, 1, curBar) == 1)
+      g_slCooldownBarTime[symIdx] = curBar[0];
+   g_slCooldownBarsLeft[symIdx] = MathMax(1, InpPostSL_CooldownBars);
+}
+
+bool PostSL_CooldownBars_IsActive(const int symIdx, const string sym)
+{
+   if(!InpPostSL_CooldownBars_Enable) return false;
+   if(symIdx < 0 || symIdx >= g_symCount) return false;
+   if(g_slCooldownBarsLeft[symIdx] <= 0) return false;
+
+   datetime curBar[1];
+   if(CopyTime(sym, InpEntryTF, 0, 1, curBar) != 1) return true; // can't check -> stay blocked
+   if(curBar[0] != g_slCooldownBarTime[symIdx])
+   {
+      g_slCooldownBarsLeft[symIdx]--;
+      g_slCooldownBarTime[symIdx] = curBar[0];
+      if(g_slCooldownBarsLeft[symIdx] <= 0) return false;
+   }
+   return true;
+}
 
 // extracted to MSPB_EA_Risk.mqh
 
@@ -2208,11 +2420,34 @@ bool VolRegime_Get(const int symIdx, const string sym, double &multOut, bool &bl
 // -----------------------------------------
 int g_emaHandle[64];
 int g_atrHandle[64];
-int g_adxHandle[64];      // ADX on confirm TF (trend)
-int g_adxEntryHandle[64]; // NEW: ADX on entry TF (entry filter)
-int g_biasFastHandle[64]; // v9: HTF bias EMA fast
-int g_biasSlowHandle[64]; // v9: HTF bias EMA slow
-int g_atrVolHandle[64];   // v9: volatility regime ATR on InpVolRegimeTF
+int g_adxHandle[64];           // ADX on confirm TF (trend)
+int g_adxEntryHandle[64];      // ADX on entry TF (entry filter)
+int g_biasFastHandle[64];      // v9: HTF bias EMA fast
+int g_biasSlowHandle[64];      // v9: HTF bias EMA slow
+int g_atrVolHandle[64];        // v9: volatility regime ATR on InpVolRegimeTF
+int g_rsiHandle[64];           // P2-4: RSI for divergence filter
+int g_ultraBiasFastHandle[64]; // P2-7: ultra-HTF EMA fast
+int g_ultraBiasSlowHandle[64]; // P2-7: ultra-HTF EMA slow
+
+// --- Weekly loss limit tracking (P3-9)
+double   g_weekEqStart   = 0.0;   // equity recorded at start of current trading week
+datetime g_weekStart     = 0;     // broker datetime of Monday 00:00 of current week
+
+// --- Bar-based SL cooldown per symbol (P3-10)
+datetime g_slCooldownBarTime[64]; // bar open-time when SL hit was recorded
+int      g_slCooldownBarsLeft[64]; // bars remaining in cooldown (counts down on new bar)
+
+// --- Slippage stats for OnTester score (P5-16)
+double g_totalSlippagePips = 0.0;
+int    g_slippageCount     = 0;
+
+// --- Deal deduplication: ring buffer of recently processed deal tickets (P1-3)
+ulong g_processedDeals[512];
+int   g_processedDealsN = 0;
+
+// --- OnTradeTransaction: flag that HistorySelectByPosition succeeded (P1-1)
+bool g_dealQHistoryFresh   = false;
+datetime g_dealQHistoryFreshTime = 0;
 
 
 // Copy buffer helper
@@ -2402,29 +2637,33 @@ void ProcessDealQueue()
 
    datetime now=TimeCurrent();
 
-   // NEW: time-based backoff to avoid busy-loop when history is not ready
+   // time-based backoff to avoid busy-loop when history is not ready
    if(g_dealQBackoffSec>0 && g_dealQNextTry>0 && now < g_dealQNextTry)
       return;
 
    static datetime lastHistorySelect=0;
 
-   // Only do HistorySelect occasionally for perf
-   if(lastHistorySelect==0 || (now - lastHistorySelect) >= 5)
+   // P1-1/P1-3: use pre-selected history from OnTradeTransaction when fresh (< 5 sec old)
+   bool usePreselected = (g_dealQHistoryFresh && (now - g_dealQHistoryFreshTime) < 5);
+   if(!usePreselected)
+      g_dealQHistoryFresh = false; // stale
+
+   if(!usePreselected)
    {
-      int lookbackDays=5;
-      if(g_dealQBackoffSec>0) lookbackDays=10;
-
-      datetime from=now - (lookbackDays*86400);
-
-      if(!HistorySelect(from, now))
+      // Only do HistorySelect occasionally for perf; expand window on backoff
+      if(lastHistorySelect==0 || (now - lastHistorySelect) >= 5)
       {
-         // History not available now (connection/busy) -> backoff
-         g_dealQBackoffSec = MathMin(60, (g_dealQBackoffSec<=0 ? 1 : g_dealQBackoffSec*2));
-         g_dealQNextTry = now + g_dealQBackoffSec;
-         return;
-      }
+         int lookbackDays = (g_dealQBackoffSec > 0) ? 14 : 7;
+         datetime from = now - ((datetime)lookbackDays * 86400);
 
-      lastHistorySelect=now;
+         if(!HistorySelect(from, now))
+         {
+            g_dealQBackoffSec = MathMin(60, (g_dealQBackoffSec<=0 ? 1 : g_dealQBackoffSec*2));
+            g_dealQNextTry = now + g_dealQBackoffSec;
+            return;
+         }
+         lastHistorySelect = now;
+      }
    }
 
    int processed=0;
@@ -2433,6 +2672,9 @@ void ProcessDealQueue()
    {
       ulong dealTicket;
       if(!DealQ_Pop(dealTicket)) break;
+
+      // P1-3: skip already-processed deals (deduplication)
+      if(!DealSeen_Add(dealTicket)) { processed++; continue; }
 
       if(!HistoryDealSelect(dealTicket))
       {
@@ -4239,8 +4481,15 @@ bool SmartOrderRoute_IsLiquid(const int symIdx, const string sym, const double a
 // -----------------------------------------
 void ProcessSymbol(const int idx, const string sym)
 {
-   // NEW: fail-safe stop entries
+   // fail-safe stop entries
    if(g_failSafeStopEntries)
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // P5-17: Telegram /pause command
+   if(TG_IsPaused())
    {
       IncReject(idx, REJ_FAILSAFE);
       return;
@@ -4250,6 +4499,20 @@ void ProcessSymbol(const int idx, const string sym)
    if(!IsNewBar(idx, sym, InpEntryTF))
    {
       IncReject(idx, REJ_NEWBAR);
+      return;
+   }
+
+   // P3-8: weekday filter
+   if(!WeekdayAllows())
+   {
+      IncReject(idx, REJ_SESSION);
+      return;
+   }
+
+   // P3-9: weekly loss limit
+   if(!WeeklyLossAllows())
+   {
+      IncReject(idx, REJ_RISK_GUARDS);
       return;
    }
 
@@ -4288,6 +4551,13 @@ void ProcessSymbol(const int idx, const string sym)
 
    // v10: per-symbol cooldown after exits
    if(InpUseSymbolCooldown && g_sym[idx].cooldownUntil>0 && TimeCurrent() < g_sym[idx].cooldownUntil)
+   {
+      IncReject(idx, REJ_COOLDOWN);
+      return;
+   }
+
+   // P3-10: bar-based SL cooldown
+   if(PostSL_CooldownBars_IsActive(idx, sym))
    {
       IncReject(idx, REJ_COOLDOWN);
       return;
@@ -4389,6 +4659,41 @@ void ProcessSymbol(const int idx, const string sym)
       }
       if(bdir>0 && !isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
       if(bdir<0 &&  isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
+   }
+
+   // P2-7: ultra-HTF (third TF) bias filter
+   if(InpUseUltraHTFBias)
+   {
+      if(g_ultraBiasFastHandle[idx] == INVALID_HANDLE || g_ultraBiasSlowHandle[idx] == INVALID_HANDLE)
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         if(InpDebug) PrintFormat("ULTRA_BIAS_NOT_READY %s tf=%s", sym, EnumToString(InpUltraBiasTF));
+         return;
+      }
+      double ubf[2], ubs[2];
+      bool ubfOk = CopyLast(g_ultraBiasFastHandle[idx], 0, 0, 2, ubf);
+      bool ubsOk = CopyLast(g_ultraBiasSlowHandle[idx], 0, 0, 2, ubs);
+      if(!ubfOk || !ubsOk)
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         return;
+      }
+      int ubdir = (ubf[1] > ubs[1]) ? 1 : ((ubf[1] < ubs[1]) ? -1 : 0);
+      if(ubdir > 0 && !isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
+      if(ubdir < 0 &&  isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
+   }
+
+   // P2-5: dynamic spread/ATR filter (applies to all setups when enabled)
+   if(InpUseDynamicSpreadFilter && atrPips > 0.0)
+   {
+      double dynRatio = spreadPips / atrPips;
+      if(dynRatio > InpDynSpread_ATRRatio)
+      {
+         IncReject(idx, REJ_SPREAD);
+         if(InpDebug) PrintFormat("DYN_SPREAD_BLOCK %s spread=%.2f atr=%.2f ratio=%.3f (max=%.3f)",
+                                  sym, spreadPips, atrPips, dynRatio, InpDynSpread_ATRRatio);
+         return;
+      }
    }
 
 
@@ -4506,6 +4811,9 @@ void ProcessSymbol(const int idx, const string sym)
       if(success && trade.ResultPrice() > 0.0)
       {
          double slipPips = (trade.ResultPrice() - entry) / MathMax(PipSize(sym), 1e-9);
+         // P5-16: accumulate slippage stats for OnTester score
+         g_totalSlippagePips += MathAbs(slipPips);
+         g_slippageCount++;
          int sess = GetCurrentSession();
          string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
          if(InpDebug) PrintFormat("SLIPPAGE %s BUY: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
@@ -4662,6 +4970,9 @@ void ProcessSymbol(const int idx, const string sym)
       if(success && trade.ResultPrice() > 0.0)
       {
          double slipPips = (entry - trade.ResultPrice()) / MathMax(PipSize(sym), 1e-9);
+         // P5-16: accumulate slippage stats for OnTester score
+         g_totalSlippagePips += MathAbs(slipPips);
+         g_slippageCount++;
          int sess = GetCurrentSession();
          string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
          if(InpDebug) PrintFormat("SLIPPAGE %s SELL: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
@@ -5090,6 +5401,11 @@ int OnInit()
       g_adxEntryHandle[i]=INVALID_HANDLE;
       g_biasFastHandle[i]=INVALID_HANDLE;
       g_biasSlowHandle[i]=INVALID_HANDLE;
+      g_rsiHandle[i]=INVALID_HANDLE;            // P2-4
+      g_ultraBiasFastHandle[i]=INVALID_HANDLE;  // P2-7
+      g_ultraBiasSlowHandle[i]=INVALID_HANDLE;  // P2-7
+      g_slCooldownBarTime[i]=0;                 // P3-10
+      g_slCooldownBarsLeft[i]=0;                // P3-10
    }
 
    // Initialize indicator handles. If one symbol fails (no data / invalid handle),
@@ -5108,11 +5424,14 @@ int OnInit()
       int adxE=INVALID_HANDLE;
       int bf=INVALID_HANDLE;
       int bs=INVALID_HANDLE;
+      int rsi=INVALID_HANDLE;       // P2-4
+      int ubf=INVALID_HANDLE;       // P2-7
+      int ubs=INVALID_HANDLE;       // P2-7
 
       if(useEMA)
          ema=iMA(sym, InpEntryTF, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
 
-      int atrPer = MathMax(1, InpATR_Period);
+      int atrPer = GetCurrentATRPeriod();
 
       atr=iATR(sym, InpEntryTF, atrPer);
 
@@ -5131,12 +5450,23 @@ int OnInit()
          bs=iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
       }
 
+      if(InpUseDivergenceFilter)
+         rsi = iRSI(sym, InpEntryTF, MathMax(2, InpRSI_Period), PRICE_CLOSE);
+
+      if(InpUseUltraHTFBias)
+      {
+         ubf = iMA(sym, InpUltraBiasTF, MathMax(1, InpUltraBiasEMAFast), 0, MODE_EMA, PRICE_CLOSE);
+         ubs = iMA(sym, InpUltraBiasTF, MathMax(1, InpUltraBiasEMASlow), 0, MODE_EMA, PRICE_CLOSE);
+      }
+
       bool ok=true;
       if(atr==INVALID_HANDLE) ok=false;
       if(useEMA && ema==INVALID_HANDLE) ok=false;
       if(InpUseVolRegime && atrVol==INVALID_HANDLE) ok=false;
       if(InpUseADXFilter && (adx==INVALID_HANDLE || adxE==INVALID_HANDLE)) ok=false;
       if(InpUseHTFBias && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
+      if(InpUseDivergenceFilter && rsi==INVALID_HANDLE) ok=false;
+      if(InpUseUltraHTFBias && (ubf==INVALID_HANDLE || ubs==INVALID_HANDLE)) ok=false;
 
       if(!ok)
       {
@@ -5149,6 +5479,9 @@ int OnInit()
          if(adxE!=INVALID_HANDLE)    IndicatorRelease(adxE);
          if(bf!=INVALID_HANDLE)      IndicatorRelease(bf);
          if(bs!=INVALID_HANDLE)      IndicatorRelease(bs);
+         if(rsi!=INVALID_HANDLE)     IndicatorRelease(rsi);
+         if(ubf!=INVALID_HANDLE)     IndicatorRelease(ubf);
+         if(ubs!=INVALID_HANDLE)     IndicatorRelease(ubs);
 
          continue;
       }
@@ -5166,6 +5499,9 @@ int OnInit()
       g_adxEntryHandle[valid]=adxE;
       g_biasFastHandle[valid]=bf;
       g_biasSlowHandle[valid]=bs;
+      g_rsiHandle[valid]=rsi;
+      g_ultraBiasFastHandle[valid]=ubf;
+      g_ultraBiasSlowHandle[valid]=ubs;
 
       valid++;
    }
@@ -5177,7 +5513,10 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   Sanity_UpdateReadiness(); // NEW: try to mark indicator buffers ready immediately
+   // P3-9: seed weekly equity baseline
+   WeeklyLoss_UpdateIfNewWeek();
+
+   Sanity_UpdateReadiness();
    // open logs
    Audit_Open();
    ML_Open();
@@ -5216,13 +5555,16 @@ void OnDeinit(const int reason)
    // release indicators
    for(int i=0;i<g_symCount;i++)
    {
-      if(g_emaHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_emaHandle[i]);
-      if(g_atrHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrHandle[i]);
-      if(g_adxHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxHandle[i]);
-      if(g_adxEntryHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxEntryHandle[i]);
-      if(g_biasFastHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasFastHandle[i]);
-      if(g_biasSlowHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasSlowHandle[i]);
-      if(g_atrVolHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrVolHandle[i]);
+      if(g_emaHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_emaHandle[i]);
+      if(g_atrHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_atrHandle[i]);
+      if(g_adxHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_adxHandle[i]);
+      if(g_adxEntryHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_adxEntryHandle[i]);
+      if(g_biasFastHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_biasFastHandle[i]);
+      if(g_biasSlowHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_biasSlowHandle[i]);
+      if(g_atrVolHandle[i]!=INVALID_HANDLE)         IndicatorRelease(g_atrVolHandle[i]);
+      if(g_rsiHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_rsiHandle[i]);
+      if(g_ultraBiasFastHandle[i]!=INVALID_HANDLE)  IndicatorRelease(g_ultraBiasFastHandle[i]);
+      if(g_ultraBiasSlowHandle[i]!=INVALID_HANDLE)  IndicatorRelease(g_ultraBiasSlowHandle[i]);
    }
 }
 
@@ -5230,12 +5572,22 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   // capture exit deals
+   // P1-1: capture exit deals; try immediate HistorySelectByPosition for lower latency.
    if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
    {
       ulong deal=trans.deal;
       if(deal>0)
       {
+         // Attempt to pre-select history using positionId (available on MT5 build 1820+).
+         // This avoids waiting for the next ProcessDealQueue / HistorySelect throttle cycle.
+         if(trans.position > 0)
+         {
+            if(HistorySelectByPosition(trans.position))
+            {
+               g_dealQHistoryFresh     = true;
+               g_dealQHistoryFreshTime = TimeCurrent();
+            }
+         }
          if(!DealQ_Push(deal))
          {
             PrintFormat("DEALQ_OVERFLOW: queue full, dropping deal %I64d", (long)deal);
@@ -5389,7 +5741,14 @@ void OnTimer()
    SymbolOverrides_UpdateIfDue();
    EqRegime_Update();
    News_UpdateIfDue();
-   Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
+   Sanity_UpdateReadiness();
+
+   // P1-2: periodically check and reinitialise indicator handles that became INVALID_HANDLE
+   // (e.g. after broker reconnect, chart reload). Runs once per timer cycle (cheap: O(n) checks).
+   Handles_CheckAndReinit();
+
+   // P3-9: check if the trading week has rolled over and reset the weekly equity baseline
+   WeeklyLoss_UpdateIfNewWeek();
 
    // HOTFIX: update correlation cache once per CorrTF bar (avoids repeated CopyClose in entry checks)
    if(InpUseCorrelationGuard) CorrCache_UpdateIfNeeded();
@@ -5411,6 +5770,8 @@ void OnTimer()
    // Optional hot-reload of Telegram config (also used by queue processor).
    TG_Config_UpdateIfDue(false);
    TelegramQueue_Process();
+   // P5-17: poll for inbound Telegram commands
+   TG_PollCommands();
 }
 
 // -----------------------------------------
@@ -5460,6 +5821,15 @@ double OnTester()
 
    // Score: prefer NetProfit, reward PF, penalize DD + low trade count.
    double score = net * (0.25 + pf) * ddFactor * tradeFactor;
+
+   // P5-16: slippage penalty — penalise runs where average slippage is high.
+   // Uses slippage tracked via the SLIPPAGE ML rows accumulated during the test.
+   if(InpTester_SlippagePenalty && g_slippageCount > 0)
+   {
+      double avgSlipPips = g_totalSlippagePips / (double)g_slippageCount;
+      if(avgSlipPips > 0.0)
+         score -= InpTester_SlippagePenalty_Mult * avgSlipPips;
+   }
 
    // Hard penalize non-profitable runs
    if(net <= 0.0)
