@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper v19.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
+#property description "MultiSymbol Pullback Scalper v20.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
