@@ -18,6 +18,7 @@ Usage:
 # Constants
 TRADING_DAYS_PER_YEAR = 252
 WEEKS_PER_YEAR = 52
+import argparse
 import csv
 import math
 import sys

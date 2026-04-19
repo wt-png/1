@@ -22,9 +22,7 @@ from typing import List, Dict, Any, Tuple
 
 _MISSING_VALUES = {"", "nan", "null", "n/a", "na"}
 
-def _parse_float(v: str) -> float:
-    """Parse a float from CSV, treating common missing-value strings as 0.0."""
-    return float(v) if v.lower() not in _MISSING_VALUES else 0.0
+NUMERIC_FEATURES = [
     "atr_pips",
     "adx_trend",
     "adx_entry",
@@ -32,6 +30,11 @@ def _parse_float(v: str) -> float:
     "body_pips",
     "risk_mult",
 ]
+
+
+def _parse_float(v: str) -> float:
+    """Parse a float from CSV, treating common missing-value strings as 0.0."""
+    return float(v) if v.lower() not in _MISSING_VALUES else 0.0
 
 TARGET_COL   = "pnl_gross"   # signed P&L; win if > 0
 EVENT_FILTER = "ENTRY"       # only look at entry rows

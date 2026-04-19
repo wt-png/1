@@ -87,11 +87,10 @@ int GetCurrentSession()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    int h = dt.hour;
-   if(h >= 0  && h < 7)  return 0; // Asia
-   if(h >= 7  && h < 12) return 1; // London
-   if(h >= 12 && h < 17) return 2; // NY overlap
-   if(h >= 17 && h < 21) return 2; // NY only
-   return 3; // other
+   if(h < InpLondonStartHour)                        return 0; // Asia
+   if(h >= InpLondonStartHour && h < InpNYStartHour) return 1; // London
+   if(h >= InpNYStartHour     && h < InpNYEndHour)   return 2; // NY (incl. London/NY overlap)
+   return 3; // other / off-session
 }
 
 // --- Session-aware SL ATR multiplier
@@ -136,12 +135,16 @@ double FindSwingTP(const string sym, const bool isBuy, const double entry)
    {
       // nearest swing high above entry
       double best = 0.0;
-      for(int i = 0; i < got; i++)
+      int swing = MathMax(1, InpSwingSR_SwingBars);
+      for(int i = swing; i < got - swing; i++)
       {
          double h = r[i].high;
          if(h <= entry + minDistPips*pip) continue;
-         // swing high: local maximum — higher than both neighbours
-         if(i > 0 && i < got-1 && r[i].high > r[i-1].high && r[i].high > r[i+1].high)
+         // swing high: r[i] is the highest within [i-swing, i+swing]
+         bool isSwing = true;
+         for(int k = i - swing; k <= i + swing && isSwing; k++)
+            if(k != i && r[k].high >= h) isSwing = false;
+         if(isSwing)
             if(best <= 0.0 || h < best) best = h;
       }
       return best;
@@ -150,12 +153,16 @@ double FindSwingTP(const string sym, const bool isBuy, const double entry)
    {
       // nearest swing low below entry
       double best = 0.0;
-      for(int i = 0; i < got; i++)
+      int swing = MathMax(1, InpSwingSR_SwingBars);
+      for(int i = swing; i < got - swing; i++)
       {
          double l = r[i].low;
          if(l >= entry - minDistPips*pip) continue;
-         // swing low: local minimum — lower than both neighbours
-         if(i > 0 && i < got-1 && r[i].low < r[i-1].low && r[i].low < r[i+1].low)
+         // swing low: r[i] is the lowest within [i-swing, i+swing]
+         bool isSwing = true;
+         for(int k = i - swing; k <= i + swing && isSwing; k++)
+            if(k != i && r[k].low <= l) isSwing = false;
+         if(isSwing)
             if(best <= 0.0 || l > best) best = l;
       }
       return best;
