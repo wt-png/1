@@ -12,10 +12,19 @@
 | `MSPB_EA_JSON.mqh` | Lightweight JSON read helpers used by the Telegram module |
 | `MSPB_EA_ML.mqh` | Machine-learning CSV export (`ML_WriteRowV2`) |
 | `MSPB_EA_News.mqh` | News-filter integration (economic calendar guard) |
+| `MSPB_EA_OrderExec.mqh` | Order execution helpers — `IsTransientRetcode`, `SendSLTPModifyByTicket`, `ModifySL_Safe`, `ClosePositionByTicketSafe` |
+| `MSPB_EA_PositionManager.mqh` | Position manager — deal-queue ring-buffer, position closure tracker, `ProcessDealQueue` |
+| `MSPB_EA_SymbolConfig.mqh` | Symbol overrides — `SymbolOverrides` struct, CSV load/hot-reload, convenience getters |
 | `MSPB_EA_UnitTests.mq5` | Standalone unit-test script — compile and run in MetaTrader Strategy Tester |
 | `.github/workflows/lint.yml` | CI workflow — MQL5 lint + Python tests on every push/PR (see below) |
 | `tools/monte_carlo_analysis.py` | Monte Carlo simulation for trade-sequence analysis (max DD, Sharpe, Calmar) |
 | `tools/test_monte_carlo.py` | pytest unit tests for the Monte Carlo tool |
+| `tools/walk_forward.py` | Walk-forward IS/OOS validator — reads ML export CSV, computes per-window Sharpe/Calmar/PF |
+| `tools/test_walk_forward.py` | pytest unit tests for the walk-forward tool |
+| `tools/sign_config.py` | HMAC-SHA256 signing and verification of `.set` config files |
+| `tools/test_sign_config.py` | pytest unit tests for sign_config (30 tests) |
+| `docs/INSTALLATION.md` | Full deployment and installation guide |
+| `docs/LIVE_TEST_PROTOCOL.md` | 4-phase live forward-test protocol, go/no-go criteria, review cycle template |
 | `CHANGELOG.md` | Version history (Keep a Changelog format) |
 
 ---

@@ -6,6 +6,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [17.1] — 2026-04-19
+
+### Deployment & Commercial Readiness
+- **`docs/INSTALLATION.md`** — full deployment guide: MT5 folder layout, broker setup, Telegram config, symbol overrides CSV, .set loading, first-run checklist, key parameters reference, troubleshooting table
+- **`tools/sign_config.py`** — HMAC-SHA256 signing and verification of `.set` files; CLI with `sign`, `verify`, `info` subcommands; sidecar `.sig` file stores hash + HMAC + timestamp + EA version
+- **`tools/test_sign_config.py`** — 30 pytest tests covering all sign/verify/info/CLI paths
+- **`docs/LIVE_TEST_PROTOCOL.md`** — 4-phase live forward-test protocol (smoke, shadow, forward, review); per-week metrics tables; go/no-go criteria; escalation policy; review meeting template
+
+---
+
 ## [17.0] — 2026-04-18
 
 ### Architecture
