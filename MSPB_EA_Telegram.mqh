@@ -1,7 +1,7 @@
 // =============================================================================
 // MSPB_EA_Telegram.mqh
 // Telegram Bot API integration for MSPB Expert Advisor
-// Extracted from MSPB_Expert_Advisor.mq5 v17.2
+// Extracted from MSPB_Expert_Advisor.mq5 v14.7; EA bumped to v17.2 by this refactor
 // =============================================================================
 #property strict
 

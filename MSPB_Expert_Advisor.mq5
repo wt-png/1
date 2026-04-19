@@ -8,9 +8,10 @@
 #define EA_VERSION "17.2"
 
 // __TIME__ compatibility: some older MT5 builds do not expose this predefined macro.
-// We avoid direct use of __TIME__ in this EA; the fallback is a no-op guard.
+// This EA does not use __TIME__ directly; the guard prevents "undeclared identifier"
+// errors when upgrading to or from external modules that may reference it.
 #ifndef __TIME__
-   #define __TIME__ ((datetime)0)
+   #define __TIME__ ((datetime)0)   // zero sentinel — intentionally unused in runtime logic
 #endif
 
 
