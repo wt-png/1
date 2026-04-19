@@ -563,6 +563,7 @@ input double   InpAsia_SL_ATR_Mult       = 0.85; // Asia session SL ATR multipli
 input bool     InpUseSwingSR_TP          = false;  // use nearest swing high/low as TP target
 input int      InpSwingSR_Lookback       = 30;     // bars to look back for swing points on confirmTF
 input double   InpSwingSR_MinRR          = 1.2;    // minimum RR required to use the S/R TP
+input double   InpSwingSR_MinDistPips    = 3.0;    // minimum distance (pips) between entry and S/R TP level
 
 // --- Spread
 input double   InpMaxSpreadPips_FX        = 25.0;

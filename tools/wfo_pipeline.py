@@ -15,9 +15,9 @@ Usage:
     python tools/wfo_pipeline.py --csv path/to/ml_export_v2.csv [--windows 6] [--oos-ratio 0.3]
 """
 
-from __future__ import annotations
-
-import argparse
+# Constants
+TRADING_DAYS_PER_YEAR = 252
+WEEKS_PER_YEAR = 52
 import csv
 import math
 import sys
@@ -78,7 +78,7 @@ def sharpe(returns: List[float], annualise: bool = True) -> float:
     if std == 0:
         return 0.0
     sr = mean / std
-    return sr * math.sqrt(252) if annualise else sr  # trade-level Sharpe
+    return sr * math.sqrt(TRADING_DAYS_PER_YEAR) if annualise else sr  # raw Sharpe ratio (mean/std)
 
 
 def max_drawdown(equity_curve: List[float]) -> float:
@@ -119,7 +119,7 @@ def score_window(pnls: List[float]) -> Dict[str, float]:
         equity.append(equity[-1] + p)
     net = equity[-1]
     mdd = max_drawdown(equity)
-    years = max(len(pnls) / 252, 1 / 52)  # approximate
+    years = max(len(pnls) / TRADING_DAYS_PER_YEAR, 1 / WEEKS_PER_YEAR)  # approximate
     returns = [pnls[i] / max(abs(equity[i]), 1.0) for i in range(len(pnls))]
     return {
         "n":      len(pnls),
@@ -209,8 +209,8 @@ def main() -> None:
     parser.add_argument("--windows",   type=int, default=6, help="Number of WF windows (default 6)")
     parser.add_argument("--oos-ratio", type=float, default=0.3, help="OOS fraction per window (default 0.3)")
     args = parser.parse_args()
-
-    print(f"Loading {args.csv} …")
+    if not (0.05 <= args.oos_ratio <= 0.95):
+        parser.error("--oos-ratio must be between 0.05 and 0.95")
     rows = load_trades(args.csv)
     print(f"  {len(rows)} trade rows")
 

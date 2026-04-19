@@ -81,6 +81,8 @@ bool EntrySignal_Setup2(const int symIdx, const string sym, bool &isBuy)
 }
 
 // --- Session identification (Asia=0, London=1, NY=2, Other=3)
+// NOTE: uses broker server time (TimeCurrent). Adjust InpLondonStartHour / InpNYStartHour
+// for your broker's GMT offset and Daylight Saving Time if needed.
 int GetCurrentSession()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
@@ -128,7 +130,7 @@ double FindSwingTP(const string sym, const bool isBuy, const double entry)
 
    double pip = PipSize(sym);
    if(pip <= 0.0) return 0.0;
-   double minDistPips = 3.0; // must be at least 3 pips from entry
+   double minDistPips = MathMax(0.5, InpSwingSR_MinDistPips); // min distance from entry to S/R level
 
    if(isBuy)
    {

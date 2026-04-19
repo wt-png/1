@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
 
-NUMERIC_FEATURES = [
+_MISSING_VALUES = {"", "nan", "null", "n/a", "na"}
+
+def _parse_float(v: str) -> float:
+    """Parse a float from CSV, treating common missing-value strings as 0.0."""
+    return float(v) if v.lower() not in _MISSING_VALUES else 0.0
     "atr_pips",
     "adx_trend",
     "adx_entry",
@@ -59,7 +63,7 @@ def build_dataset(rows: List[Dict[str, str]]) -> Tuple[List[List[float]], List[i
         for f in NUMERIC_FEATURES:
             v = r.get(f, "")
             try:
-                feats.append(float(v) if v not in ("", "nan", "null") else 0.0)
+                feats.append(_parse_float(v))
             except ValueError:
                 feats.append(0.0)
         X.append(feats)
