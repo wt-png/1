@@ -5,7 +5,87 @@ Format: [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [18.1] — 2026-04-19
+## [19.0] — 2026-04-19
+
+### Priority 1 — Robustness & Reliability
+
+- **P1-1 OnTradeTransaction primary deal-processor**: `OnTradeTransaction` now calls
+  `HistorySelectByPosition(trans.position)` immediately on `DEAL_ADD`, setting a
+  freshness flag (`g_dealQHistoryFresh`). `ProcessDealQueue` skips the throttled
+  `HistorySelect` call when the flag is valid (< 5 s old), reducing deal-processing
+  latency after disconnects.
+- **P1-2 Indicator handle revalidation (`Handles_CheckAndReinit`)**: Called from
+  `OnTimer` every cycle; detects any `INVALID_HANDLE` per symbol (possible after
+  broker reconnect) and reinitialises ATR, ADX, EMA, RSI, and ultra-HTF handles.
+- **P1-3 ProcessDealQueue deduplication + wider history window**: `DealSeen_Add`
+  ring-buffer prevents a deal from being processed twice. Default lookback expanded
+  from 5→7 days (14 on back-off).
+
+### Priority 2 — Entry Quality
+
+- **P2-4 RSI divergence filter (`InpUseDivergenceFilter`, `InpRSI_Period`)**: In
+  `EntrySignal_Setup1`, checks for bullish divergence (buy: price lower low + RSI
+  higher low) or bearish divergence (sell: price higher high + RSI lower high) on the
+  last two closed bars of `entryTF`.
+- **P2-5 Dynamic spread/ATR filter (`InpUseDynamicSpreadFilter`, `InpDynSpread_ATRRatio`)**:
+  Blocks all setups (Setup1 and Setup2) when `spread / atrPips > InpDynSpread_ATRRatio`.
+  Complements the static `InpMaxSpreadPips_FX` check.
+- **P2-6 Body-to-range ratio pinbar filter (`InpUseBodyRatioFilter`, `InpMinBodyRatio`)**:
+  Rejects doji/pinbar candles in `EntrySignal_Setup1` when `body/range < InpMinBodyRatio`
+  (default 0.30). One check on the last closed `entryTF` candle.
+- **P2-7 Ultra-HTF bias / three-TF alignment (`InpUseUltraHTFBias`, `InpUltraBiasTF`,
+  `InpUltraBiasEMAFast`, `InpUltraBiasEMASlow`)**: Adds a third timeframe EMA cross
+  check in `ProcessSymbol`. Requires `ultraFast > ultraSlow` for buys (and vice versa
+  for sells) on `InpUltraBiasTF` (default H4). New handles initialised in `OnInit`,
+  released in `OnDeinit`, and revalidated in `Handles_CheckAndReinit`.
+
+### Priority 3 — Risk Management
+
+- **P3-8 Weekday filter (`InpBlockMonday`, `InpBlockFriday`, `InpBlockFridayFromHour`)**:
+  `WeekdayAllows()` blocks entries on Monday before `InpLondonStartHour` (optional) and
+  on Friday from `InpBlockFridayFromHour` onward (optional).
+- **P3-9 Weekly loss limit (`InpWeeklyLossLimit_Enable`, `InpWeeklyLossLimit_Pct`)**:
+  `WeeklyLoss_UpdateIfNewWeek()` seeds `g_weekEqStart` each Monday; `WeeklyLossAllows()`
+  blocks new entries for the remainder of the week when equity drawdown exceeds the
+  configured threshold.
+- **P3-10 Post-SL bar-based cooldown (`InpPostSL_CooldownBars_Enable`, `InpPostSL_CooldownBars`)**:
+  `PostSL_CooldownBars_Trigger()` is called from `Cooldown_Apply` unconditionally on
+  SL-exits, recording the bar open-time and a bar countdown. `ProcessSymbol` checks
+  `PostSL_CooldownBars_IsActive()` in addition to the existing minute-based cooldown.
+
+### Priority 4 — Tooling & Workflow
+
+- **P4-11 `tools/test_entry_logic.py`**: 28 pytest tests covering `ComputeSL_SessionAware`,
+  `FindSwingTP`, body-to-range ratio filter, and RSI divergence detection — all as Python
+  reference mirrors of the MQL5 logic.
+- **P4-12 `tools/optimize_params.py`**: Grid-search and Optuna-based parameter optimiser;
+  evaluates `InpMinADXForEntry`, `InpMinADXTrendFilter`, `InpMinATR_Pips`,
+  `InpMaxSpread_Ratio`, `InpSwingSR_MinRR`, `InpTrail_ATR_Mult` against the WFO pipeline.
+- **P4-13 `.github/workflows/ci.yml`**: GitHub Actions CI — runs `pytest tools/` on every
+  push/PR and verifies `EA_VERSION` in `.mq5` matches the latest `## [X.Y]` section in
+  `CHANGELOG.md`.
+- **P4-14 Documentation restored**: `docs/INSTALLATION.md` (broker setup, MT5 layout, first-run
+  checklist, Telegram integration) and `docs/LIVE_TEST_PROTOCOL.md` (4-phase protocol,
+  go/no-go criteria, emergency stop procedures).
+
+### Priority 5 — Advanced
+
+- **P5-15 Adaptive ATR lookback (`InpAdaptiveATR_Enable`, `InpATR_Period_Fast`,
+  `InpATR_Period_Mid`)**: `GetCurrentATRPeriod()` returns `InpATR_Period_Fast` in
+  `EQ_DEFENSIVE`, `InpATR_Period_Mid` in `EQ_CAUTION`, and `InpATR_Period` in
+  `EQ_NEUTRAL`. Applied in `OnInit` and `Handles_CheckAndReinit`.
+- **P5-16 Slippage penalty in `OnTester` score (`InpTester_SlippagePenalty`,
+  `InpTester_SlippagePenalty_Mult`)**: BUY and SELL slippage pips are accumulated in
+  `g_totalSlippagePips` / `g_slippageCount`; `OnTester` deducts
+  `mult * avg_slip_pips` from the score.
+- **P5-17 Telegram inbound commands (`TG_PollCommands`)**: `OnTimer` calls
+  `TG_PollCommands()` which polls `getUpdates` (offset-tracked, non-blocking `timeout=0`).
+  Supported: `/pause` (sets `g_tgPaused`), `/resume`, `/status`, `/closeall`. Respects
+  `ALLOWED_USER_ID` from the config file.
+
+---
+
+
 
 ### Fixed
 - **`tools/ml_feedback.py`**: Syntax error — `NUMERIC_FEATURES` list was accidentally placed

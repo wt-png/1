@@ -1,0 +1,80 @@
+name: CI — pytest + version-check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: pytest (all tests in tools/)
+  # ---------------------------------------------------------------------------
+  pytest:
+    name: pytest tools/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          # Install optional numeric deps (non-fatal if unavailable in tox/local envs)
+          pip install numpy xgboost || true
+
+      - name: Run pytest
+        run: pytest tools/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Job 2: EA_VERSION ↔ CHANGELOG.md version-check
+  # Verifies that the version string in MSPB_Expert_Advisor.mq5 matches the
+  # most-recent section heading in CHANGELOG.md  (format: ## [X.Y] — …)
+  # ---------------------------------------------------------------------------
+  version-check:
+    name: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check EA_VERSION matches CHANGELOG.md
+        run: |
+          set -euo pipefail
+
+          # Extract EA_VERSION from .mq5 — expects: #define EA_VERSION "X.Y"
+          MQ5_VERSION=$(grep -E '^\s*#define\s+EA_VERSION\s+"[^"]+"' MSPB_Expert_Advisor.mq5 \
+                        | head -1 \
+                        | sed -E 's/.*"([^"]+)".*/\1/')
+
+          if [ -z "$MQ5_VERSION" ]; then
+            echo "ERROR: Could not find EA_VERSION in MSPB_Expert_Advisor.mq5"
+            exit 1
+          fi
+
+          # Extract most-recent version from CHANGELOG.md — expects: ## [X.Y]
+          CL_VERSION=$(grep -E '^\s*##\s+\[[0-9]+\.[0-9]+\]' CHANGELOG.md \
+                       | head -1 \
+                       | sed -E 's/.*\[([0-9]+\.[0-9]+)\].*/\1/')
+
+          if [ -z "$CL_VERSION" ]; then
+            echo "ERROR: Could not find a version heading in CHANGELOG.md"
+            exit 1
+          fi
+
+          echo "EA_VERSION   : $MQ5_VERSION"
+          echo "CHANGELOG    : $CL_VERSION"
+
+          if [ "$MQ5_VERSION" != "$CL_VERSION" ]; then
+            echo ""
+            echo "ERROR: EA_VERSION ($MQ5_VERSION) does not match the latest"
+            echo "       CHANGELOG.md entry ($CL_VERSION)."
+            echo "       Please update CHANGELOG.md or bump EA_VERSION."
+            exit 1
+          fi
+
+          echo "Version check passed: $MQ5_VERSION"
