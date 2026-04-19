@@ -138,10 +138,9 @@ double FindSwingTP(const string sym, const bool isBuy, const double entry)
       {
          double h = r[i].high;
          if(h <= entry + minDistPips*pip) continue;
-         // swing high: bar[i].high > bar[i-1].high and bar[i].high > bar[i+1].high
-         if(i > 0 && i < got-1)
-            if(r[i].high > r[i-1].high && r[i].high > r[i+1].high)
-               if(best <= 0.0 || h < best) best = h;
+         // swing high: local maximum — higher than both neighbours
+         if(i > 0 && i < got-1 && r[i].high > r[i-1].high && r[i].high > r[i+1].high)
+            if(best <= 0.0 || h < best) best = h;
       }
       return best;
    }
@@ -153,9 +152,9 @@ double FindSwingTP(const string sym, const bool isBuy, const double entry)
       {
          double l = r[i].low;
          if(l >= entry - minDistPips*pip) continue;
-         if(i > 0 && i < got-1)
-            if(r[i].low < r[i-1].low && r[i].low < r[i+1].low)
-               if(best <= 0.0 || l > best) best = l;
+         // swing low: local minimum — lower than both neighbours
+         if(i > 0 && i < got-1 && r[i].low < r[i-1].low && r[i].low < r[i+1].low)
+            if(best <= 0.0 || l > best) best = l;
       }
       return best;
    }

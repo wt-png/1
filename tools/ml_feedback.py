@@ -56,15 +56,12 @@ def build_dataset(rows: List[Dict[str, str]]) -> Tuple[List[List[float]], List[i
         label = 1 if pnl > 0 else 0
 
         feats = []
-        ok = True
         for f in NUMERIC_FEATURES:
             v = r.get(f, "")
             try:
                 feats.append(float(v) if v not in ("", "nan", "null") else 0.0)
             except ValueError:
                 feats.append(0.0)
-        if not ok:
-            continue
         X.append(feats)
         y.append(label)
     return X, y, NUMERIC_FEATURES
