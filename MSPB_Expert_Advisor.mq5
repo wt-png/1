@@ -1,9 +1,9 @@
 #property strict
 #property description "MultiSymbol Pullback Scalper: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
-#property version   "17.0"
+#property version   "17.2"
 
 // Semantic version exposed at runtime — used in startup logs and Telegram messages.
-#define EA_VERSION "17.0"
+#define EA_VERSION "17.2"
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -25,6 +25,12 @@
    #define FILE_SHARE_READ 0
 #endif
 // --------------------------------------------------------------------------------
+
+// Convenience debug-logging macros.
+// EA_DBG(msg)  — Print msg only when InpDebug is true (replaces scattered if(InpDebug) Print(...)).
+// EA_DBGF(fmt, ...) — PrintFormat variant.
+#define EA_DBG(msg)           do { if(InpDebug) Print(msg);              } while(false)
+#define EA_DBGF(fmt, ...)     do { if(InpDebug) PrintFormat(fmt, __VA_ARGS__); } while(false)
 
 // Maximum number of symbols the EA tracks simultaneously.
 // Raise this value if you need more than 64 instruments.
@@ -1997,6 +2003,24 @@ int g_biasSlowHandle[MAX_SYMBOLS];
 int g_atrVolHandle[MAX_SYMBOLS];
 int g_h4EmaHandle[MAX_SYMBOLS];
 
+// Releases all indicator handles for the first `n` symbols and resets them to
+// INVALID_HANDLE.  Called both on orderly deinit and before a re-initialisation
+// pass to prevent handle leaks.
+void Symbols_ReleaseHandles(const int n)
+{
+   for(int i = 0; i < n; i++)
+   {
+      if(g_emaHandle[i]      != INVALID_HANDLE) { IndicatorRelease(g_emaHandle[i]);      g_emaHandle[i]      = INVALID_HANDLE; }
+      if(g_atrHandle[i]      != INVALID_HANDLE) { IndicatorRelease(g_atrHandle[i]);      g_atrHandle[i]      = INVALID_HANDLE; }
+      if(g_atrVolHandle[i]   != INVALID_HANDLE) { IndicatorRelease(g_atrVolHandle[i]);   g_atrVolHandle[i]   = INVALID_HANDLE; }
+      if(g_adxHandle[i]      != INVALID_HANDLE) { IndicatorRelease(g_adxHandle[i]);      g_adxHandle[i]      = INVALID_HANDLE; }
+      if(g_adxEntryHandle[i] != INVALID_HANDLE) { IndicatorRelease(g_adxEntryHandle[i]); g_adxEntryHandle[i] = INVALID_HANDLE; }
+      if(g_biasFastHandle[i] != INVALID_HANDLE) { IndicatorRelease(g_biasFastHandle[i]); g_biasFastHandle[i] = INVALID_HANDLE; }
+      if(g_biasSlowHandle[i] != INVALID_HANDLE) { IndicatorRelease(g_biasSlowHandle[i]); g_biasSlowHandle[i] = INVALID_HANDLE; }
+      if(g_h4EmaHandle[i]    != INVALID_HANDLE) { IndicatorRelease(g_h4EmaHandle[i]);    g_h4EmaHandle[i]    = INVALID_HANDLE; }
+   }
+}
+
 
 // Copy buffer helper
 bool CopyLast(const int handle, const int buffer, const int start, const int count, double &out[])
@@ -3326,6 +3350,16 @@ void TuneState_Load()
    }
 
    FileClose(h);
+
+   // Validate the state-file format version.  This EA writes version 1.  A file
+   // written by a future EA version may have additional columns; loading it with
+   // the current parser is likely safe (extra columns are ignored) but we warn the
+   // operator so they can decide whether to reset state.
+   if(versionSeen && version > 1)
+      PrintFormat("[TUNE] WARNING: state file '%s' was written by EA format version %d "
+                  "(this EA supports up to version 1). Some fields may be misread. "
+                  "Delete or rename the file to start fresh if unexpected behaviour occurs.",
+                  fn, version);
 }
 
 void TuneState_Save()
@@ -5068,18 +5102,9 @@ int OnInit()
 
 
    // init indicators per symbol
-   bool needEMA = (InpUsePullbackEMA || InpSymbolOverrides_Enable);
-   for(int i=0;i<g_symCount;i++)
-   {
-      g_emaHandle[i]=INVALID_HANDLE;
-      g_atrHandle[i]=INVALID_HANDLE;
-      g_atrVolHandle[i]=INVALID_HANDLE;
-      g_adxHandle[i]=INVALID_HANDLE;
-      g_adxEntryHandle[i]=INVALID_HANDLE;
-      g_biasFastHandle[i]=INVALID_HANDLE;
-      g_biasSlowHandle[i]=INVALID_HANDLE;
-      g_h4EmaHandle[i]=INVALID_HANDLE;
-   }
+   // Release any previously-allocated handles first to prevent leaks if this
+   // path is ever reached a second time (e.g. future hot-reinit refactors).
+   Symbols_ReleaseHandles(g_symCount);
 
    // Initialize indicator handles. If one symbol fails (no data / invalid handle),
    // we SKIP that symbol instead of failing the whole EA (multi-symbol friendly).
@@ -5239,18 +5264,10 @@ void OnDeinit(const int reason)
 
    if(InpTune_Enable) TuneState_Save();
 
-   // release indicators
-   for(int i=0;i<g_symCount;i++)
-   {
-      if(g_emaHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_emaHandle[i]);
-      if(g_atrHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrHandle[i]);
-      if(g_adxHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxHandle[i]);
-      if(g_adxEntryHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxEntryHandle[i]);
-      if(g_biasFastHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasFastHandle[i]);
-      if(g_biasSlowHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasSlowHandle[i]);
-      if(g_atrVolHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrVolHandle[i]);
-      if(g_h4EmaHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_h4EmaHandle[i]);
-   }
+   // Release all indicator handles and reset arrays to INVALID_HANDLE.
+   // Using the shared helper prevents double-release if OnDeinit is ever
+   // invoked more than once and keeps the release logic in one place.
+   Symbols_ReleaseHandles(g_symCount);
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -5281,8 +5298,10 @@ void OnTick()
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
 
-   // HOTFIX: update correlation cache once per CorrTF bar (avoids repeated CopyClose in entry checks)
-   if(InpUseCorrelationGuard) CorrCache_UpdateIfNeeded();
+   // Update correlation cache once per CorrTF bar.  When the timer drives the
+   // main loop (InpUseTimerForEntries=true) OnTimer already handles this, so we
+   // skip the call here to avoid the redundant CopyClose work every tick.
+   if(InpUseCorrelationGuard && !InpUseTimerForEntries) CorrCache_UpdateIfNeeded();
 
    if(InpManageOnTick) ManagePositions();
 

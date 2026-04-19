@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [17.2] — 2026-04-19
+
+### Robustness
+- **Indicator handle safety** — extracted `Symbols_ReleaseHandles(n)` helper; called before indicator init in `OnInit` and replaces the inline loop in `OnDeinit`; handles are reset to `INVALID_HANDLE` after release, preventing double-release bugs on future refactors
+- **`TuneState_Load` version guard** — warns when the state file was written by a newer EA format version so the operator can decide whether to reset state before an unexpected field mismatch causes silent miscalculation
+- **Override CSV array-full warning** — `LoadSymbolOverrides()` now prints a visible warning instead of silently truncating when the 128-row override table is full
+
+### Performance
+- **Eliminate duplicate `CorrCache_UpdateIfNeeded()` call** — `OnTick` no longer calls the correlation-cache update when the timer-driven main loop is active (`InpUseTimerForEntries=true`); `OnTimer` is the single owner in that mode, removing the redundant `CopyClose` work on every tick
+
+### Observability
+- **Override hot-reload change logging** — `SymbolOverrides_UpdateIfDue()` now logs a `[Overrides] Hot-reload:` line on every reload, showing whether the row count changed; makes it trivial to confirm that a file change was picked up
+- **`EA_DBG` / `EA_DBGF` convenience macros** — add `do { if(InpDebug) Print(…); } while(false)` wrappers to replace the scattered `if(InpDebug) Print(…)` pattern; new code should use `EA_DBG`/`EA_DBGF` for debug-guarded output
+
+### Internal
+- **Version bump `EA_VERSION` and `#property version`** — bumped from `"17.0"` to `"17.2"` to match CHANGELOG
+
+---
+
 ## [17.1] — 2026-04-19
 
 ### Deployment & Commercial Readiness

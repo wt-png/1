@@ -82,7 +82,12 @@ bool LoadSymbolOverrides()
       string key=UpperTrim(cols[0]);
       if(key=="" || key=="SYMBOL" || key=="SYM") continue;
 
-      if(g_ovrCount>=ArraySize(g_ovr)) break;
+      if(g_ovrCount>=ArraySize(g_ovr))
+      {
+         Print("[Overrides] WARNING: override table is full (max=", ArraySize(g_ovr),
+               "). Remaining rows in '", InpSymbolOverrides_File, "' were ignored.");
+         break;
+      }
 
       SymbolOverrides o;
       o.sym=key;
@@ -135,8 +140,20 @@ void SymbolOverrides_UpdateIfDue()
    if(!InpSymbolOverrides_Enable || !InpSymbolOverrides_HotReload) return;
    datetime now=TimeCurrent();
    if(now<g_ovrNextReload) return;
+   int prevCount = g_ovrCount;
    bool ok=LoadSymbolOverrides();
-   if(ok && InpTune_Enable) Tune_SyncWithOverrides(false);
+   if(ok)
+   {
+      // Log whenever the number of active override rows changes so the operator
+      // can see that the file was reloaded and whether rows were added/removed.
+      if(g_ovrCount != prevCount)
+         PrintFormat("[Overrides] Hot-reload: row count changed %d → %d (file='%s')",
+                     prevCount, g_ovrCount, InpSymbolOverrides_File);
+      else
+         PrintFormat("[Overrides] Hot-reload: %d row(s) unchanged (file='%s')",
+                     g_ovrCount, InpSymbolOverrides_File);
+      if(InpTune_Enable) Tune_SyncWithOverrides(false);
+   }
 }
 
 // Convenience getters (per-symbol override if set, else global)
