@@ -209,6 +209,7 @@ def main() -> None:
     parser.add_argument("--csv",       required=True,      help="Path to ml_export_v2.csv")
     parser.add_argument("--windows",   type=int, default=6, help="Number of WF windows (default 6)")
     parser.add_argument("--oos-ratio", type=float, default=0.3, help="OOS fraction per window (default 0.3)")
+    parser.add_argument("--output",    default="",         help="Optional JSON output file for results")
     args = parser.parse_args()
     if not (0.05 <= args.oos_ratio <= 0.95):
         parser.error("--oos-ratio must be between 0.05 and 0.95")
@@ -239,6 +240,28 @@ def main() -> None:
         print_results(results)
     else:
         print("Not enough data for walk-forward split.")
+
+    # Write JSON output if requested (used by E12 CI cron)
+    if args.output:
+        import json
+        from datetime import timezone as _tz
+        wfo_json = {
+            "generated_at": datetime.now(_tz.utc).isoformat(timespec="seconds"),
+            "overall": overall,
+            "windows": [
+                {
+                    "window": r["window"],
+                    "is_sharpe":  r["is"]["sharpe"],
+                    "oos_sharpe": r["oos"]["sharpe"],
+                    "is_pf":      r["is"]["pf"],
+                    "oos_pf":     r["oos"]["pf"],
+                    "stable":     r["is"]["sharpe"] > 0 and r["oos"]["sharpe"] > 0,
+                }
+                for r in results
+            ] if results else [],
+        }
+        Path(args.output).write_text(json.dumps(wfo_json, indent=2), encoding="utf-8")
+        print(f"\nWFO results written to {args.output}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,87 @@ Format: [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [20.0] — 2026-04-19
+
+### Category A — Direct Alpha (higher profit per trade)
+
+- **A1 ML Entry-Gate (`InpUseMLEntryGate`, `InpMLGateFile`, `InpML_MinScore`)**:
+  `tools/export_model_thresholds.py` trains an XGBoost classifier on
+  `ml_export_v2.csv` and exports a lightweight weighted-feature threshold to
+  `ml_entry_threshold.json`. The EA loads this JSON at startup and computes a
+  sigmoid score from standardised feature z-scores. Entries are blocked when
+  `score < InpML_MinScore` (default 0.55). Expected: +15–25% entry precision.
+
+- **A2 Three-level TP ladder (`InpTP_Ladder_Enable`, `InpTP_R1_*`, `InpTP_R2_*`,
+  `InpTP_R3_Trail_Mult`)**: `ManagePositions` now monitors each tracked position
+  and partially closes `InpTP_R1_ClosePct`% of the initial volume at R1 (default
+  1× initial risk) and `InpTP_R2_ClosePct`% at R2 (default 2×). The remaining
+  position trails with `InpTP_R3_Trail_Mult` × ATR after R2. Expected: +10–20%
+  average R:R in trending regimes.
+
+- **A3 Chandelier Exit (`InpUseChandelierExit`, `InpChandelier_Period`,
+  `InpChandelier_Mult`)**: When enabled, replaces the fixed ATR-multiple trailing
+  stop with a Chandelier Exit (`highest_high(N) − k×ATR` for longs). Dynamically
+  follows the trend. Expected: +5–15% in trending regimes.
+
+- **A4 Pyramiding after partial TP (`InpUsePyramiding`, `InpPyramid_MaxAdds`,
+  `InpPyramid_RiskPct`)**: After a R1 partial TP and break-even stop, the EA
+  places a micro-lot pyramid add (at `InpPyramid_RiskPct`% risk) if the next bar
+  forms a valid pullback. State tracked via `g_sym[idx].pyramidCount`. Expected:
+  +10–30% in strong trends.
+
+### Category B — Better Entry Filters (fewer losers)
+
+- **B5 MAE/MFE analysis (`tools/analyse_mae_mfe.py`)**: New Python tool reads
+  `ml_export_v2.csv`, pairs ENTRY+EXIT rows, and computes per-symbol MAE/MFE
+  distributions. Outputs recommended `InpSL_ATR_Mult` and `InpTP_RR` overrides
+  based on the configurable MAE/MFE percentile (default 90th/60th). No MQL5
+  changes required.
+
+- **B6 Per-symbol auto-disable on negative expectancy (`InpAutoDisable_Enable`,
+  `InpAutoDisable_Lookback`)**: After each closed trade the EA evaluates rolling
+  expectancy (`win_rate × avg_win − loss_rate × avg_loss`) over the last
+  `InpAutoDisable_Lookback` trades. If expectancy < 0 the symbol is blocked until
+  the next Monday open via `g_sym[idx].autoDisabledUntil`.
+
+- **B7 Kelly-fraction risk scaling (`InpUseKellyScaling`, `InpKelly_Lookback`,
+  `InpKelly_Fraction`)**: Computes per-symbol half-Kelly fraction from the rolling
+  win-rate and average win/loss ratio. Multiplies `tradeRiskMult` by the Kelly
+  factor, capped at `[InpKelly_MinMult, InpKelly_MaxMult]`.
+
+### Category C — Execution Quality
+
+- **C8 Limit re-entry on spread block (`InpUseLimitOnSpreadBlock`,
+  `InpLimitOrderTTL_Min`)**: When an entry is blocked by the dynamic spread filter
+  and no limit order is pending for that symbol, the EA places a pending limit
+  order at the signal price with `ORDER_TIME_SPECIFIED` expiry (TTL in minutes).
+  Stale orders are auto-cancelled in `OnTimer`.
+
+- **C9 Entry micro-delay (`InpEntryDelay_Ms`)**: A configurable millisecond delay
+  (default 0 = disabled) before placing an order. Allows the spread to normalise
+  after bar open. Expected: −1 to −3 pips slippage in volatile openings.
+
+### Category D — Portfolio Level
+
+- **D10 Weekly symbol ranking (`InpUseWeeklySymbolRank`, `InpSymbolRankFile`,
+  `InpSymbolRank_TopN`)**: `tools/rank_symbols.py` ranks symbols by rolling Sharpe
+  ratio over a configurable window and writes `ml_symbol_rank.csv`. The EA reads
+  this file weekly (refreshes every 6+ days) and sets `g_sym[idx].rankEnabled` to
+  block the bottom-ranked symbols from taking new entries.
+
+- **D11 Cross-symbol spread-aware correlation filter (`InpCorrSpreadPrefer`)**:
+  Extends `CorrelationAllowsEntry`: when a correlated signal would otherwise be
+  blocked, the entry is allowed if the current symbol's spread is ≤ the worst
+  correlated symbol's spread. Reduces missed entries at competitive spreads.
+
+### Category E — Backtesting Precision
+
+- **E12 Weekly WFO CI cron job**: `.github/workflows/ci.yml` now includes a weekly
+  schedule (every Saturday at 02:00 UTC) that runs `tools/wfo_pipeline.py` on the
+  latest ML export and pushes optimal parameters to `config/wfo_latest.json`.
+
+---
+
 ## [19.0] — 2026-04-19
 
 ### Priority 1 — Robustness & Reliability

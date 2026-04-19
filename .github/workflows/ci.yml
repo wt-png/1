@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  schedule:
+    # E12: weekly WFO pipeline — runs every Saturday at 02:00 UTC
+    - cron: "0 2 * * 6"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -82,3 +85,53 @@ jobs:
           fi
 
           echo "Version check passed: $MQ5_VERSION"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Walk-Forward Optimisation (E12)
+  # Runs only on the weekly Saturday cron schedule.
+  # Uses the ml_export_v2.csv committed to the repo (if present) to produce
+  # an updated config/wfo_latest.json and pushes it back to the branch.
+  # ---------------------------------------------------------------------------
+  wfo:
+    name: weekly-wfo
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy xgboost || true
+
+      - name: Run WFO pipeline
+        run: |
+          mkdir -p config
+          # Run WFO pipeline if ml_export_v2.csv exists (non-fatal if absent)
+          if [ -f ml_export_v2.csv ]; then
+            python tools/wfo_pipeline.py \
+              --csv ml_export_v2.csv \
+              --output config/wfo_latest.json \
+              || echo "WFO pipeline failed (non-fatal)"
+          else
+            echo "ml_export_v2.csv not found — skipping WFO run"
+            echo "{\"generated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"status\": \"no_data\"}" \
+              > config/wfo_latest.json
+          fi
+
+      - name: Commit and push wfo_latest.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/wfo_latest.json || true
+          git diff --cached --quiet || git commit -m "chore(wfo): weekly WFO update [skip ci]"
+          git push origin HEAD || true
