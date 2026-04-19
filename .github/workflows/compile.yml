@@ -1,0 +1,201 @@
+name: MQL5 Compile Check
+
+# Triggered on every push/PR that touches MQL5 source files.
+# Uses Wine + MetaEditor64.exe (part of MetaTrader 5) running headlessly
+# on a Linux runner to verify that every .mq5 file compiles without errors.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**.mq5"
+      - "**.mqh"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "**.mq5"
+      - "**.mqh"
+
+# Read-only — this workflow never writes back to the repository.
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Compile MQL5 source files
+    runs-on: ubuntu-22.04
+
+    env:
+      # Wine prefix kept outside the default ~/.wine so it is
+      # fully predictable regardless of the runner home directory.
+      WINEPREFIX: /opt/wineprefix
+      WINEDEBUG: "-all"
+      MT5_DIR: /opt/wineprefix/drive_c/mt5
+      # Where MetaEditor expects the MQL5 include/expert source tree.
+      MQL5_DIR: /opt/wineprefix/drive_c/mt5/MQL5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 1. Wine — use the Ubuntu 22.04 package; no i386 Wine needed for
+      #    64-bit MetaEditor64.exe.
+      # ------------------------------------------------------------------
+      - name: Install Wine and Xvfb
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            wine64 wine32 xvfb ca-certificates wget
+
+      # ------------------------------------------------------------------
+      # 2. Cache the MetaTrader 5 installation between runs to avoid
+      #    downloading ~60 MB on every CI run.
+      # ------------------------------------------------------------------
+      - name: Cache MetaTrader 5 installation
+        id: cache-mt5
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MT5_DIR }}
+          key: mt5-install-v1
+
+      # ------------------------------------------------------------------
+      # 3. Download and silently install MT5 (contains MetaEditor64.exe).
+      #    Skipped when the cache is warm.
+      # ------------------------------------------------------------------
+      - name: Install MetaTrader 5 (includes MetaEditor)
+        if: steps.cache-mt5.outputs.cache-hit != 'true'
+        run: |
+          wget -q -O /tmp/mt5setup.exe \
+            "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+
+          # Start a virtual display — the installer needs one even in /auto mode.
+          Xvfb :99 -screen 0 1024x768x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          sleep 3
+
+          # /auto runs the installer non-interactively.
+          WINEPREFIX="${WINEPREFIX}" wine /tmp/mt5setup.exe /auto &
+          WINE_PID=$!
+
+          # Wait up to 120 s for MetaEditor to appear.
+          for i in $(seq 1 24); do
+            sleep 5
+            ME=$(find "${WINEPREFIX}" -iname "MetaEditor64.exe" 2>/dev/null | head -1)
+            if [ -n "$ME" ]; then
+              echo "MetaEditor found at: $ME"
+              break
+            fi
+          done
+
+          kill $WINE_PID 2>/dev/null || true
+          kill $XVFB_PID 2>/dev/null || true
+
+          ME=$(find "${WINEPREFIX}" -iname "MetaEditor64.exe" 2>/dev/null | head -1)
+          if [ -z "$ME" ]; then
+            echo "ERROR: MetaEditor64.exe not found after installation."
+            exit 1
+          fi
+
+          # Persist the MT5 directory path for later steps.
+          MT5_INSTALL_DIR=$(dirname "$ME")
+          echo "MT5 installed to: $MT5_INSTALL_DIR"
+
+          # Normalise: copy to the fixed MT5_DIR path if it differs.
+          if [ "$MT5_INSTALL_DIR" != "${MT5_DIR}" ]; then
+            mkdir -p "${MT5_DIR}"
+            cp -r "$MT5_INSTALL_DIR/." "${MT5_DIR}/"
+          fi
+
+      # ------------------------------------------------------------------
+      # 4. Set up the MQL5 source tree inside the Wine prefix.
+      #    MetaEditor resolves #include paths relative to MQL5/Include.
+      # ------------------------------------------------------------------
+      - name: Stage source files in Wine MQL5 tree
+        run: |
+          EXPERTS_DIR="${MQL5_DIR}/Experts/MSPB"
+          INCLUDE_DIR="${MQL5_DIR}/Include"
+          mkdir -p "${EXPERTS_DIR}" "${INCLUDE_DIR}"
+
+          # Copy .mqh files to Include so #include "MSPB_EA_*.mqh" resolves.
+          cp *.mqh "${INCLUDE_DIR}/" 2>/dev/null || true
+
+          # Copy .mq5 files to Experts.
+          cp *.mq5 "${EXPERTS_DIR}/" 2>/dev/null || true
+
+          echo "Staged files:"
+          ls "${EXPERTS_DIR}/"
+          ls "${INCLUDE_DIR}/" | grep MSPB || true
+
+      # ------------------------------------------------------------------
+      # 5. Compile every .mq5 file and fail if any errors are reported.
+      #    MetaEditor writes a UTF-16 log next to each compiled file;
+      #    we convert it to UTF-8 for readable CI output.
+      # ------------------------------------------------------------------
+      - name: Compile .mq5 files
+        run: |
+          ME="${MT5_DIR}/MetaEditor64.exe"
+          EXPERTS_DIR="${MQL5_DIR}/Experts/MSPB"
+
+          if [ ! -f "$ME" ]; then
+            echo "ERROR: MetaEditor64.exe not found at $ME"
+            exit 1
+          fi
+
+          # Virtual display for MetaEditor.
+          Xvfb :99 -screen 0 1024x768x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          sleep 2
+
+          overall_fail=0
+
+          for mq5 in *.mq5; do
+            echo "──────────────────────────────────────"
+            echo "Compiling: $mq5"
+
+            # Wine path: C:\mt5\MQL5\Experts\MSPB\<file>
+            WIN_FILE="C:\\\\mt5\\\\MQL5\\\\Experts\\\\MSPB\\\\${mq5}"
+            WIN_LOG="C:\\\\mt5\\\\MQL5\\\\Experts\\\\MSPB\\\\${mq5%.mq5}.log"
+
+            WINEPREFIX="${WINEPREFIX}" WINEDEBUG="-all" \
+              wine "$ME" \
+              "/compile:${WIN_FILE}" \
+              "/log:${WIN_LOG}" \
+              "/inc:C:\\\\mt5\\\\MQL5\\\\Include" \
+              2>/dev/null
+
+            LOG_FILE="${EXPERTS_DIR}/${mq5%.mq5}.log"
+
+            if [ -f "$LOG_FILE" ]; then
+              # MetaEditor log is UTF-16LE; convert for readable output.
+              iconv -f UTF-16LE -t UTF-8 "$LOG_FILE" 2>/dev/null \
+                || cat "$LOG_FILE" || true
+              if iconv -f UTF-16LE -t UTF-8 "$LOG_FILE" 2>/dev/null \
+                  | grep -qi " error"; then
+                echo "FAIL: $mq5 has compilation errors."
+                overall_fail=1
+              else
+                echo "OK:   $mq5 compiled successfully."
+              fi
+            else
+              echo "WARN: no log produced for $mq5 — MetaEditor may not have run."
+              overall_fail=1
+            fi
+          done
+
+          kill $XVFB_PID 2>/dev/null || true
+          exit $overall_fail
+
+      # ------------------------------------------------------------------
+      # 6. Upload the compilation logs as an artifact for inspection.
+      # ------------------------------------------------------------------
+      - name: Upload compilation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mql5-compile-logs
+          path: ${{ env.MQL5_DIR }}/Experts/MSPB/*.log
+          if-no-files-found: ignore

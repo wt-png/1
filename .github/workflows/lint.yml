@@ -1,0 +1,161 @@
+name: MQL5 Lint & Structure Check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Minimal permissions — this workflow only reads repository contents.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint MQL5 source files
+    runs-on: ubuntu-latest
+
+    env:
+      # Alert when the main EA file grows beyond this many lines.
+      # The threshold keeps the monolithic file manageable after module extraction.
+      MAX_EA_LINES: 10000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Sanity: every .mq5 / .mqh file must start with the correct
+      #    property or include guard so that the compiler never silently
+      #    skips a file.
+      # ---------------------------------------------------------------
+      - name: Check #property strict / include guards
+        run: |
+          fail=0
+          for f in *.mq5; do
+            if ! grep -q '#property strict' "$f"; then
+              echo "FAIL: $f missing '#property strict'"
+              fail=1
+            fi
+          done
+          for f in *.mqh; do
+            if ! grep -qP '#ifndef\s+\w+_MQH' "$f"; then
+              echo "FAIL: $f missing include guard (#ifndef ..._MQH)"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # ---------------------------------------------------------------
+      # 2. No stray debug Print() calls that contain known debug-only
+      #    markers.  The pattern matches any Print call whose message
+      #    *contains* [DEBUG] or [TEST] anywhere in the string.
+      # ---------------------------------------------------------------
+      - name: Check for debug-only markers
+        run: |
+          fail=0
+          # Reject Print() calls whose message string contains [DEBUG] or [TEST].
+          if grep -rn 'Print.*"\[DEBUG\]\|Print.*"\[TEST\]' *.mq5 *.mqh 2>/dev/null; then
+            echo "FAIL: debug-only Print() markers found (see above)"
+            fail=1
+          fi
+          exit $fail
+
+      # ---------------------------------------------------------------
+      # 3. EA_VERSION must be defined in the main EA file.
+      # ---------------------------------------------------------------
+      - name: Check EA_VERSION is defined
+        run: |
+          if ! grep -q '#define EA_VERSION' MSPB_Expert_Advisor.mq5; then
+            echo "FAIL: EA_VERSION not defined in MSPB_Expert_Advisor.mq5"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 4. Every #include "MSPB_EA_*.mqh" reference must have a
+      #    matching file in the repository.
+      # ---------------------------------------------------------------
+      - name: Check that all local includes exist
+        run: |
+          fail=0
+          while IFS= read -r line; do
+            file=$(echo "$line" | grep -oP '(?<=#include ")MSPB_EA_[^"]+')
+            if [ -n "$file" ] && [ ! -f "$file" ]; then
+              echo "FAIL: included file '$file' not found in repository"
+              fail=1
+            fi
+          done < <(grep -rn '#include "MSPB_EA_' *.mq5 *.mqh 2>/dev/null)
+          exit $fail
+
+      # ---------------------------------------------------------------
+      # 5. Verify CHANGELOG.md and CONTRIBUTING.md exist.
+      # ---------------------------------------------------------------
+      - name: Check documentation files exist
+        run: |
+          fail=0
+          for doc in CHANGELOG.md CONTRIBUTING.md; do
+            if [ ! -f "$doc" ]; then
+              echo "FAIL: $doc is missing"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # ---------------------------------------------------------------
+      # 6. File-size guard: warn when the main EA file grows beyond
+      #    MAX_EA_LINES lines (indicates that extracted modules are
+      #    drifting back into the monolithic file).
+      # ---------------------------------------------------------------
+      - name: Check main EA file line count
+        run: |
+          lines=$(wc -l < MSPB_Expert_Advisor.mq5)
+          echo "MSPB_Expert_Advisor.mq5: $lines lines"
+          if [ "$lines" -gt "$MAX_EA_LINES" ]; then
+            echo "FAIL: main EA file exceeds ${MAX_EA_LINES} lines ($lines). Extract modules."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 7. Semantic version consistency: EA_VERSION in the .mq5 file
+      #    must match the latest version heading in CHANGELOG.md.
+      #    CHANGELOG format expected: ## [x.y] — YYYY-MM-DD
+      # ---------------------------------------------------------------
+      - name: Check EA_VERSION matches CHANGELOG.md
+        run: |
+          ea_ver=$(grep -oP '(?<=#define EA_VERSION ")[\d.]+' MSPB_Expert_Advisor.mq5 | head -1)
+          cl_ver=$(grep -oP '(?<=## \[)[\d.]+(?=\])' CHANGELOG.md | head -1)
+          echo "EA_VERSION in .mq5  : $ea_ver"
+          echo "Latest in CHANGELOG : $cl_ver"
+          if [ "$ea_ver" != "$cl_ver" ]; then
+            echo "FAIL: EA_VERSION ($ea_ver) does not match latest CHANGELOG entry ($cl_ver)."
+            echo "Update EA_VERSION in MSPB_Expert_Advisor.mq5 or add a new CHANGELOG entry."
+            exit 1
+          fi
+
+  python-tools:
+    name: Python tools — lint and test coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+
+      # ---------------------------------------------------------------
+      # Run unit tests for the Python tools with coverage reporting.
+      # A minimum coverage threshold keeps regressions from going
+      # unnoticed as the tool suite grows.
+      # ---------------------------------------------------------------
+      - name: Run Python tests with coverage
+        run: |
+          pytest tools/ --cov=tools --cov-report=term-missing --cov-fail-under=70 -v
+        continue-on-error: false
