@@ -5298,9 +5298,9 @@ void OnTick()
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
 
-   // Update correlation cache once per CorrTF bar.  When the timer drives the
-   // main loop (InpUseTimerForEntries=true) OnTimer already handles this, so we
-   // skip the call here to avoid the redundant CopyClose work every tick.
+   // Update correlation cache once per CorrTF bar.  Skip when timer mode is
+   // enabled (InpUseTimerForEntries=true): OnTimer already owns this call, so
+   // repeating it here on every tick would cause redundant CopyClose work.
    if(InpUseCorrelationGuard && !InpUseTimerForEntries) CorrCache_UpdateIfNeeded();
 
    if(InpManageOnTick) ManagePositions();
