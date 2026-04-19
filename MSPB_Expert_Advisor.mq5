@@ -1,11 +1,17 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper v17.2: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
+#property description "MultiSymbol Pullback Scalper v18.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
+#include "MSPB_EA_Telegram.mqh"
+#include "MSPB_EA_OrderExec.mqh"
+#include "MSPB_EA_Dashboard.mqh"
+#include "MSPB_EA_Risk.mqh"
+#include "MSPB_EA_ExecQual.mqh"
+#include "MSPB_EA_Entry.mqh"
 
 // EA version string -- used in startup logs and Telegram messages.
-#define EA_VERSION "17.2"
+#define EA_VERSION "18.0"
 
 // __TIME__ compatibility: some older MT5 builds do not expose this predefined macro.
 // This EA does not use __TIME__ directly; the guard prevents "undeclared identifier"
@@ -456,6 +462,8 @@ input int      InpMaxPositionsTotal       = 6;
 input bool     InpUseTimerForEntries      = true;   // if true, entries evaluated in OnTimer; else in OnTick
 input bool     InpManageOnTick            = true;   // if true, position mgmt runs on tick; else in timer
 input int      InpTimerSec                = 1;
+input bool     InpSmartOrderRoute        = false;  // only use market orders when spread < ATR*InpSOR_SpreadATRRatio
+input double   InpSOR_SpreadATRRatio     = 0.15;   // max spread/ATR ratio for market order execution
 
 // --- Risk
 input bool     InpUseRiskPercent          = true;
@@ -532,6 +540,12 @@ input double   InpVolHighPct              = 80.0;  // >= => high vol regime
 input bool     InpVolLowBlockEntries      = true;  // block entries in low regime
 input double   InpVolHighRiskMult         = 0.50;  // risk multiplier in high regime
 
+// --- Volatility percentile filter (v18)
+input bool     InpVolPctFilter_Enable    = false;  // block entries when ATR(20) below Nth pct of ATR(100)
+input int      InpVolPctFilter_Period    = 20;     // short ATR period for percentile filter
+input int      InpVolPctFilter_Base      = 100;    // base ATR period (denominator)
+input double   InpVolPctFilter_Threshold = 30.0;  // block if below this percentile (0-100)
+
 // --- Setup2
 input bool     InpUseSetup2               = true;
 input bool     InpUseBreakPrevHighLow     = true;
@@ -542,6 +556,13 @@ input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
+input double   InpLondon_SL_ATR_Mult     = 1.0;  // London session SL ATR multiplier (1.0 = same as base)
+input double   InpAsia_SL_ATR_Mult       = 0.85; // Asia session SL ATR multiplier (tighter range)
+
+// --- Swing S/R TP (v18)
+input bool     InpUseSwingSR_TP          = false;  // use nearest swing high/low as TP target
+input int      InpSwingSR_Lookback       = 30;     // bars to look back for swing points on confirmTF
+input double   InpSwingSR_MinRR          = 1.2;    // minimum RR required to use the S/R TP
 
 // --- Spread
 input double   InpMaxSpreadPips_FX        = 25.0;
@@ -1329,7 +1350,6 @@ void Status_SetTrade(const string key, const int code, const string msg)
       PrintFormat("STATUS %s code=%d msg=%s", key, code, msg);
 }
 
-#include "MSPB_EA_Telegram.mqh"
 
 // --- Fail-safe implementation (NEW)
 void FailSafe_Trip(const string why)
@@ -1736,380 +1756,7 @@ void Cooldown_Apply(const string sym,
 }
 
 
-double SpreadPips(const string sym)
-{
-   MqlTick tk;
-   if(!SymbolInfoTick(sym, tk)) return 0.0;
-   double pip=PipSize(sym);
-   if(pip<=0.0) return 0.0;
-
-   double sp = (tk.ask - tk.bid)/pip;
-   double mult = (InpSpreadStressMult<=0.0 ? 1.0 : InpSpreadStressMult);
-   return sp * mult;
-}
-
-double NormalizeVolume(const string sym, double vol)
-{
-   double minv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double maxv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
-   double step=SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-   if(step<=0) step=0.01;
-
-   if(vol<minv) vol=minv;
-   if(vol>maxv) vol=maxv;
-
-   double steps=MathFloor((vol-minv)/step);
-   double out=minv + steps*step;
-   if(out<minv) out=minv;
-   if(out>maxv) out=maxv;
-
-   // Digits based on volume step (avoids "Invalid volume" on brokers with 0.001 steps or stocks with 1.0 steps).
-   int digits=0;
-   double s=step;
-   while(digits<8 && MathAbs(s - MathRound(s)) > 1e-12)
-   {
-      s*=10.0;
-      digits++;
-   }
-   return NormalizeDouble(out, digits);
-}
-
-// --- floor-normalize volume (never rounds UP to min volume); returns 0 if below min
-double NormalizeVolumeFloor(const string sym, double vol)
-{
-   double minv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double maxv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
-   double step=SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-   if(step<=0) step=0.01;
-
-   if(vol < (minv - 1e-12)) return 0.0;
-   if(vol > maxv) vol = maxv;
-
-   double steps=MathFloor((vol-minv)/step + 1e-9);
-   double out=minv + steps*step;
-
-   // float safety: never exceed requested vol
-   if(out > vol + 1e-12) out -= step;
-
-   if(out < (minv - 1e-12)) return 0.0;
-   if(out > maxv) out = maxv;
-
-   // normalize digits based on step precision
-   int digits=0;
-   double s=step;
-   while(digits<8 && MathAbs(s - MathRound(s)) > 1e-12)
-   {
-      s *= 10.0;
-      digits++;
-   }
-   return NormalizeDouble(out, digits);
-}
-
-double PositionRiskMoney(const string sym, const double entry, const double sl, const double vol)
-{
-   double tickVal=SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize=SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   if(tickVal<=0 || tickSize<=0) return 0.0;
-
-   double dist=MathAbs(entry-sl);
-   if(dist<=0) return 0.0;
-
-   // value per price unit:
-   double vpu = tickVal / tickSize;
-   double risk = dist * vpu * vol;
-   return risk;
-}
-
-bool CalcRiskLotsEx(const string sym, const double entry, const double sl, const double riskMult, double &lotsOut, double &riskMoneyOut)
-{
-   lotsOut=0; riskMoneyOut=0;
-
-   // Fixed-lot mode
-   if(!InpUseRiskPercent || InpRiskPercent<=0.0)
-   {
-      lotsOut=NormalizeVolume(sym, InpLots);
-      riskMoneyOut=PositionRiskMoney(sym, entry, sl, lotsOut);
-      return (lotsOut>0.0);
-   }
-
-   // Risk-% mode (use EQUITY to avoid sizing too aggressively during floating drawdown)
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-
-   double riskBudget=eq * (InpRiskPercent/100.0);
-   if(riskMult<=0.0) return false;
-   riskBudget *= riskMult;
-
-   double riskPerLot=PositionRiskMoney(sym, entry, sl, 1.0);
-   if(riskPerLot<=0.0) return false;
-
-   double rawLots = riskBudget / riskPerLot;
-
-   // IMPORTANT: use floor-normalization so we don't round up to min lot and exceed the risk budget.
-   double lots = NormalizeVolumeFloor(sym, rawLots);
-   if(lots<=0.0) return false;
-
-   double actual=PositionRiskMoney(sym, entry, sl, lots);
-   lotsOut=lots;
-   riskMoneyOut=actual;
-   return true;
-}
-
-bool CalcRiskLots(const string sym, const double entry, const double sl, double &lotsOut, double &riskMoneyOut)
-{
-   // wrapper for legacy calls: equity-regime only
-   return CalcRiskLotsEx(sym, entry, sl, g_riskMult, lotsOut, riskMoneyOut);
-}
-
-enum RiskCapBucket
-{
-   RISK_CAP_USD=0,
-   RISK_CAP_EUR=1,
-   RISK_CAP_GBP=2,
-   RISK_CAP_OTHER=3
-};
-const double RISK_CAP_EPS = 1e-9;
-// Fallback counts both FX legs into OTHER when parsing fails (base + quote => 2x).
-const double RISK_CAP_PARSE_FALLBACK_MULT = 2.0;
-
-bool RiskCap_IsEnabled()
-{
-   return (InpRisk_Cap_Mode==1);
-}
-
-double RiskCap_OneRMoney()
-{
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return 0.0;
-   if(!InpUseRiskPercent || InpRiskPercent<=0.0) return 0.0;
-   return eq * (InpRiskPercent/100.0);
-}
-
-double RiskCap_MoneyToR(const double riskMoney)
-{
-   if(riskMoney<=0.0) return 0.0;
-   double oneR=RiskCap_OneRMoney();
-   if(oneR<=0.0) return 0.0;
-   return (riskMoney/oneR);
-}
-
-string RiskCap_BucketName(const int idx)
-{
-   if(idx==RISK_CAP_USD) return "USD";
-   if(idx==RISK_CAP_EUR) return "EUR";
-   if(idx==RISK_CAP_GBP) return "GBP";
-   return "OTHER";
-}
-
-double RiskCap_BucketCapR(const int idx)
-{
-   if(idx==RISK_CAP_USD) return MathMax(0.0, InpRisk_Cap_USD_R);
-   if(idx==RISK_CAP_EUR) return MathMax(0.0, InpRisk_Cap_EUR_R);
-   if(idx==RISK_CAP_GBP) return MathMax(0.0, InpRisk_Cap_GBP_R);
-   return MathMax(0.0, InpRisk_Cap_Other_R);
-}
-
-int RiskCap_BucketIndexByCurrency(const string ccy)
-{
-   if(ccy=="USD") return RISK_CAP_USD;
-   if(ccy=="EUR") return RISK_CAP_EUR;
-   if(ccy=="GBP") return RISK_CAP_GBP;
-   return RISK_CAP_OTHER;
-}
-
-bool RiskCap_ParseBaseQuote(const string sym, string &baseOut, string &quoteOut)
-{
-   baseOut="OTHER";
-   quoteOut="OTHER";
-   string letters="";
-   int L=StringLen(sym);
-   // Broker suffix/prefix safe: extract first 6 alphabetic chars, then split 3/3 (e.g. EURUSDm -> EUR/USD).
-   for(int i=0; i<L && StringLen(letters)<6; i++)
-   {
-      ushort c=(ushort)StringGetCharacter(sym, i);
-      bool isAlphabetic = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
-      if(isAlphabetic) letters += StringSubstr(sym, i, 1);
-   }
-   if(StringLen(letters)<6) return false;
-
-   baseOut=StringSubstr(letters, 0, 3);
-   quoteOut=StringSubstr(letters, 3, 3);
-   StringToUpper(baseOut);
-   StringToUpper(quoteOut);
-   return true;
-}
-
-double RiskCap_PositionInitialRBestEffort(const string sym,
-                                          const long posId,
-                                          const double openPx,
-                                          const double slPx,
-                                          const double vol)
-{
-   double riskMoney=0.0;
-
-   int tIdx=PosTrackFind(posId);
-   if(tIdx>=0)
-   {
-      if(g_posTrackRiskMoney[tIdx]>0.0)
-         riskMoney=g_posTrackRiskMoney[tIdx];
-      else if(g_posTrackVolIn[tIdx]>0.0 && g_posTrackSL0[tIdx]>0.0 && g_posTrackOpenSum[tIdx]>0.0)
-      {
-         double avgEntry = g_posTrackOpenSum[tIdx] / g_posTrackVolIn[tIdx];
-         riskMoney = PositionRiskMoney(sym, avgEntry, g_posTrackSL0[tIdx], g_posTrackVolIn[tIdx]);
-      }
-   }
-
-   if(riskMoney<=0.0 && openPx>0.0 && slPx>0.0 && vol>0.0)
-      riskMoney = PositionRiskMoney(sym, openPx, slPx, vol);
-
-   return RiskCap_MoneyToR(riskMoney);
-}
-
-void RiskCap_AddSymbolExposure(const string sym, const double posR, double &buckets[])
-{
-   if(posR<=0.0) return;
-   string base="", quote="";
-   if(!RiskCap_ParseBaseQuote(sym, base, quote))
-   {
-      // parsing failed => fallback bucket
-      buckets[RISK_CAP_OTHER] += (RISK_CAP_PARSE_FALLBACK_MULT*posR);
-      if(InpRisk_Cap_LogDetail || InpDebug)
-      {
-         static datetime lastParseWarn=0;
-         datetime now=TimeCurrent();
-         if(lastParseWarn==0 || (now-lastParseWarn)>60)
-         {
-            PrintFormat("RISK_CAP_PARSE_FALLBACK symbol=%s posR=%.3f", sym, posR);
-            lastParseWarn=now;
-         }
-      }
-      return;
-   }
-
-   int b0=RiskCap_BucketIndexByCurrency(base);
-   int b1=RiskCap_BucketIndexByCurrency(quote);
-   buckets[b0] += posR;
-   buckets[b1] += posR;
-}
-
-void RiskCap_CollectCurrentBuckets(double &buckets[])
-{
-   ArrayResize(buckets, 4);
-   ArrayInitialize(buckets, 0.0);
-
-   int total=PositionsTotal();
-   for(int i=0;i<total;i++)
-   {
-      ulong ticket=PositionGetTicket(i);
-      if(ticket==0) continue;
-      if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-
-      string sym=PositionGetString(POSITION_SYMBOL);
-      long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-      double openPx=PositionGetDouble(POSITION_PRICE_OPEN);
-      double slPx=PositionGetDouble(POSITION_SL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-
-      double posR=RiskCap_PositionInitialRBestEffort(sym, posId, openPx, slPx, vol);
-      if(posR<=0.0) continue;
-      RiskCap_AddSymbolExposure(sym, posR, buckets);
-   }
-}
-
-string RiskCap_BucketsKV(const double &vals[])
-{
-   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
-                       vals[RISK_CAP_USD], vals[RISK_CAP_EUR], vals[RISK_CAP_GBP], vals[RISK_CAP_OTHER]);
-}
-
-string RiskCap_CapsKV()
-{
-   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
-                       RiskCap_BucketCapR(RISK_CAP_USD),
-                       RiskCap_BucketCapR(RISK_CAP_EUR),
-                       RiskCap_BucketCapR(RISK_CAP_GBP),
-                       RiskCap_BucketCapR(RISK_CAP_OTHER));
-}
-
-void RiskCap_SendBlockedTelegram(const string msg)
-{
-   if(!InpEnableTelegram) return;
-   datetime now=TimeCurrent();
-   int cooldownSec=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
-   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cooldownSec)
-   {
-      if(InpRisk_Cap_LogDetail || InpDebug)
-         Print("RISK_CAP_TG_COOLDOWN active; blocked alert suppressed.");
-      return;
-   }
-   g_riskCapLastTG=now;
-   TelegramSendMessage(msg);
-}
-
-bool RiskCap_AllowsEntry(const int symIdx,
-                         const string sym,
-                         const string dir,
-                         const string setup,
-                         const double intendedR,
-                         const double riskMoney)
-{
-   if(!RiskCap_IsEnabled()) return true;
-   if(intendedR<=0.0) return true;
-
-   double current[];
-   RiskCap_CollectCurrentBuckets(current);
-
-   double projected[];
-   ArrayResize(projected, 4);
-   for(int i=0;i<4;i++) projected[i]=current[i];
-   RiskCap_AddSymbolExposure(sym, intendedR, projected);
-
-   bool blocked=false;
-   string breach="";
-   for(int i=0;i<4;i++)
-   {
-      double cap=RiskCap_BucketCapR(i);
-      if(projected[i] > cap + RISK_CAP_EPS)
-      {
-         blocked=true;
-         if(breach!="") breach += ",";
-         breach += RiskCap_BucketName(i);
-      }
-   }
-   if(!blocked) return true;
-
-   string kv = StringFormat("symbol=%s|dir=%s|setup=%s|intended_R_total=%.3f|breach=%s|current={%s}|projected={%s}|caps={%s}",
-                            sym, dir, setup, intendedR, breach,
-                            RiskCap_BucketsKV(current),
-                            RiskCap_BucketsKV(projected),
-                            RiskCap_CapsKV());
-
-   Audit_Log("BLOCKED_CURRENCY_RISK", kv, false);
-
-   if(InpEnableMLExport)
-   {
-      ML_WriteRowV2("entry_block", NowStr(), sym, setup, dir,
-                    0, 0, 0, 0, riskMoney,
-                    0, 0, 0, 0, 0,
-                    "CURRENCY_RISK_CAP", breach,
-                    0, "ENTRY_BLOCKED", 0, 0, 0,
-                    0, "BLOCKED_CURRENCY_RISK "+kv, g_mlSchema);
-   }
-
-   if(InpRisk_Cap_LogDetail || InpDebug)
-      Print("BLOCKED_CURRENCY_RISK ", kv);
-
-   RiskCap_SendBlockedTelegram(StringFormat("BLOCKED_CURRENCY_RISK %s %s intendedR=%.3f breach=%s current={%s} projected={%s} caps={%s}",
-                                            sym, dir, intendedR, breach,
-                                            RiskCap_BucketsKV(current),
-                                            RiskCap_BucketsKV(projected),
-                                            RiskCap_CapsKV()));
-
-   IncReject(symIdx, REJ_RISK_GUARDS);
-   return false;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // v9: Correlation guard / HTF bias / Volatility regime
@@ -2552,156 +2199,7 @@ bool VolRegime_Get(const int symIdx, const string sym, double &multOut, bool &bl
    return true;
 }
 
-double CurrentPortfolioRiskPct()
-{
-   double totalRiskMoney=0.0;
-
-   int total=PositionsTotal();
-   for(int i=0;i<total;i++)
-   {
-      ulong ticket=PositionGetTicket(i);
-      if(ticket==0) continue;
-      if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-
-      string sym=PositionGetString(POSITION_SYMBOL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-      long type=PositionGetInteger(POSITION_TYPE);
-      double open=PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl=PositionGetDouble(POSITION_SL);
-
-      if(vol<=0.0 || open<=0.0) continue;
-
-      // If SL is missing, estimate risk so portfolio guard does not under-report risk.
-      if(sl<=0.0)
-      {
-         double pip=PipSize(sym);
-         bool   estOk=false;
-
-         if(pip>0.0)
-         {
-            // Prefer ATR-based estimate (EntryTF ATR)
-            int idx=SymIndexByNameLoose(sym);
-            if(idx>=0 && g_atrHandle[idx]!=INVALID_HANDLE)
-            {
-               double atrBuf[1];
-               if(CopyLast(g_atrHandle[idx], 0, 0, 1, atrBuf))
-               {
-                  double atrPips = atrBuf[0]/pip;
-                  if(atrPips>0.0)
-                  {
-                     double dist = atrPips * Sym_SL_ATR_Mult(sym) * pip;
-                     double slEst = (type==POSITION_TYPE_BUY ? open - dist : open + dist);
-                     double rm = PositionRiskMoney(sym, open, slEst, vol);
-                     if(rm>0.0) { totalRiskMoney += rm; estOk=true; }
-                  }
-               }
-            }
-
-            // Fallback: use minimum ATR pips as proxy when ATR buffer isn't available yet
-            if(!estOk)
-            {
-               double fbAtrPips = Sym_MinATR_Pips(sym);
-               if(fbAtrPips<=0.0) fbAtrPips = InpMinATR_Pips;
-               if(fbAtrPips<=0.0) fbAtrPips = 10.0;
-
-               double dist = fbAtrPips * Sym_SL_ATR_Mult(sym) * pip;
-               if(dist>0.0)
-               {
-                  double slEst = (type==POSITION_TYPE_BUY ? open - dist : open + dist);
-                  double rm = PositionRiskMoney(sym, open, slEst, vol);
-                  if(rm>0.0)
-                  {
-                     totalRiskMoney += rm;
-                     estOk=true;
-
-                     // Throttled audit/ML notice (optional) so you can see when portfolio risk uses a fallback estimate.
-                     datetime nowFB=TimeCurrent();
-                     if(InpEnableAuditLog)
-                     {
-                        static datetime lastAudit=0;
-                        if(lastAudit==0 || (nowFB-lastAudit)>300)
-                        {
-                           long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-                           Audit_Log("PORT_RISK_FALLBACK",
-                                     StringFormat("sym=%s|ticket=%I64d|posId=%I64d|vol=%.2f|distPips=%.2f|open=%s|note=noSL_noATR",
-                                                  sym,(long)ticket,posId,vol,dist/pip,FmtPriceSym(sym,open)),
-                                     false);
-                           lastAudit=nowFB;
-                        }
-                     }
-                     if(InpEnableMLExport)
-                     {
-                        static datetime lastML=0;
-                        if(lastML==0 || (nowFB-lastML)>300)
-                        {
-                           long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-                           string dir=(type==POSITION_TYPE_BUY?"BUY":"SELL");
-                           ML_WriteRowV2("risk_fb", NowStr(), sym, "", dir,
-                                        open, 0,0, vol, rm,
-                                        fbAtrPips, 0,0, 0,0,
-                                        "", "",
-                                        posId, "RISK_FALLBACK", 0,0,0,
-                                        0, "noSL_noATR", g_mlSchema,
-                                        StringFormat("distPips=%.2f|ticket=%I64d", dist/pip, (long)ticket));
-                           lastML=nowFB;
-                        }
-                     }
-
-                     // Throttled warning (debug only)
-                     if(InpDebug)
-                     {
-                        static datetime lastWarn=0;
-                        datetime now=TimeCurrent();
-                        if(lastWarn==0 || (now-lastWarn)>60)
-                        {
-                           PrintFormat("PORT_RISK_FALLBACK: %s position has NO SL; ATR not ready -> using fallbackDist=%.1f pips (minATR*SLmult).",
-                                       sym, fbAtrPips*Sym_SL_ATR_Mult(sym));
-                           lastWarn=now;
-                        }
-                     }
-                  }
-               }
-            }
-         }
-
-         if(!estOk)
-         {
-            // Ultimate fail-closed: count full allowed portfolio risk so new entries are blocked until stops exist.
-            double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-            if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-            if(eq>0.0)
-               totalRiskMoney += eq * (InpMaxPortfolioRiskPct/100.0);
-         }
-         continue;
-      }
-
-      double rm=PositionRiskMoney(sym, open, sl, vol);
-      if(rm>0.0) totalRiskMoney += rm;
-   }
-
-   // Use equity (safer during floating DD); fall back to balance if equity not available.
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return 0.0;
-
-   return 100.0 * totalRiskMoney / eq;
-}
-
-
-
-bool PortfolioRiskAllows(const double addRiskMoney)
-{
-   if(!InpUsePortfolioRiskGuard) return true;
-   // Use equity for consistency with CurrentPortfolioRiskPct() and risk sizing.
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return false;
-
-   double curPct=CurrentPortfolioRiskPct();
-   double addPct=(addRiskMoney/eq)*100.0;
-   return (curPct + addPct) <= InpMaxPortfolioRiskPct;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // Indicators per symbol
@@ -2731,72 +2229,7 @@ bool CopyRatesLast(const string sym, const ENUM_TIMEFRAMES tf, const int start, 
 }
 
 // -----------------------------------------
-// Sanity mode (startup indicator readiness guard)
-// -----------------------------------------
-void Sanity_Reset()
-{
-   g_startTime = TimeCurrent();
-   g_sanityNextCheck = 0;
-   for(int i=0;i<64;i++) g_indReady[i]=false;
-}
-
-void Sanity_UpdateReadiness()
-{
-   if(!InpSanityMode_Enable) return;
-   datetime now=TimeCurrent();
-   if(g_sanityNextCheck!=0 && now < g_sanityNextCheck) return;
-   g_sanityNextCheck = now + 1; // probe at most once per second (cheap + avoids tick spam)
-
-   // if already all ready, we can stop probing
-   int ready=0;
-   for(int i=0;i<g_symCount;i++) if(g_indReady[i]) ready++;
-   if(g_symCount>0 && ready>=g_symCount) return;
-
-   for(int i=0;i<g_symCount;i++)
-   {
-      if(g_indReady[i]) continue;
-
-      // Trailing/spike logic needs ATR only. If ADX is missing or never becomes ready,
-      // we still want management features to work.
-      double b1[1];
-      bool okAtr = (g_atrHandle[i]!=INVALID_HANDLE && CopyLast(g_atrHandle[i],0,0,1,b1));
-      if(okAtr) g_indReady[i]=true;
-   }
-}
-
-int Sanity_ReadyCount()
-{
-   int c=0;
-   for(int i=0;i<g_symCount;i++) if(g_indReady[i]) c++;
-   return c;
-}
-
-int Sanity_RemainingSeconds()
-{
-   if(!InpSanityMode_Enable) return 0;
-   if(InpSanityMode_Seconds<=0) return 0;
-   datetime now=TimeCurrent();
-   if(g_startTime==0) g_startTime=now;
-   int rem = (int)(InpSanityMode_Seconds - (now - g_startTime));
-   if(rem<0) rem=0;
-   return rem;
-}
-
-bool Sanity_BlockTrailingSpike(const int symIdx)
-{
-   if(!InpSanityMode_Enable) return false;
-   datetime now=TimeCurrent();
-   if(g_startTime==0) g_startTime=now;
-
-   // time warm-up
-   if(InpSanityMode_Seconds>0 && (now - g_startTime) < InpSanityMode_Seconds)
-      return true;
-
-   // indicator warm-up (ATR + ADX buffers must be ready)
-   if(symIdx<0 || symIdx>=g_symCount) return true;
-   if(!g_indReady[symIdx]) return true;
-   return false;
-}
+// extracted to MSPB_EA_ExecQual.mqh
 
 
 bool IsNewBar(const int symIdx, const string sym, const ENUM_TIMEFRAMES tf)
@@ -2939,33 +2372,7 @@ double ClampSLToStopsLevel(const string sym, const long type, const double price
 double g_eqPeak=0.0;
 double g_eqTrough=0.0;
 
-string EqRegToStr(const EqRegime r)
-{
-   if(r==EQ_NEUTRAL) return "NEUTRAL";
-   if(r==EQ_CAUTION) return "CAUTION";
-   if(r==EQ_DEFENSIVE) return "DEFENSIVE";
-   return "?";
-}
-
-void EqRegime_Update()
-{
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(g_eqPeak==0.0) { g_eqPeak=eq; g_eqTrough=eq; }
-   if(eq>g_eqPeak) g_eqPeak=eq;
-   if(eq<g_eqTrough) g_eqTrough=eq;
-
-   // compute drawdown in R-like scale: ddPct
-   double ddPct=0.0;
-   if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
-
-   if(ddPct<2.0) g_eqRegime=EQ_NEUTRAL;
-   else if(ddPct<5.0) g_eqRegime=EQ_CAUTION;
-   else g_eqRegime=EQ_DEFENSIVE;
-
-   if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
-   if(g_eqRegime==EQ_CAUTION) g_riskMult=0.7;
-   if(g_eqRegime==EQ_DEFENSIVE) g_riskMult=0.4;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // Deal queue (track exits precisely)
@@ -4774,101 +4181,56 @@ bool DetectNewsSpike(const string sym, const int symIdx, const double atrPips)
    return false;
 }
 
-#include "MSPB_EA_OrderExec.mqh"
 
-#include "MSPB_EA_Dashboard.mqh"
+// --- Volatility percentile filter (v18): block entries when volatility is too low
+bool VolPctFilter_Block(const int symIdx, const string sym)
+{
+   if(!InpVolPctFilter_Enable) return false;
+   if(symIdx < 0 || symIdx >= g_symCount) return false;
+   if(g_atrHandle[symIdx] == INVALID_HANDLE) return false;
+
+   int shortN  = MathMax(5,  InpVolPctFilter_Period);
+   int baseN   = MathMax(20, InpVolPctFilter_Base);
+
+   double shortBuf[], baseBuf[];
+   ArraySetAsSeries(shortBuf, true);
+   ArraySetAsSeries(baseBuf,  true);
+
+   if(CopyBuffer(g_atrHandle[symIdx], 0, 0, shortN,  shortBuf) < shortN)  return false;
+   if(CopyBuffer(g_atrHandle[symIdx], 0, 0, baseN,   baseBuf)  < baseN)   return false;
+
+   double curATR = shortBuf[0];
+   if(curATR <= 0.0) return false;
+
+   int below = 0, total = 0;
+   for(int i = 1; i < baseN; i++)
+   {
+      if(baseBuf[i] <= 0.0) continue;
+      total++;
+      if(baseBuf[i] >= curATR) below++;   // curATR is <= baseBuf[i], so curATR ranks lower
+   }
+   if(total < 10) return false;  // not enough data
+   double pct = (double)below / total * 100.0;
+   return (pct >= (100.0 - InpVolPctFilter_Threshold));  // blocked when in bottom X%
+}
+
+// --- Smart order routing: only enter when spread/ATR ratio is acceptable
+bool SmartOrderRoute_IsLiquid(const int symIdx, const string sym, const double atrPips)
+{
+   if(!InpSmartOrderRoute) return true;  // disabled -> always allow
+   if(atrPips <= 0.0) return true;
+   double sp = SpreadPips(sym);
+   double ratio = sp / atrPips;
+   bool liquid = (ratio <= InpSOR_SpreadATRRatio);
+   if(!liquid && InpDebug)
+      PrintFormat("SOR_ILLIQUID %s spread=%.2f atr=%.2f ratio=%.3f (max=%.3f)",
+                  sym, sp, atrPips, ratio, InpSOR_SpreadATRRatio);
+   return liquid;
+}
+
 
 // -----------------------------------------
-// Core: entry logic (Setup1 / Setup2)
-// -----------------------------------------
-bool BreakPrevHighLow(const string sym,const bool isBuy,const bool useBreakPrev)
-{
-   if(!useBreakPrev) return true;
-   // Break previous bar high/low on entryTF using CLOSED candles (avoid intra-bar repaint).
-   // r[0] = current forming bar, r[1] = last closed, r[2] = bar before last closed
-   MqlRates r[3];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-   if(isBuy) return (r[1].close > r[2].high);
-   else      return (r[1].close < r[2].low);
-}
-
-bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double &adxTrend, double &adxEntry, double &atrPips, double &bodyPips)
-{
-   isBuy=false; adxTrend=0; adxEntry=0; atrPips=0; bodyPips=0;
-
-   // rates
-   MqlRates r[3];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-
-   double pip=PipSize(sym);
-   if(pip<=0) return false;
-
-   // Use last CLOSED candle for signal calculations (avoid intra-bar repaint).
-   bodyPips = MathAbs(r[1].close - r[1].open)/pip;
-
-   // ATR (use last closed bar value)
-   double atrBuf[2];
-   if(!CopyLast(g_atrHandle[symIdx],0,0,2,atrBuf)) return false;
-   atrPips = atrBuf[1]/pip;
-
-   // ADX filters are optional (InpUseADXFilter). If disabled, skip handle/buffer reads.
-   if(InpUseADXFilter)
-   {
-      // ADX (trend TF)
-      double adxBufT[2];
-      if(!CopyLast(g_adxHandle[symIdx],0,0,2,adxBufT)) return false;
-      adxTrend = adxBufT[1];
-
-      // ADX (entry TF)
-      double adxBufE[2];
-      if(!CopyLast(g_adxEntryHandle[symIdx],0,0,2,adxBufE)) return false;
-      adxEntry = adxBufE[1];
-   }
-   else
-   {
-      adxTrend = 999.0;
-      adxEntry = 999.0;
-   }
-
-   // Pullback EMA touch check (closed candle + closed EMA)
-   if(InpUsePullbackEMA || Sym_UsePullbackEMA(sym))
-   {
-      if(g_emaHandle[symIdx]==INVALID_HANDLE) return false;
-      double emaBuf[2];
-      if(!CopyLast(g_emaHandle[symIdx],0,0,2,emaBuf)) return false;
-      double ema=emaBuf[1];
-      bool touched = (r[1].low <= ema && r[1].high >= ema);
-      if(!touched) return false;
-   }
-
-   // direction: simple - close above open => buy, else sell
-   isBuy = (r[1].close > r[1].open);
-   return true;
-}
-
-bool EntrySignal_Setup2(const int symIdx, const string sym, bool &isBuy)
-{
-   // Simple fallback: contrarian direction based on last CLOSED candle (avoid intra-bar repaint)
-   MqlRates r[2];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r)) return false;
-   isBuy = (r[1].close < r[1].open); // contrarian
-   return true;
-}
-
-double ComputeSL(const string sym, const bool isBuy, const double entry, const double atrPips)
-{
-   double pip=PipSize(sym);
-   double slDist = atrPips * Sym_SL_ATR_Mult(sym) * pip;
-   if(isBuy) return entry - slDist;
-   else      return entry + slDist;
-}
-
-double ComputeTP(const string sym, const bool isBuy, const double entry, const double sl)
-{
-   double dist=MathAbs(entry-sl);
-   if(isBuy) return entry + dist*Sym_TP_RR(sym);
-   else      return entry - dist*Sym_TP_RR(sym);
-}
+// extracted to MSPB_EA_Entry.mqh
 
 // -----------------------------------------
 // ProcessSymbol
@@ -5005,6 +4367,13 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
+   // v18: volatility percentile filter
+   if(VolPctFilter_Block(idx, sym))
+   {
+      IncReject(idx, REJ_VOL_REGIME);
+      return;
+   }
+
    // v9: higher timeframe bias filter
    if(InpUseHTFBias)
    {
@@ -5029,7 +4398,7 @@ void ProcessSymbol(const int idx, const string sym)
 
    double sl = ComputeSL(sym, isBuy, entry, atrPips);
    sl = ClampSLToStopsLevel(sym, isBuy?POSITION_TYPE_BUY:POSITION_TYPE_SELL, entry, sl);
-   double tp = ComputeTP(sym, isBuy, entry, sl);
+   double tp = ComputeTP_Smart(sym, isBuy, entry, sl);
 
    // risk lots
    double lots, riskMoney;
@@ -5100,6 +4469,12 @@ void ProcessSymbol(const int idx, const string sym)
          return;
 
 
+      if(!SmartOrderRoute_IsLiquid(idx, sym, atrPips))
+      {
+         IncReject(idx, REJ_SPREAD);
+         return;
+      }
+
       // send order
       trade.SetExpertMagicNumber((long)InpMagic);
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
@@ -5109,6 +4484,40 @@ void ProcessSymbol(const int idx, const string sym)
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
       Status_SetTrade("BUY", ret, trade.ResultComment());
+      // --- Partial fill detection (D1) ---
+      if(ret == TRADE_RETCODE_DONE_PARTIAL)
+      {
+         double filledVol = trade.ResultVolume();
+         if(filledVol > 0.0 && filledVol < lots - 1e-9)
+         {
+            double actualRisk = PositionRiskMoney(sym, entry, sl, filledVol);
+            if(InpDebug) PrintFormat("PARTIAL_FILL %s BUY: requested=%.2f filled=%.2f riskAdj=%.2f",
+                                     sym, lots, filledVol, actualRisk);
+            Audit_Log("PARTIAL_FILL",
+                      StringFormat("sym=%s|dir=BUY|requested=%.2f|filled=%.2f|risk_adj=%.2f",
+                                   sym, lots, filledVol, actualRisk),
+                      false);
+         }
+      }
+
+      // --- Slippage tracking (D2) ---
+      if(success && trade.ResultPrice() > 0.0)
+      {
+         double slipPips = (trade.ResultPrice() - entry) / MathMax(PipSize(sym), 1e-9);
+         int sess = GetCurrentSession();
+         string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
+         if(InpDebug) PrintFormat("SLIPPAGE %s BUY: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
+                                  sym, entry, trade.ResultPrice(), slipPips, sessName);
+         if(InpEnableMLExport)
+         {
+            ML_WriteRowV2("slippage", NowStr(), sym, setup, "BUY",
+                         entry, sl, tp, lots, riskMoney,
+                         atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
+                         "", StringFormat("slip_pips=%.3f|sess=%s", slipPips, sessName),
+                         (long)trade.ResultDeal(), "SLIPPAGE", 0,0,tradeRiskMult,
+                         0, StringFormat("slip=%.3f|sess=%s", slipPips, sessName), g_mlSchema);
+         }
+      }
 
 
       if(InpEnableMLExport)
@@ -5217,6 +4626,12 @@ void ProcessSymbol(const int idx, const string sym)
          return;
 
 
+      if(!SmartOrderRoute_IsLiquid(idx, sym, atrPips))
+      {
+         IncReject(idx, REJ_SPREAD);
+         return;
+      }
+
       trade.SetExpertMagicNumber((long)InpMagic);
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
@@ -5225,6 +4640,40 @@ void ProcessSymbol(const int idx, const string sym)
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
       Status_SetTrade("SELL", ret, trade.ResultComment());
+      // --- Partial fill detection (D1) ---
+      if(ret == TRADE_RETCODE_DONE_PARTIAL)
+      {
+         double filledVol = trade.ResultVolume();
+         if(filledVol > 0.0 && filledVol < lots - 1e-9)
+         {
+            double actualRisk = PositionRiskMoney(sym, entry, sl, filledVol);
+            if(InpDebug) PrintFormat("PARTIAL_FILL %s SELL: requested=%.2f filled=%.2f riskAdj=%.2f",
+                                     sym, lots, filledVol, actualRisk);
+            Audit_Log("PARTIAL_FILL",
+                      StringFormat("sym=%s|dir=SELL|requested=%.2f|filled=%.2f|risk_adj=%.2f",
+                                   sym, lots, filledVol, actualRisk),
+                      false);
+         }
+      }
+
+      // --- Slippage tracking (D2) ---
+      if(success && trade.ResultPrice() > 0.0)
+      {
+         double slipPips = (entry - trade.ResultPrice()) / MathMax(PipSize(sym), 1e-9);
+         int sess = GetCurrentSession();
+         string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
+         if(InpDebug) PrintFormat("SLIPPAGE %s SELL: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
+                                  sym, entry, trade.ResultPrice(), slipPips, sessName);
+         if(InpEnableMLExport)
+         {
+            ML_WriteRowV2("slippage", NowStr(), sym, setup, "SELL",
+                         entry, sl, tp, lots, riskMoney,
+                         atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
+                         "", StringFormat("slip_pips=%.3f|sess=%s", slipPips, sessName),
+                         (long)trade.ResultDeal(), "SLIPPAGE", 0,0,tradeRiskMult,
+                         0, StringFormat("slip=%.3f|sess=%s", slipPips, sessName), g_mlSchema);
+         }
+      }
 
 
       if(InpEnableMLExport)
