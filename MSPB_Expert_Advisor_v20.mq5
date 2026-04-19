@@ -1,8 +1,24 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.7 hotfix: Setup2 only if Setup1 fails by BreakPrev (TREND-only). ML-export CSV (v2 schema), News-aware trailing (no API) w/ rollover ignore, Equity-curve regime filter (DD in R), correlation-guard w/ per-bar cache, Telegram queue+rate limit, broker stops/freeze safe, exact exit logging via HistoryDeal queue. Trades EURUSD/GBPUSD/CUCUSD/XAUUSD (suffix ok)."
+#property description "MultiSymbol Pullback Scalper v20.0: multi-session, multi-symbol, multi-TF EA with execution-quality gate, equity-regime filter, Telegram integration and walk-forward robustness scoring."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
+#include "MSPB_EA_Telegram.mqh"
+#include "MSPB_EA_OrderExec.mqh"
+#include "MSPB_EA_Dashboard.mqh"
+#include "MSPB_EA_Risk.mqh"
+#include "MSPB_EA_ExecQual.mqh"
+#include "MSPB_EA_Entry.mqh"
+
+// EA version string -- used in startup logs and Telegram messages.
+#define EA_VERSION "20.0"
+
+// __TIME__ compatibility: some older MT5 builds do not expose this predefined macro.
+// This EA does not use __TIME__ directly; the guard prevents "undeclared identifier"
+// errors when upgrading to or from external modules that may reference it.
+#ifndef __TIME__
+   #define __TIME__ ((datetime)0)   // zero sentinel — intentionally unused in runtime logic
+#endif
 
 
 // --- Compatibility helpers ----------------------------------------------------
@@ -446,6 +462,8 @@ input int      InpMaxPositionsTotal       = 6;
 input bool     InpUseTimerForEntries      = true;   // if true, entries evaluated in OnTimer; else in OnTick
 input bool     InpManageOnTick            = true;   // if true, position mgmt runs on tick; else in timer
 input int      InpTimerSec                = 1;
+input bool     InpSmartOrderRoute        = false;  // only use market orders when spread < ATR*InpSOR_SpreadATRRatio
+input double   InpSOR_SpreadATRRatio     = 0.15;   // max spread/ATR ratio for market order execution
 
 // --- Risk
 input bool     InpUseRiskPercent          = true;
@@ -522,6 +540,12 @@ input double   InpVolHighPct              = 80.0;  // >= => high vol regime
 input bool     InpVolLowBlockEntries      = true;  // block entries in low regime
 input double   InpVolHighRiskMult         = 0.50;  // risk multiplier in high regime
 
+// --- Volatility percentile filter (v18)
+input bool     InpVolPctFilter_Enable    = false;  // block entries when ATR(20) below Nth pct of ATR(100)
+input int      InpVolPctFilter_Period    = 20;     // short ATR period for percentile filter
+input int      InpVolPctFilter_Base      = 100;    // base ATR period (denominator)
+input double   InpVolPctFilter_Threshold = 30.0;  // block if below this percentile (0-100)
+
 // --- Setup2
 input bool     InpUseSetup2               = true;
 input bool     InpUseBreakPrevHighLow     = true;
@@ -532,6 +556,55 @@ input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
+input double   InpLondon_SL_ATR_Mult     = 1.0;  // London session SL ATR multiplier (1.0 = same as base)
+input double   InpAsia_SL_ATR_Mult       = 0.85; // Asia session SL ATR multiplier (tighter range)
+
+// --- Swing S/R TP (v18)
+input bool     InpUseSwingSR_TP          = false;  // use nearest swing high/low as TP target
+input int      InpSwingSR_Lookback       = 30;     // bars to look back for swing points on confirmTF
+input double   InpSwingSR_MinRR          = 1.2;    // minimum RR required to use the S/R TP
+input double   InpSwingSR_MinDistPips    = 3.0;    // minimum distance (pips) between entry and S/R TP level
+input int      InpSwingSR_SwingBars      = 2;      // N bars each side required for a swing point (1=3-bar, 2=5-bar, etc.)
+
+// --- Body-to-range ratio filter — rejects doji/pinbar entries (P2-6)
+input bool     InpUseBodyRatioFilter     = false;   // block if body/range < InpMinBodyRatio
+input double   InpMinBodyRatio           = 0.30;    // min candle body fraction (0.0–1.0)
+
+// --- Dynamic spread/ATR filter applied to all setups (P2-5)
+input bool     InpUseDynamicSpreadFilter = false;   // block if spread/ATR > threshold (complements static InpMaxSpreadPips_FX)
+input double   InpDynSpread_ATRRatio     = 0.15;    // max allowed spread/ATR ratio (e.g. 0.15 = 15 % of ATR)
+
+// --- RSI divergence filter (P2-4)
+input bool     InpUseDivergenceFilter    = false;   // require RSI divergence confirmation
+input int      InpRSI_Period             = 14;      // RSI period for divergence check
+
+// --- Ultra-HTF bias: third TF alignment (P2-7)
+input bool     InpUseUltraHTFBias       = false;
+input ENUM_TIMEFRAMES InpUltraBiasTF    = PERIOD_H4;
+input int      InpUltraBiasEMAFast      = 50;
+input int      InpUltraBiasEMASlow      = 200;
+
+// --- Weekday filter (P3-8)
+input bool     InpBlockMonday           = false;   // skip entries on Monday open (00:00–InpLondonStartHour)
+input bool     InpBlockFriday           = false;   // skip entries on Friday from hour InpBlockFridayFromHour
+input int      InpBlockFridayFromHour   = 17;      // hour (broker time) from which Friday entries are blocked
+
+// --- Weekly loss limit (P3-9)
+input bool     InpWeeklyLossLimit_Enable = false;
+input double   InpWeeklyLossLimit_Pct    = 5.0;   // block new entries when week equity DD% exceeds this
+
+// --- Post-SL bar-based cooldown (P3-10)
+input bool     InpPostSL_CooldownBars_Enable = false;
+input int      InpPostSL_CooldownBars        = 3;  // bars on entryTF to block after SL hit (stacks with minute cooldown)
+
+// --- Adaptive ATR lookback based on EqRegime (P5-15)
+input bool     InpAdaptiveATR_Enable    = false;
+input int      InpATR_Period_Fast       = 5;       // ATR period in EQ_DEFENSIVE regime (shorter = more reactive)
+input int      InpATR_Period_Mid        = 10;      // ATR period in EQ_CAUTION regime
+
+// --- Slippage-adjusted OnTester score (P5-16)
+input bool     InpTester_SlippagePenalty      = false;
+input double   InpTester_SlippagePenalty_Mult = 0.1; // score deducted = mult * avg_slip_pips
 
 // --- Spread
 input double   InpMaxSpreadPips_FX        = 25.0;
@@ -644,6 +717,11 @@ input bool     InpSLModRetryTransient     = true;  // retry SL modify on transie
 input int      InpSLModMaxRetries         = 1;
 input int      InpSLModRetrySleepMS       = 100;   // NEW: delay between retries (ms), 0 => none
 
+// --- Order (close/entry) retry on transient broker errors
+input bool     InpOrderRetryTransient     = true;  // retry close/entry OrderSend on transient retcodes (requote, timeout, etc.)
+input int      InpOrderRetryMaxRetries    = 2;     // max extra attempts (total = 1 + this; 2 => up to 3 sends)
+input int      InpOrderRetrySleepMS       = 500;   // delay between retry attempts (ms)
+
 // --- Fail safe
 input bool     InpFailSafeStopEntriesOnMLFail = true;
 input bool     InpFailSafeStopEntriesOnAuditFail = false;
@@ -669,6 +747,63 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
+
+// ============================================================
+// v20.0 — Rendement improvements
+// ============================================================
+
+// --- A1: ML entry-gate (XGBoost threshold from export_model_thresholds.py)
+input bool     InpUseMLEntryGate         = false;  // block entries when ML score < InpML_MinScore
+input string   InpMLGateFile             = "ml_entry_threshold.json"; // output of export_model_thresholds.py
+input double   InpML_MinScore            = 0.55;   // minimum score to allow entry (0-1)
+input bool     InpMLGate_UseCommonFolder = false;
+
+// --- A2: Three-level partial TP ladder (33/33/trailing rest)
+input bool     InpTP_Ladder_Enable       = false;  // enable 3-level TP ladder
+input double   InpTP_R1_ClosePct         = 33.0;   // % of position to close at R1 TP (R1 = initRisk * InpTP_R1_R)
+input double   InpTP_R1_R                = 1.0;    // R multiple to trigger first partial close
+input double   InpTP_R2_ClosePct         = 33.0;   // % of position to close at R2
+input double   InpTP_R2_R                = 2.0;    // R multiple to trigger second partial close
+input double   InpTP_R3_Trail_Mult       = 1.5;    // ATR trailing mult for remaining position after R2
+
+// --- A3: Chandelier Exit as alternative trailing stop
+input bool     InpUseChandelierExit      = false;  // use Chandelier Exit instead of fixed ATR trail
+input int      InpChandelier_Period      = 22;     // highest-high / lowest-low lookback bars
+input double   InpChandelier_Mult        = 3.0;    // ATR multiplier for chandelier distance
+
+// --- A4: Re-entry / pyramiding after partial TP hit
+input bool     InpUsePyramiding          = false;  // add a pyramid lot after first partial TP + BE
+input int      InpPyramid_MaxAdds        = 1;      // maximum pyramid adds per position chain
+input double   InpPyramid_RiskPct        = 0.5;    // % risk for each pyramid add (< normal risk)
+
+// --- B6: Per-symbol auto-disable on negative expectancy
+input bool     InpAutoDisable_Enable     = false;  // disable symbol for the week if expectancy < 0
+input int      InpAutoDisable_Lookback   = 30;     // number of recent trades to measure expectancy
+
+// --- B7: Kelly-fraction risk scaling
+input bool     InpUseKellyScaling        = false;  // scale lot size by half-Kelly fraction
+input int      InpKelly_Lookback         = 20;     // closed trades per symbol used for Kelly calculation
+input double   InpKelly_Fraction         = 0.5;    // Kelly fraction (0.5 = half-Kelly, safer)
+input double   InpKelly_MinMult          = 0.25;   // minimum Kelly multiplier (floor)
+input double   InpKelly_MaxMult          = 2.0;    // maximum Kelly multiplier (cap)
+
+// --- C8: Limit-order re-entry after spread block
+input bool     InpUseLimitOnSpreadBlock  = false;  // place pending limit order when spread blocks entry
+input int      InpLimitOrderTTL_Min      = 5;      // TTL in minutes before limit order is cancelled
+
+// --- C9: Entry micro-delay after bar open (reduces slippage)
+input int      InpEntryDelay_Ms          = 0;      // delay in ms before placing order (0 = disabled); e.g. 1500
+
+// --- D10: Weekly symbol ranking via Sharpe (tools/rank_symbols.py)
+input bool     InpUseWeeklySymbolRank    = false;  // enable/disable symbols based on weekly Sharpe ranking
+input string   InpSymbolRankFile         = "ml_symbol_rank.csv"; // output of rank_symbols.py
+input int      InpSymbolRank_TopN        = 3;      // number of top-ranked symbols to enable
+input bool     InpSymbolRank_UseCommonFolder = false;
+
+// --- D11: Cross-symbol spread-aware correlation filter
+// Extends InpUseCorrelationGuard: when two correlated symbols both have signals,
+// allow entry only on the symbol with the lower spread (vs blocking both).
+input bool     InpCorrSpreadPrefer       = false;  // true: prefer lower-spread symbol; false: block as before
 
 // -----------------------------------------
 // Globals / enums
@@ -1068,6 +1203,21 @@ struct SymbolState
    // v10 cooldown (entry throttle after exit)
    datetime cooldownUntil;
    int      cooldownReason; // 0 none, 2 SL, 3 TP, 4 MANUAL/OTHER
+   // v20: per-symbol runtime state
+   datetime autoDisabledUntil; // epoch until symbol is auto-disabled (B6)
+   int      pyramidCount;      // active pyramid adds on this symbol (A4)
+   // v20: Kelly & auto-disable rolling stats (last InpKelly_Lookback trades)
+   double   kellyPnL[64];      // circular buffer of per-trade P&L
+   int      kellyPnLHead;      // head pointer into circular buffer
+   int      kellyPnLN;         // number of trades recorded (capped at 64)
+   // v20: TP-ladder state per position chain (tracked by open position posId)
+   long     ladderPosId;       // posId being tracked by the ladder
+   bool     ladderR1Done;      // first partial close done
+   bool     ladderR2Done;      // second partial close done
+   double   ladderInitRisk;    // initial risk in pips for the tracked position
+   double   ladderVolInit;     // initial volume for partial-close calculations
+   // v20: rank-disable flag (refreshed weekly from ml_symbol_rank.csv)
+   bool     rankEnabled;       // true if symbol is in the top-N weekly ranking
 };
 SymbolState g_sym[64];
 
@@ -1088,6 +1238,30 @@ datetime g_mlLastRot=0;
 // --- Audit log state
 int    g_auditHandle=INVALID_HANDLE;
 bool   g_inAuditLog=false;
+
+// --- v20 ML gate state
+double   g_mlGateThreshold    = 0.55;      // loaded from JSON
+double   g_mlGateWeights[6];               // feature weights (parallel to NUMERIC_FEATURES)
+double   g_mlGateMeans[6];                 // feature means
+double   g_mlGateStds[6];                  // feature stds
+bool     g_mlGateLoaded        = false;    // true once JSON loaded
+datetime g_mlGateLastLoad      = 0;        // last load time
+
+// v20 NUMERIC_FEATURES order: atr_pips(0), adx_trend(1), adx_entry(2), spread_pips(3), body_pips(4), r_mult(5)
+const int ML_GATE_NFEAT = 6;
+
+// --- v20 pending limit orders (C8)
+struct PendingLimit
+{
+   ulong    ticket;
+   string   sym;
+   datetime expiresAt;
+};
+PendingLimit g_pendingLimits[32];
+int          g_pendingLimitsN = 0;
+
+// --- v20 weekly symbol rank refresh state (D10)
+datetime g_rankLastRefresh = 0;
 
 // --- Deal queue
 ulong  g_dealQueueTickets[4096];
@@ -1317,386 +1491,6 @@ void Status_SetTrade(const string key, const int code, const string msg)
 {
    if(InpDebug)
       PrintFormat("STATUS %s code=%d msg=%s", key, code, msg);
-}
-
-// -----------------------------------------
-// Telegram (Bot API via WebRequest)
-// -----------------------------------------
-// IMPORTANT (MT5):
-//  Tools -> Options -> Expert Advisors -> "Allow WebRequest for listed URL"
-//  Add this URL (exact): https://api.telegram.org
-//
-// Inputs needed:
-//  InpEnableTelegram=true
-//  InpTGConfigFile=<your cfg filename>
-//  (cfg must contain BOT_TOKEN and CHAT_ID)
-//
-// NOTE: Incoming commands (InpTGEnableIncoming / InpTGSecret) are not implemented in this build.
-
-string TG_UrlEncode(const string s)
-{
-   // URL-encode as application/x-www-form-urlencoded (UTF-8, spaces => '+')
-   uchar data[];
-   StringToCharArray(s, data, 0, WHOLE_ARRAY, CP_UTF8);
-
-   string out = "";
-   for(int i=0;i<ArraySize(data);i++)
-   {
-      int c = (int)data[i];
-      if(c==0) break;
-
-      if((c>='0' && c<='9') ||
-         (c>='A' && c<='Z') ||
-         (c>='a' && c<='z') ||
-         c=='-' || c=='_' || c=='.' || c=='~')
-      {
-         out += StringFormat("%c", c);
-      }
-      else if(c==' ')
-      {
-         out += "+";
-      }
-      else
-      {
-         out += StringFormat("%%%02X", c);
-      }
-   }
-   return out;
-}
-
-// --- Telegram config (secrets from file) ------------------------------
-string   g_tgBotToken="";
-string   g_tgChatId="";
-long     g_tgAllowedUserId=0;      // optional (for future incoming commands)
-string   g_tgSecret="";           // optional (for future incoming commands)
-string   g_tgPrefixOverride="";   // optional override of InpTGMessagePrefix
-
-string   g_tgCfgLastError="";
-datetime g_tgCfgLastLoad=0;
-datetime g_tgCfgNextReload=0;
-bool     g_tgCfgWarned=false;
-
-bool ParseBoolLoose(const string s,const bool def=false)
-{
-   string t=TrimStr(s);
-   StringToLower(t);
-   if(t=="1" || t=="true" || t=="yes" || t=="y" || t=="on")  return true;
-   if(t=="0" || t=="false"|| t=="no"  || t=="n" || t=="off") return false;
-   return def;
-}
-
-string TG_GetPrefix()
-{
-   if(g_tgPrefixOverride!="") return g_tgPrefixOverride;
-   return InpTGMessagePrefix;
-}
-
-bool TG_Config_IsReady()
-{
-   return (g_tgBotToken!="" && g_tgChatId!="");
-}
-
-bool TG_Config_Load()
-{
-   g_tgCfgLastError="";
-   if(TrimStr(InpTGConfigFile)=="")
-   {
-      g_tgCfgLastError="TGCFG_EMPTY_FILENAME";
-      return false;
-   }
-
-   int flags = FILE_READ|FILE_TXT|FILE_ANSI|FILE_SHARE_READ;
-   if(InpTGConfig_UseCommonFolder) flags |= FILE_COMMON;
-
-   ResetLastError();
-   int h=FileOpen(InpTGConfigFile, flags);
-   if(h==INVALID_HANDLE)
-   {
-      g_tgCfgLastError = StringFormat("TGCFG_OPEN_FAIL file='%s' err=%d", InpTGConfigFile, GetLastError());
-      return false;
-   }
-
-   string line;
-   string newToken="";
-   string newChat="";
-   long   newAllowed=0;
-   string newSecret="";
-   string newPrefix="";
-   int    loaded=0; // number of parsed keys (for debug)
-   while(FileReadLineTxt(h, line))
-   {
-      line=TrimStr(line);
-      if(line=="") continue;
-      int c0=StringGetCharacter(line,0);
-      if(c0=='#' || c0==';') continue;
-
-      int sep=StringFind(line,"=");
-      if(sep<0) sep=StringFind(line,":");
-      if(sep<0) continue;
-
-      string key=UpperTrim(StringSubstr(line,0,sep));
-      string val=TrimStr(StringSubstr(line,sep+1));
-
-      // Strip surrounding quotes
-      int L=StringLen(val);
-      if(L>=2)
-      {
-         int f=StringGetCharacter(val,0);
-         int l=StringGetCharacter(val,L-1);
-         if((f=='"' && l=='"') || (f=='\'' && l=='\''))
-            val=StringSubstr(val,1,L-2);
-      }
-
-      if(key=="BOT_TOKEN" || key=="TOKEN" || key=="TGBOT_TOKEN") { newToken=val; loaded++; }
-      else if(key=="CHAT_ID" || key=="CHATID" || key=="TGCHAT_ID") { newChat=val; loaded++; }
-      else if(key=="ALLOWED_USER_ID" || key=="ALLOWEDUSERID" || key=="USER_ID") { newAllowed=(long)StringToInteger(val); loaded++; }
-      else if(key=="SECRET" || key=="TGSECRET") { newSecret=val; loaded++; }
-      else if(key=="PREFIX" || key=="MESSAGE_PREFIX") { newPrefix=val; loaded++; }
-   }
-   FileClose(h);
-
-   if(newToken!="") g_tgBotToken=newToken;
-   if(newChat!="")  g_tgChatId=newChat;
-   if(newAllowed!=0) g_tgAllowedUserId=newAllowed;
-   if(newSecret!="") g_tgSecret=newSecret;
-   if(newPrefix!="") g_tgPrefixOverride=newPrefix;
-
-   if(InpDebug)
-      Print("[TG] Config read: keys=",loaded," file=",InpTGConfigFile);
-
-   if(!TG_Config_IsReady())
-   {
-      g_tgCfgLastError = StringFormat("TGCFG_MISSING_KEYS (need BOT_TOKEN and CHAT_ID) in '%s'", InpTGConfigFile);
-      return false;
-   }
-   return true;
-}
-
-void TG_Config_UpdateIfDue(const bool force=false)
-{
-   if(!InpEnableTelegram) return;
-
-   datetime now=TimeCurrent();
-   int reloadSec=MathMax(5, InpTGConfig_ReloadSec);
-
-   bool due = force || (g_tgCfgLastLoad==0) || (InpTGConfig_HotReload && now>=g_tgCfgNextReload);
-   if(!due) return;
-
-   bool wasReady = TG_Config_IsReady();
-   bool ok = TG_Config_Load();
-
-   g_tgCfgLastLoad = now;
-   g_tgCfgNextReload = now + (InpTGConfig_HotReload ? reloadSec : 1000000000);
-
-   if(!ok)
-   {
-      if(!g_tgCfgWarned)
-      {
-         Print("[TG] Config not loaded: ", g_tgCfgLastError);
-         g_tgCfgWarned=true;
-      }
-      return;
-   }
-
-   g_tgCfgWarned=false;
-   if(!wasReady && TG_Config_IsReady())
-      Print("[TG] Config loaded OK from '", InpTGConfigFile, "' (token/chat_id hidden)");
-}
-
-// --- Telegram queue (rate-limited) ---------------------------------
-#define TGQ_MAX 128
-string   g_tgQueue[TGQ_MAX];
-int      g_tgQHead=0, g_tgQTail=0;
-datetime g_tgNextSend=0;
-int      g_tgBackoffSec=0;
-
-bool TGQ_IsEmpty(){ return g_tgQHead==g_tgQTail; }
-int  TGQ_Next(const int x){ return (x+1)%TGQ_MAX; }
-
-int TGQ_Size()
-{
-   if(g_tgQTail>=g_tgQHead) return (g_tgQTail-g_tgQHead);
-   return (TGQ_MAX - g_tgQHead + g_tgQTail);
-}
-
-bool TGQ_Push(const string msg)
-{
-   int next = TGQ_Next(g_tgQTail);
-   if(next==g_tgQHead)
-   {
-      // full -> drop oldest
-      g_tgQHead = TGQ_Next(g_tgQHead);
-      static datetime lastWarn=0;
-      datetime now=TimeCurrent();
-      if(lastWarn==0 || (now-lastWarn)>60)
-      {
-         Print("TGQ: queue full -> dropping oldest message(s).");
-         lastWarn=now;
-      }
-   }
-   g_tgQueue[g_tgQTail]=msg;
-   g_tgQTail=next;
-   return true;
-}
-
-bool TGQ_Pop(string &out)
-{
-   if(TGQ_IsEmpty()) return false;
-   out=g_tgQueue[g_tgQHead];
-   g_tgQueue[g_tgQHead]="";
-   g_tgQHead=TGQ_Next(g_tgQHead);
-   return true;
-}
-
-void TGQ_Clear()
-{
-   g_tgQHead=0; g_tgQTail=0;
-}
-
-// Parse "retry after X" seconds from Telegram 429 message
-int TG_ParseRetryAfterSec(const string resp)
-{
-   string s=resp;
-   StringToLower(s);
-   int p=StringFind(s,"retry after");
-   if(p<0) return 0;
-   p += StringLen("retry after");
-   // skip non-digits
-   while(p<StringLen(s) && (StringGetCharacter(s,p)<'0' || StringGetCharacter(s,p)>'9')) p++;
-   int start=p;
-   while(p<StringLen(s) && (StringGetCharacter(s,p)>='0' && StringGetCharacter(s,p)<='9')) p++;
-   if(p<=start) return 0;
-   string num=StringSubstr(s,start,p-start);
-   int v=(int)StringToInteger(num);
-   return v;
-}
-
-bool TelegramSendNow(const string msg, int &httpOut, string &respOut)
-{
-   httpOut = 0; respOut="";
-   if(!InpEnableTelegram) return false;
-
-   // Ensure config is loaded at least once (won't reload every call unless due)
-   TG_Config_UpdateIfDue(false);
-   if(!TG_Config_IsReady())
-   {
-      static datetime lastWarn=0;
-      datetime now=TimeCurrent();
-      if(lastWarn==0 || (now-lastWarn)>60)
-      {
-         if(g_tgCfgLastError!="")
-            Print("TG: Not configured. ", g_tgCfgLastError, " (and enable WebRequest to https://api.telegram.org).");
-         else
-            Print("TG: Not configured. Missing BOT_TOKEN/CHAT_ID in '", InpTGConfigFile, "' (and enable WebRequest to https://api.telegram.org).");
-         lastWarn=now;
-      }
-      httpOut = 0;
-      return false;
-   }
-
-   string text = msg;
-   string pfx = TG_GetPrefix();
-   if(pfx!="")
-      text = pfx + ": " + msg;
-
-   // Telegram max message length is ~4096 chars; keep margin
-   if(StringLen(text)>3900)
-      text = StringSubstr(text,0,3900) + "...";
-
-   string url = "https://api.telegram.org/bot" + g_tgBotToken + "/sendMessage";
-
-   string body = "chat_id=" + TG_UrlEncode(g_tgChatId)
-               + "&text="   + TG_UrlEncode(text);
-
-   if(InpTGDisableWebPreview)
-      body += "&disable_web_page_preview=true";
-
-   uchar post[];
-   StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-
-   uchar result[];
-   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
-   string result_headers = "";
-
-   ResetLastError();
-   int http = WebRequest("POST", url, headers, InpTGTimeoutMS, post, result, result_headers);
-   httpOut = http;
-
-   if(http == -1)
-   {
-      int err = GetLastError();
-      PrintFormat("TG: WebRequest failed (err=%d). MT5 must allow WebRequest to https://api.telegram.org. Also check internet/firewall.", err);
-      return false;
-   }
-
-   string resp = CharArrayToString(result, 0, -1, CP_UTF8);
-   respOut = resp;
-
-   if(http != 200)
-   {
-      PrintFormat("TG: HTTP %d. Resp=%s", http, Shorten(resp, 160));
-      return false;
-   }
-
-   return true;
-}
-
-bool TelegramSendMessage(const string msg)
-{
-   if(!InpEnableTelegram) return false;
-
-   // Queue mode avoids blocking the trading thread and reduces 429 risk
-   if(!InpTGUseQueue)
-   {
-      int http; string resp;
-      return TelegramSendNow(msg, http, resp);
-   }
-
-   return TGQ_Push(msg);
-}
-
-void TelegramQueue_Process()
-{
-   if(!InpEnableTelegram || !InpTGUseQueue) return;
-
-   // Ensure config is loaded; if missing, keep the queue (user can fix cfg without losing messages)
-   TG_Config_UpdateIfDue(false);
-   if(!TG_Config_IsReady())
-      return;
-
-   datetime now=TimeCurrent();
-   if(g_tgNextSend>0 && now < g_tgNextSend) return;
-
-   string msg;
-   if(!TGQ_Pop(msg)) return;
-
-   int http; string resp;
-   bool ok = TelegramSendNow(msg, http, resp);
-
-   int rateSec = (int)MathCeil((double)InpTGRateLimitMs/1000.0);
-   if(rateSec < 1) rateSec = 1;
-
-   if(ok)
-   {
-      g_tgBackoffSec=0;
-      g_tgNextSend = now + rateSec;
-      return;
-   }
-
-   // Requeue for retry (best-effort)
-   TGQ_Push(msg);
-
-   int retry=0;
-   if(http==429)
-      retry = TG_ParseRetryAfterSec(resp);
-
-   if(retry<=0)
-   {
-      int base = (g_tgBackoffSec>0 ? g_tgBackoffSec*2 : 5);
-      retry = MathMin(InpTGBackoffMaxSec, MathMax(2, base));
-   }
-   g_tgBackoffSec = retry;
-   g_tgNextSend = now + retry;
 }
 
 
@@ -2067,6 +1861,12 @@ void Cooldown_Apply(const string sym,
                     const double posProfit,
                     const double posRiskMoney)
 {
+   int i = SymIndexByNameLoose(sym);
+
+   // P3-10: bar-based cooldown on SL hit (unconditional — not subject to LossOnly filter)
+   if(closeReason == DEAL_REASON_SL && i >= 0 && i < g_symCount)
+      PostSL_CooldownBars_Trigger(i);
+
    if(!InpUseSymbolCooldown) return;
 
    // v12: apply cooldown only when net position P/L < 0 (optional)
@@ -2081,7 +1881,6 @@ void Cooldown_Apply(const string sym,
       }
    }
 
-   int i = SymIndexByNameLoose(sym);
    if(i<0 || i>=g_symCount) return;
 
    int mins=0;
@@ -2105,380 +1904,174 @@ void Cooldown_Apply(const string sym,
 }
 
 
-double SpreadPips(const string sym)
+// -----------------------------------------
+// Weekday filter (P3-8)
+// -----------------------------------------
+bool WeekdayAllows()
 {
-   MqlTick tk;
-   if(!SymbolInfoTick(sym, tk)) return 0.0;
-   double pip=PipSize(sym);
-   if(pip<=0.0) return 0.0;
-
-   double sp = (tk.ask - tk.bid)/pip;
-   double mult = (InpSpreadStressMult<=0.0 ? 1.0 : InpSpreadStressMult);
-   return sp * mult;
-}
-
-double NormalizeVolume(const string sym, double vol)
-{
-   double minv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double maxv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
-   double step=SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-   if(step<=0) step=0.01;
-
-   if(vol<minv) vol=minv;
-   if(vol>maxv) vol=maxv;
-
-   double steps=MathFloor((vol-minv)/step);
-   double out=minv + steps*step;
-   if(out<minv) out=minv;
-   if(out>maxv) out=maxv;
-
-   // Digits based on volume step (avoids "Invalid volume" on brokers with 0.001 steps or stocks with 1.0 steps).
-   int digits=0;
-   double s=step;
-   while(digits<8 && MathAbs(s - MathRound(s)) > 1e-12)
-   {
-      s*=10.0;
-      digits++;
-   }
-   return NormalizeDouble(out, digits);
-}
-
-// --- floor-normalize volume (never rounds UP to min volume); returns 0 if below min
-double NormalizeVolumeFloor(const string sym, double vol)
-{
-   double minv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double maxv=SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
-   double step=SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-   if(step<=0) step=0.01;
-
-   if(vol < (minv - 1e-12)) return 0.0;
-   if(vol > maxv) vol = maxv;
-
-   double steps=MathFloor((vol-minv)/step + 1e-9);
-   double out=minv + steps*step;
-
-   // float safety: never exceed requested vol
-   if(out > vol + 1e-12) out -= step;
-
-   if(out < (minv - 1e-12)) return 0.0;
-   if(out > maxv) out = maxv;
-
-   // normalize digits based on step precision
-   int digits=0;
-   double s=step;
-   while(digits<8 && MathAbs(s - MathRound(s)) > 1e-12)
-   {
-      s *= 10.0;
-      digits++;
-   }
-   return NormalizeDouble(out, digits);
-}
-
-double PositionRiskMoney(const string sym, const double entry, const double sl, const double vol)
-{
-   double tickVal=SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize=SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   if(tickVal<=0 || tickSize<=0) return 0.0;
-
-   double dist=MathAbs(entry-sl);
-   if(dist<=0) return 0.0;
-
-   // value per price unit:
-   double vpu = tickVal / tickSize;
-   double risk = dist * vpu * vol;
-   return risk;
-}
-
-bool CalcRiskLotsEx(const string sym, const double entry, const double sl, const double riskMult, double &lotsOut, double &riskMoneyOut)
-{
-   lotsOut=0; riskMoneyOut=0;
-
-   // Fixed-lot mode
-   if(!InpUseRiskPercent || InpRiskPercent<=0.0)
-   {
-      lotsOut=NormalizeVolume(sym, InpLots);
-      riskMoneyOut=PositionRiskMoney(sym, entry, sl, lotsOut);
-      return (lotsOut>0.0);
-   }
-
-   // Risk-% mode (use EQUITY to avoid sizing too aggressively during floating drawdown)
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-
-   double riskBudget=eq * (InpRiskPercent/100.0);
-   if(riskMult<=0.0) return false;
-   riskBudget *= riskMult;
-
-   double riskPerLot=PositionRiskMoney(sym, entry, sl, 1.0);
-   if(riskPerLot<=0.0) return false;
-
-   double rawLots = riskBudget / riskPerLot;
-
-   // IMPORTANT: use floor-normalization so we don't round up to min lot and exceed the risk budget.
-   double lots = NormalizeVolumeFloor(sym, rawLots);
-   if(lots<=0.0) return false;
-
-   double actual=PositionRiskMoney(sym, entry, sl, lots);
-   lotsOut=lots;
-   riskMoneyOut=actual;
+   if(!InpBlockMonday && !InpBlockFriday) return true;
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int dow = dt.day_of_week; // 0=Sun,1=Mon,...,5=Fri,6=Sat
+   if(InpBlockMonday && dow == 1 && dt.hour < InpLondonStartHour)
+      return false;
+   if(InpBlockFriday && dow == 5 && dt.hour >= InpBlockFridayFromHour)
+      return false;
    return true;
 }
 
-bool CalcRiskLots(const string sym, const double entry, const double sl, double &lotsOut, double &riskMoneyOut)
+// -----------------------------------------
+// Weekly loss limit (P3-9)
+// -----------------------------------------
+void WeeklyLoss_UpdateIfNewWeek()
 {
-   // wrapper for legacy calls: equity-regime only
-   return CalcRiskLotsEx(sym, entry, sl, g_riskMult, lotsOut, riskMoneyOut);
-}
-
-enum RiskCapBucket
-{
-   RISK_CAP_USD=0,
-   RISK_CAP_EUR=1,
-   RISK_CAP_GBP=2,
-   RISK_CAP_OTHER=3
-};
-const double RISK_CAP_EPS = 1e-9;
-// Fallback counts both FX legs into OTHER when parsing fails (base + quote => 2x).
-const double RISK_CAP_PARSE_FALLBACK_MULT = 2.0;
-
-bool RiskCap_IsEnabled()
-{
-   return (InpRisk_Cap_Mode==1);
-}
-
-double RiskCap_OneRMoney()
-{
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return 0.0;
-   if(!InpUseRiskPercent || InpRiskPercent<=0.0) return 0.0;
-   return eq * (InpRiskPercent/100.0);
-}
-
-double RiskCap_MoneyToR(const double riskMoney)
-{
-   if(riskMoney<=0.0) return 0.0;
-   double oneR=RiskCap_OneRMoney();
-   if(oneR<=0.0) return 0.0;
-   return (riskMoney/oneR);
-}
-
-string RiskCap_BucketName(const int idx)
-{
-   if(idx==RISK_CAP_USD) return "USD";
-   if(idx==RISK_CAP_EUR) return "EUR";
-   if(idx==RISK_CAP_GBP) return "GBP";
-   return "OTHER";
-}
-
-double RiskCap_BucketCapR(const int idx)
-{
-   if(idx==RISK_CAP_USD) return MathMax(0.0, InpRisk_Cap_USD_R);
-   if(idx==RISK_CAP_EUR) return MathMax(0.0, InpRisk_Cap_EUR_R);
-   if(idx==RISK_CAP_GBP) return MathMax(0.0, InpRisk_Cap_GBP_R);
-   return MathMax(0.0, InpRisk_Cap_Other_R);
-}
-
-int RiskCap_BucketIndexByCurrency(const string ccy)
-{
-   if(ccy=="USD") return RISK_CAP_USD;
-   if(ccy=="EUR") return RISK_CAP_EUR;
-   if(ccy=="GBP") return RISK_CAP_GBP;
-   return RISK_CAP_OTHER;
-}
-
-bool RiskCap_ParseBaseQuote(const string sym, string &baseOut, string &quoteOut)
-{
-   baseOut="OTHER";
-   quoteOut="OTHER";
-   string letters="";
-   int L=StringLen(sym);
-   // Broker suffix/prefix safe: extract first 6 alphabetic chars, then split 3/3 (e.g. EURUSDm -> EUR/USD).
-   for(int i=0; i<L && StringLen(letters)<6; i++)
+   if(!InpWeeklyLossLimit_Enable) return;
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int dow = dt.day_of_week;
+   if(dow == 0) dow = 7; // treat Sunday as day 7 so Monday is day 1
+   datetime monStart = TimeCurrent() - ((datetime)(dow - 1)) * 86400
+                     - (datetime)dt.hour * 3600 - (datetime)dt.min * 60 - (datetime)dt.sec;
+   if(monStart != g_weekStart)
    {
-      ushort c=(ushort)StringGetCharacter(sym, i);
-      bool isAlphabetic = ((c>='A' && c<='Z') || (c>='a' && c<='z'));
-      if(isAlphabetic) letters += StringSubstr(sym, i, 1);
+      g_weekStart   = monStart;
+      g_weekEqStart = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(g_weekEqStart <= 0.0) g_weekEqStart = AccountInfoDouble(ACCOUNT_BALANCE);
    }
-   if(StringLen(letters)<6) return false;
+}
 
-   baseOut=StringSubstr(letters, 0, 3);
-   quoteOut=StringSubstr(letters, 3, 3);
-   StringToUpper(baseOut);
-   StringToUpper(quoteOut);
+bool WeeklyLossAllows()
+{
+   if(!InpWeeklyLossLimit_Enable) return true;
+   if(g_weekEqStart <= 0.0) return true;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq <= 0.0) eq = AccountInfoDouble(ACCOUNT_BALANCE);
+   double ddPct = (g_weekEqStart - eq) / g_weekEqStart * 100.0;
+   if(ddPct >= InpWeeklyLossLimit_Pct)
+   {
+      if(InpDebug)
+         PrintFormat("WEEKLY_LOSS_BLOCK: weekDD=%.2f%% >= limit=%.2f%%", ddPct, InpWeeklyLossLimit_Pct);
+      return false;
+   }
    return true;
 }
 
-double RiskCap_PositionInitialRBestEffort(const string sym,
-                                          const long posId,
-                                          const double openPx,
-                                          const double slPx,
-                                          const double vol)
+// -----------------------------------------
+// Deal deduplication helpers (P1-3)
+// -----------------------------------------
+bool DealSeen_Add(const ulong ticket)
 {
-   double riskMoney=0.0;
+   // Returns true if newly added (not yet seen), false if duplicate.
+   int cap = ArraySize(g_processedDeals);
+   int check = MathMin(g_processedDealsN, cap);
+   for(int i = 0; i < check; i++)
+      if(g_processedDeals[i] == ticket) return false;
+   g_processedDeals[g_processedDealsN % cap] = ticket;
+   g_processedDealsN++;
+   return true;
+}
 
-   int tIdx=PosTrackFind(posId);
-   if(tIdx>=0)
+// -----------------------------------------
+// Adaptive ATR period based on EqRegime (P5-15)
+// -----------------------------------------
+int GetCurrentATRPeriod()
+{
+   if(!InpAdaptiveATR_Enable) return MathMax(1, InpATR_Period);
+   if(g_eqRegime == EQ_DEFENSIVE) return MathMax(1, InpATR_Period_Fast);
+   if(g_eqRegime == EQ_CAUTION)   return MathMax(1, InpATR_Period_Mid);
+   return MathMax(1, InpATR_Period);
+}
+
+// -----------------------------------------
+// Indicator handle revalidation (P1-2)
+// Called from OnTimer; catches handles that became INVALID_HANDLE after reconnect.
+// -----------------------------------------
+void Handles_CheckAndReinit()
+{
+   bool needEMA_global = (InpUsePullbackEMA || InpSymbolOverrides_Enable);
+   for(int i = 0; i < g_symCount; i++)
    {
-      if(g_posTrackRiskMoney[tIdx]>0.0)
-         riskMoney=g_posTrackRiskMoney[tIdx];
-      else if(g_posTrackVolIn[tIdx]>0.0 && g_posTrackSL0[tIdx]>0.0 && g_posTrackOpenSum[tIdx]>0.0)
+      string sym = g_syms[i];
+      bool needEMA = (needEMA_global || Sym_UsePullbackEMA(sym));
+      bool reinit  = false;
+
+      if(needEMA && g_emaHandle[i] == INVALID_HANDLE)           reinit = true;
+      if(g_atrHandle[i] == INVALID_HANDLE)                      reinit = true;
+      if(InpUseVolRegime && g_atrVolHandle[i] == INVALID_HANDLE) reinit = true;
+      if(InpUseADXFilter && (g_adxHandle[i] == INVALID_HANDLE ||
+                             g_adxEntryHandle[i] == INVALID_HANDLE)) reinit = true;
+      if(InpUseHTFBias && (g_biasFastHandle[i] == INVALID_HANDLE ||
+                           g_biasSlowHandle[i] == INVALID_HANDLE))  reinit = true;
+      if(InpUseDivergenceFilter && g_rsiHandle[i] == INVALID_HANDLE) reinit = true;
+      if(InpUseUltraHTFBias && (g_ultraBiasFastHandle[i] == INVALID_HANDLE ||
+                                g_ultraBiasSlowHandle[i] == INVALID_HANDLE)) reinit = true;
+
+      if(!reinit) continue;
+      if(InpDebug) PrintFormat("[HANDLE_REINIT] sym=%s — reinitialising invalid handles", sym);
+
+      int atrPer = GetCurrentATRPeriod();
+      if(needEMA && g_emaHandle[i] == INVALID_HANDLE)
+         g_emaHandle[i] = iMA(sym, InpEntryTF, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      if(g_atrHandle[i] == INVALID_HANDLE)
+         g_atrHandle[i] = iATR(sym, InpEntryTF, atrPer);
+      if(InpUseVolRegime && g_atrVolHandle[i] == INVALID_HANDLE)
+         g_atrVolHandle[i] = iATR(sym, InpVolRegimeTF, atrPer);
+      if(InpUseADXFilter)
       {
-         double avgEntry = g_posTrackOpenSum[tIdx] / g_posTrackVolIn[tIdx];
-         riskMoney = PositionRiskMoney(sym, avgEntry, g_posTrackSL0[tIdx], g_posTrackVolIn[tIdx]);
+         if(g_adxHandle[i] == INVALID_HANDLE)
+            g_adxHandle[i] = iADX(sym, InpConfirmTF, InpADX_Period);
+         if(g_adxEntryHandle[i] == INVALID_HANDLE)
+            g_adxEntryHandle[i] = iADX(sym, InpEntryTF, InpADX_Period);
+      }
+      if(InpUseHTFBias)
+      {
+         if(g_biasFastHandle[i] == INVALID_HANDLE)
+            g_biasFastHandle[i] = iMA(sym, InpBiasTF, InpBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_biasSlowHandle[i] == INVALID_HANDLE)
+            g_biasSlowHandle[i] = iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+      }
+      if(InpUseDivergenceFilter && g_rsiHandle[i] == INVALID_HANDLE)
+         g_rsiHandle[i] = iRSI(sym, InpEntryTF, InpRSI_Period, PRICE_CLOSE);
+      if(InpUseUltraHTFBias)
+      {
+         if(g_ultraBiasFastHandle[i] == INVALID_HANDLE)
+            g_ultraBiasFastHandle[i] = iMA(sym, InpUltraBiasTF, InpUltraBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+         if(g_ultraBiasSlowHandle[i] == INVALID_HANDLE)
+            g_ultraBiasSlowHandle[i] = iMA(sym, InpUltraBiasTF, InpUltraBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
       }
    }
-
-   if(riskMoney<=0.0 && openPx>0.0 && slPx>0.0 && vol>0.0)
-      riskMoney = PositionRiskMoney(sym, openPx, slPx, vol);
-
-   return RiskCap_MoneyToR(riskMoney);
 }
 
-void RiskCap_AddSymbolExposure(const string sym, const double posR, double &buckets[])
+// -----------------------------------------
+// Bar-based SL cooldown (P3-10)
+// -----------------------------------------
+void PostSL_CooldownBars_Trigger(const int symIdx)
 {
-   if(posR<=0.0) return;
-   string base="", quote="";
-   if(!RiskCap_ParseBaseQuote(sym, base, quote))
+   if(!InpPostSL_CooldownBars_Enable) return;
+   if(symIdx < 0 || symIdx >= g_symCount) return;
+   // Capture current bar open time
+   datetime curBar[1];
+   if(CopyTime(g_syms[symIdx], InpEntryTF, 0, 1, curBar) == 1)
+      g_slCooldownBarTime[symIdx] = curBar[0];
+   g_slCooldownBarsLeft[symIdx] = MathMax(1, InpPostSL_CooldownBars);
+}
+
+bool PostSL_CooldownBars_IsActive(const int symIdx, const string sym)
+{
+   if(!InpPostSL_CooldownBars_Enable) return false;
+   if(symIdx < 0 || symIdx >= g_symCount) return false;
+   if(g_slCooldownBarsLeft[symIdx] <= 0) return false;
+
+   datetime curBar[1];
+   if(CopyTime(sym, InpEntryTF, 0, 1, curBar) != 1) return true; // can't check -> stay blocked
+   if(curBar[0] != g_slCooldownBarTime[symIdx])
    {
-      // parsing failed => fallback bucket
-      buckets[RISK_CAP_OTHER] += (RISK_CAP_PARSE_FALLBACK_MULT*posR);
-      if(InpRisk_Cap_LogDetail || InpDebug)
-      {
-         static datetime lastParseWarn=0;
-         datetime now=TimeCurrent();
-         if(lastParseWarn==0 || (now-lastParseWarn)>60)
-         {
-            PrintFormat("RISK_CAP_PARSE_FALLBACK symbol=%s posR=%.3f", sym, posR);
-            lastParseWarn=now;
-         }
-      }
-      return;
+      g_slCooldownBarsLeft[symIdx]--;
+      g_slCooldownBarTime[symIdx] = curBar[0];
+      if(g_slCooldownBarsLeft[symIdx] <= 0) return false;
    }
-
-   int b0=RiskCap_BucketIndexByCurrency(base);
-   int b1=RiskCap_BucketIndexByCurrency(quote);
-   buckets[b0] += posR;
-   buckets[b1] += posR;
+   return true;
 }
 
-void RiskCap_CollectCurrentBuckets(double &buckets[])
-{
-   ArrayResize(buckets, 4);
-   ArrayInitialize(buckets, 0.0);
-
-   int total=PositionsTotal();
-   for(int i=0;i<total;i++)
-   {
-      ulong ticket=PositionGetTicket(i);
-      if(ticket==0) continue;
-      if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-
-      string sym=PositionGetString(POSITION_SYMBOL);
-      long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-      double openPx=PositionGetDouble(POSITION_PRICE_OPEN);
-      double slPx=PositionGetDouble(POSITION_SL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-
-      double posR=RiskCap_PositionInitialRBestEffort(sym, posId, openPx, slPx, vol);
-      if(posR<=0.0) continue;
-      RiskCap_AddSymbolExposure(sym, posR, buckets);
-   }
-}
-
-string RiskCap_BucketsKV(const double &vals[])
-{
-   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
-                       vals[RISK_CAP_USD], vals[RISK_CAP_EUR], vals[RISK_CAP_GBP], vals[RISK_CAP_OTHER]);
-}
-
-string RiskCap_CapsKV()
-{
-   return StringFormat("USD=%.3f|EUR=%.3f|GBP=%.3f|OTHER=%.3f",
-                       RiskCap_BucketCapR(RISK_CAP_USD),
-                       RiskCap_BucketCapR(RISK_CAP_EUR),
-                       RiskCap_BucketCapR(RISK_CAP_GBP),
-                       RiskCap_BucketCapR(RISK_CAP_OTHER));
-}
-
-void RiskCap_SendBlockedTelegram(const string msg)
-{
-   if(!InpEnableTelegram) return;
-   datetime now=TimeCurrent();
-   int cooldownSec=MathMax(1, InpRisk_Cap_TelegramCooldownSec);
-   if(g_riskCapLastTG>0 && (now-g_riskCapLastTG)<cooldownSec)
-   {
-      if(InpRisk_Cap_LogDetail || InpDebug)
-         Print("RISK_CAP_TG_COOLDOWN active; blocked alert suppressed.");
-      return;
-   }
-   g_riskCapLastTG=now;
-   TelegramSendMessage(msg);
-}
-
-bool RiskCap_AllowsEntry(const int symIdx,
-                         const string sym,
-                         const string dir,
-                         const string setup,
-                         const double intendedR,
-                         const double riskMoney)
-{
-   if(!RiskCap_IsEnabled()) return true;
-   if(intendedR<=0.0) return true;
-
-   double current[];
-   RiskCap_CollectCurrentBuckets(current);
-
-   double projected[];
-   ArrayResize(projected, 4);
-   for(int i=0;i<4;i++) projected[i]=current[i];
-   RiskCap_AddSymbolExposure(sym, intendedR, projected);
-
-   bool blocked=false;
-   string breach="";
-   for(int i=0;i<4;i++)
-   {
-      double cap=RiskCap_BucketCapR(i);
-      if(projected[i] > cap + RISK_CAP_EPS)
-      {
-         blocked=true;
-         if(breach!="") breach += ",";
-         breach += RiskCap_BucketName(i);
-      }
-   }
-   if(!blocked) return true;
-
-   string kv = StringFormat("symbol=%s|dir=%s|setup=%s|intended_R_total=%.3f|breach=%s|current={%s}|projected={%s}|caps={%s}",
-                            sym, dir, setup, intendedR, breach,
-                            RiskCap_BucketsKV(current),
-                            RiskCap_BucketsKV(projected),
-                            RiskCap_CapsKV());
-
-   Audit_Log("BLOCKED_CURRENCY_RISK", kv, false);
-
-   if(InpEnableMLExport)
-   {
-      ML_WriteRowV2("entry_block", NowStr(), sym, setup, dir,
-                    0, 0, 0, 0, riskMoney,
-                    0, 0, 0, 0, 0,
-                    "CURRENCY_RISK_CAP", breach,
-                    0, "ENTRY_BLOCKED", 0, 0, 0,
-                    0, "BLOCKED_CURRENCY_RISK "+kv, g_mlSchema);
-   }
-
-   if(InpRisk_Cap_LogDetail || InpDebug)
-      Print("BLOCKED_CURRENCY_RISK ", kv);
-
-   RiskCap_SendBlockedTelegram(StringFormat("BLOCKED_CURRENCY_RISK %s %s intendedR=%.3f breach=%s current={%s} projected={%s} caps={%s}",
-                                            sym, dir, intendedR, breach,
-                                            RiskCap_BucketsKV(current),
-                                            RiskCap_BucketsKV(projected),
-                                            RiskCap_CapsKV()));
-
-   IncReject(symIdx, REJ_RISK_GUARDS);
-   return false;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // v9: Correlation guard / HTF bias / Volatility regime
@@ -2786,6 +2379,26 @@ bool CorrelationAllowsEntry(const int symIdx,
 
    if(sumWeightedLots <= 0.0) return true;
 
+   // v20-D11: spread-prefer mode — allow entry if current symbol spread < worst correlated symbol spread
+   if(InpCorrSpreadPrefer && worstSym != "")
+   {
+      MqlTick tickNew, tickWorst;
+      bool gotNew   = SymbolInfoTick(sym,      tickNew);
+      bool gotWorst = SymbolInfoTick(worstSym, tickWorst);
+      if(gotNew && gotWorst)
+      {
+         double spreadNew   = SpreadPipsPrices(sym,      tickNew.bid,   tickNew.ask);
+         double spreadWorst = SpreadPipsPrices(worstSym, tickWorst.bid, tickWorst.ask);
+         if(spreadNew <= spreadWorst)
+         {
+            // Current symbol has equal or tighter spread — allow entry
+            detailOut = StringFormat("corrSpreadPrefer|sym_spread=%.2f<=worst_spread=%.2f|worst=%s",
+                                     spreadNew, spreadWorst, worstSym);
+            return true;
+         }
+      }
+   }
+
    // v11: weighted exposure mode (recommended)
    if(InpCorrUseWeightedExposure)
    {
@@ -2921,167 +2534,41 @@ bool VolRegime_Get(const int symIdx, const string sym, double &multOut, bool &bl
    return true;
 }
 
-double CurrentPortfolioRiskPct()
-{
-   double totalRiskMoney=0.0;
-
-   int total=PositionsTotal();
-   for(int i=0;i<total;i++)
-   {
-      ulong ticket=PositionGetTicket(i);
-      if(ticket==0) continue;
-      if(!PositionSelectByTicket(ticket)) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-
-      string sym=PositionGetString(POSITION_SYMBOL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-      long type=PositionGetInteger(POSITION_TYPE);
-      double open=PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl=PositionGetDouble(POSITION_SL);
-
-      if(vol<=0.0 || open<=0.0) continue;
-
-      // If SL is missing, estimate risk so portfolio guard does not under-report risk.
-      if(sl<=0.0)
-      {
-         double pip=PipSize(sym);
-         bool   estOk=false;
-
-         if(pip>0.0)
-         {
-            // Prefer ATR-based estimate (EntryTF ATR)
-            int idx=SymIndexByNameLoose(sym);
-            if(idx>=0 && g_atrHandle[idx]!=INVALID_HANDLE)
-            {
-               double atrBuf[1];
-               if(CopyLast(g_atrHandle[idx], 0, 0, 1, atrBuf))
-               {
-                  double atrPips = atrBuf[0]/pip;
-                  if(atrPips>0.0)
-                  {
-                     double dist = atrPips * Sym_SL_ATR_Mult(sym) * pip;
-                     double slEst = (type==POSITION_TYPE_BUY ? open - dist : open + dist);
-                     double rm = PositionRiskMoney(sym, open, slEst, vol);
-                     if(rm>0.0) { totalRiskMoney += rm; estOk=true; }
-                  }
-               }
-            }
-
-            // Fallback: use minimum ATR pips as proxy when ATR buffer isn't available yet
-            if(!estOk)
-            {
-               double fbAtrPips = Sym_MinATR_Pips(sym);
-               if(fbAtrPips<=0.0) fbAtrPips = InpMinATR_Pips;
-               if(fbAtrPips<=0.0) fbAtrPips = 10.0;
-
-               double dist = fbAtrPips * Sym_SL_ATR_Mult(sym) * pip;
-               if(dist>0.0)
-               {
-                  double slEst = (type==POSITION_TYPE_BUY ? open - dist : open + dist);
-                  double rm = PositionRiskMoney(sym, open, slEst, vol);
-                  if(rm>0.0)
-                  {
-                     totalRiskMoney += rm;
-                     estOk=true;
-
-                     // Throttled audit/ML notice (optional) so you can see when portfolio risk uses a fallback estimate.
-                     datetime nowFB=TimeCurrent();
-                     if(InpEnableAuditLog)
-                     {
-                        static datetime lastAudit=0;
-                        if(lastAudit==0 || (nowFB-lastAudit)>300)
-                        {
-                           long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-                           Audit_Log("PORT_RISK_FALLBACK",
-                                     StringFormat("sym=%s|ticket=%I64d|posId=%I64d|vol=%.2f|distPips=%.2f|open=%s|note=noSL_noATR",
-                                                  sym,(long)ticket,posId,vol,dist/pip,FmtPriceSym(sym,open)),
-                                     false);
-                           lastAudit=nowFB;
-                        }
-                     }
-                     if(InpEnableMLExport)
-                     {
-                        static datetime lastML=0;
-                        if(lastML==0 || (nowFB-lastML)>300)
-                        {
-                           long posId=(long)PositionGetInteger(POSITION_IDENTIFIER);
-                           string dir=(type==POSITION_TYPE_BUY?"BUY":"SELL");
-                           ML_WriteRowV2("risk_fb", NowStr(), sym, "", dir,
-                                        open, 0,0, vol, rm,
-                                        fbAtrPips, 0,0, 0,0,
-                                        "", "",
-                                        posId, "RISK_FALLBACK", 0,0,0,
-                                        0, "noSL_noATR", g_mlSchema,
-                                        StringFormat("distPips=%.2f|ticket=%I64d", dist/pip, (long)ticket));
-                           lastML=nowFB;
-                        }
-                     }
-
-                     // Throttled warning (debug only)
-                     if(InpDebug)
-                     {
-                        static datetime lastWarn=0;
-                        datetime now=TimeCurrent();
-                        if(lastWarn==0 || (now-lastWarn)>60)
-                        {
-                           PrintFormat("PORT_RISK_FALLBACK: %s position has NO SL; ATR not ready -> using fallbackDist=%.1f pips (minATR*SLmult).",
-                                       sym, fbAtrPips*Sym_SL_ATR_Mult(sym));
-                           lastWarn=now;
-                        }
-                     }
-                  }
-               }
-            }
-         }
-
-         if(!estOk)
-         {
-            // Ultimate fail-closed: count full allowed portfolio risk so new entries are blocked until stops exist.
-            double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-            if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-            if(eq>0.0)
-               totalRiskMoney += eq * (InpMaxPortfolioRiskPct/100.0);
-         }
-         continue;
-      }
-
-      double rm=PositionRiskMoney(sym, open, sl, vol);
-      if(rm>0.0) totalRiskMoney += rm;
-   }
-
-   // Use equity (safer during floating DD); fall back to balance if equity not available.
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return 0.0;
-
-   return 100.0 * totalRiskMoney / eq;
-}
-
-
-
-bool PortfolioRiskAllows(const double addRiskMoney)
-{
-   if(!InpUsePortfolioRiskGuard) return true;
-   // Use equity for consistency with CurrentPortfolioRiskPct() and risk sizing.
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(eq<=0.0) return false;
-
-   double curPct=CurrentPortfolioRiskPct();
-   double addPct=(addRiskMoney/eq)*100.0;
-   return (curPct + addPct) <= InpMaxPortfolioRiskPct;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // Indicators per symbol
 // -----------------------------------------
 int g_emaHandle[64];
 int g_atrHandle[64];
-int g_adxHandle[64];      // ADX on confirm TF (trend)
-int g_adxEntryHandle[64]; // NEW: ADX on entry TF (entry filter)
-int g_biasFastHandle[64]; // v9: HTF bias EMA fast
-int g_biasSlowHandle[64]; // v9: HTF bias EMA slow
-int g_atrVolHandle[64];   // v9: volatility regime ATR on InpVolRegimeTF
+int g_adxHandle[64];           // ADX on confirm TF (trend)
+int g_adxEntryHandle[64];      // ADX on entry TF (entry filter)
+int g_biasFastHandle[64];      // v9: HTF bias EMA fast
+int g_biasSlowHandle[64];      // v9: HTF bias EMA slow
+int g_atrVolHandle[64];        // v9: volatility regime ATR on InpVolRegimeTF
+int g_rsiHandle[64];           // P2-4: RSI for divergence filter
+int g_ultraBiasFastHandle[64]; // P2-7: ultra-HTF EMA fast
+int g_ultraBiasSlowHandle[64]; // P2-7: ultra-HTF EMA slow
+
+// --- Weekly loss limit tracking (P3-9)
+double   g_weekEqStart   = 0.0;   // equity recorded at start of current trading week
+datetime g_weekStart     = 0;     // broker datetime of Monday 00:00 of current week
+
+// --- Bar-based SL cooldown per symbol (P3-10)
+datetime g_slCooldownBarTime[64]; // bar open-time when SL hit was recorded
+int      g_slCooldownBarsLeft[64]; // bars remaining in cooldown (counts down on new bar)
+
+// --- Slippage stats for OnTester score (P5-16)
+double g_totalSlippagePips = 0.0;
+int    g_slippageCount     = 0;
+
+// --- Deal deduplication: ring buffer of recently processed deal tickets (P1-3)
+ulong g_processedDeals[512];
+int   g_processedDealsN = 0;
+
+// --- OnTradeTransaction: flag that HistorySelectByPosition succeeded (P1-1)
+bool g_dealQHistoryFresh   = false;
+datetime g_dealQHistoryFreshTime = 0;
 
 
 // Copy buffer helper
@@ -3100,72 +2587,7 @@ bool CopyRatesLast(const string sym, const ENUM_TIMEFRAMES tf, const int start, 
 }
 
 // -----------------------------------------
-// Sanity mode (startup indicator readiness guard)
-// -----------------------------------------
-void Sanity_Reset()
-{
-   g_startTime = TimeCurrent();
-   g_sanityNextCheck = 0;
-   for(int i=0;i<64;i++) g_indReady[i]=false;
-}
-
-void Sanity_UpdateReadiness()
-{
-   if(!InpSanityMode_Enable) return;
-   datetime now=TimeCurrent();
-   if(g_sanityNextCheck!=0 && now < g_sanityNextCheck) return;
-   g_sanityNextCheck = now + 1; // probe at most once per second (cheap + avoids tick spam)
-
-   // if already all ready, we can stop probing
-   int ready=0;
-   for(int i=0;i<g_symCount;i++) if(g_indReady[i]) ready++;
-   if(g_symCount>0 && ready>=g_symCount) return;
-
-   for(int i=0;i<g_symCount;i++)
-   {
-      if(g_indReady[i]) continue;
-
-      // Trailing/spike logic needs ATR only. If ADX is missing or never becomes ready,
-      // we still want management features to work.
-      double b1[1];
-      bool okAtr = (g_atrHandle[i]!=INVALID_HANDLE && CopyLast(g_atrHandle[i],0,0,1,b1));
-      if(okAtr) g_indReady[i]=true;
-   }
-}
-
-int Sanity_ReadyCount()
-{
-   int c=0;
-   for(int i=0;i<g_symCount;i++) if(g_indReady[i]) c++;
-   return c;
-}
-
-int Sanity_RemainingSeconds()
-{
-   if(!InpSanityMode_Enable) return 0;
-   if(InpSanityMode_Seconds<=0) return 0;
-   datetime now=TimeCurrent();
-   if(g_startTime==0) g_startTime=now;
-   int rem = (int)(InpSanityMode_Seconds - (now - g_startTime));
-   if(rem<0) rem=0;
-   return rem;
-}
-
-bool Sanity_BlockTrailingSpike(const int symIdx)
-{
-   if(!InpSanityMode_Enable) return false;
-   datetime now=TimeCurrent();
-   if(g_startTime==0) g_startTime=now;
-
-   // time warm-up
-   if(InpSanityMode_Seconds>0 && (now - g_startTime) < InpSanityMode_Seconds)
-      return true;
-
-   // indicator warm-up (ATR + ADX buffers must be ready)
-   if(symIdx<0 || symIdx>=g_symCount) return true;
-   if(!g_indReady[symIdx]) return true;
-   return false;
-}
+// extracted to MSPB_EA_ExecQual.mqh
 
 
 bool IsNewBar(const int symIdx, const string sym, const ENUM_TIMEFRAMES tf)
@@ -3308,33 +2730,7 @@ double ClampSLToStopsLevel(const string sym, const long type, const double price
 double g_eqPeak=0.0;
 double g_eqTrough=0.0;
 
-string EqRegToStr(const EqRegime r)
-{
-   if(r==EQ_NEUTRAL) return "NEUTRAL";
-   if(r==EQ_CAUTION) return "CAUTION";
-   if(r==EQ_DEFENSIVE) return "DEFENSIVE";
-   return "?";
-}
-
-void EqRegime_Update()
-{
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(g_eqPeak==0.0) { g_eqPeak=eq; g_eqTrough=eq; }
-   if(eq>g_eqPeak) g_eqPeak=eq;
-   if(eq<g_eqTrough) g_eqTrough=eq;
-
-   // compute drawdown in R-like scale: ddPct
-   double ddPct=0.0;
-   if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
-
-   if(ddPct<2.0) g_eqRegime=EQ_NEUTRAL;
-   else if(ddPct<5.0) g_eqRegime=EQ_CAUTION;
-   else g_eqRegime=EQ_DEFENSIVE;
-
-   if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
-   if(g_eqRegime==EQ_CAUTION) g_riskMult=0.7;
-   if(g_eqRegime==EQ_DEFENSIVE) g_riskMult=0.4;
-}
+// extracted to MSPB_EA_Risk.mqh
 
 // -----------------------------------------
 // Deal queue (track exits precisely)
@@ -3362,29 +2758,33 @@ void ProcessDealQueue()
 
    datetime now=TimeCurrent();
 
-   // NEW: time-based backoff to avoid busy-loop when history is not ready
+   // time-based backoff to avoid busy-loop when history is not ready
    if(g_dealQBackoffSec>0 && g_dealQNextTry>0 && now < g_dealQNextTry)
       return;
 
    static datetime lastHistorySelect=0;
 
-   // Only do HistorySelect occasionally for perf
-   if(lastHistorySelect==0 || (now - lastHistorySelect) >= 5)
+   // P1-1/P1-3: use pre-selected history from OnTradeTransaction when fresh (< 5 sec old)
+   bool usePreselected = (g_dealQHistoryFresh && (now - g_dealQHistoryFreshTime) < 5);
+   if(!usePreselected)
+      g_dealQHistoryFresh = false; // stale
+
+   if(!usePreselected)
    {
-      int lookbackDays=5;
-      if(g_dealQBackoffSec>0) lookbackDays=10;
-
-      datetime from=now - (lookbackDays*86400);
-
-      if(!HistorySelect(from, now))
+      // Only do HistorySelect occasionally for perf; expand window on backoff
+      if(lastHistorySelect==0 || (now - lastHistorySelect) >= 5)
       {
-         // History not available now (connection/busy) -> backoff
-         g_dealQBackoffSec = MathMin(60, (g_dealQBackoffSec<=0 ? 1 : g_dealQBackoffSec*2));
-         g_dealQNextTry = now + g_dealQBackoffSec;
-         return;
-      }
+         int lookbackDays = (g_dealQBackoffSec > 0) ? 14 : 7;
+         datetime from = now - ((datetime)lookbackDays * 86400);
 
-      lastHistorySelect=now;
+         if(!HistorySelect(from, now))
+         {
+            g_dealQBackoffSec = MathMin(60, (g_dealQBackoffSec<=0 ? 1 : g_dealQBackoffSec*2));
+            g_dealQNextTry = now + g_dealQBackoffSec;
+            return;
+         }
+         lastHistorySelect = now;
+      }
    }
 
    int processed=0;
@@ -3393,6 +2793,9 @@ void ProcessDealQueue()
    {
       ulong dealTicket;
       if(!DealQ_Pop(dealTicket)) break;
+
+      // P1-3: skip already-processed deals (deduplication)
+      if(!DealSeen_Add(dealTicket)) { processed++; continue; }
 
       if(!HistoryDealSelect(dealTicket))
       {
@@ -3481,6 +2884,26 @@ void ProcessDealQueue()
          g_closedTradesSinceProposal++;
             Cooldown_Apply(sym, now, closeReason, posProfit, posRiskMoney);
          CheckTradeCountProposal();
+
+         // v20-B6/B7: record trade P&L for Kelly & auto-disable tracking
+         int symIdx2 = SymIndexByNameLoose(sym);
+         if(symIdx2 >= 0)
+         {
+            AutoDisable_RecordTrade(symIdx2, profit);
+            AutoDisable_MaybeDisable(symIdx2, sym);
+            // Reset pyramid count when a full position chain closes
+            if(g_sym[symIdx2].pyramidCount > 0)
+               g_sym[symIdx2].pyramidCount = 0;
+            // Reset ladder state
+            if(g_sym[symIdx2].ladderPosId == (long)posId)
+            {
+               g_sym[symIdx2].ladderPosId   = 0;
+               g_sym[symIdx2].ladderR1Done  = false;
+               g_sym[symIdx2].ladderR2Done  = false;
+               g_sym[symIdx2].ladderInitRisk = 0.0;
+               g_sym[symIdx2].ladderVolInit  = 0.0;
+            }
+         }
       }
 
       g_dealQLastProgress=now;
@@ -3602,6 +3025,350 @@ double SafeDiv(const double a, const double b)
 {
    if(MathAbs(b) <= 1e-12) return 0.0;
    return a / b;
+}
+
+// =============================================================
+// v20.0 Helper functions
+// =============================================================
+
+// ----- A1: ML Entry Gate ----
+double MLGate_Sigmoid(const double x)
+{
+   double cx = x;
+   if(cx >  500.0) cx =  500.0;
+   if(cx < -500.0) cx = -500.0;
+   return 1.0 / (1.0 + MathExp(-cx));
+}
+
+// Load ml_entry_threshold.json into global arrays.
+// JSON is simple enough to parse with string ops (no full JSON library needed).
+void MLGate_Load()
+{
+   if(!InpUseMLEntryGate) return;
+   int flags = FILE_READ | FILE_TXT;
+   if(InpMLGate_UseCommonFolder) flags |= FILE_COMMON;
+   int h = FileOpen(InpMLGateFile, flags);
+   if(h == INVALID_HANDLE)
+   {
+      if(InpDebug) PrintFormat("[MLGate] Cannot open %s — gate disabled", InpMLGateFile);
+      g_mlGateLoaded = false;
+      return;
+   }
+
+   string json = "";
+   while(!FileIsEnding(h))
+      json += FileReadString(h);
+   FileClose(h);
+
+   // Extract threshold
+   string threshKey = "\"threshold\":";
+   int pos = StringFind(json, threshKey);
+   if(pos >= 0)
+   {
+      int start = pos + StringLen(threshKey);
+      while(start < StringLen(json) && (StringGetCharacter(json, start)==' ' || StringGetCharacter(json, start)=='\n')) start++;
+      int end = start;
+      while(end < StringLen(json) && StringGetCharacter(json, end) != ',' && StringGetCharacter(json, end) != '\n' && StringGetCharacter(json, end) != '}') end++;
+      g_mlGateThreshold = StringToDouble(StringSubstr(json, start, end - start));
+   }
+
+   // Feature order: atr_pips, adx_trend, adx_entry, spread_pips, body_pips, r_mult
+   string featNames[] = {"atr_pips", "adx_trend", "adx_entry", "spread_pips", "body_pips", "r_mult"};
+   for(int fi = 0; fi < ML_GATE_NFEAT; fi++)
+   {
+      // Extract weight
+      string wKey = "\"" + featNames[fi] + "\":";
+      // Search in feature_weights section
+      int wStart = StringFind(json, "\"feature_weights\"");
+      int wPos = (wStart >= 0) ? StringFind(json, wKey, wStart) : -1;
+      if(wPos >= 0)
+      {
+         int vs = wPos + StringLen(wKey);
+         while(vs < StringLen(json) && (StringGetCharacter(json, vs)==' ' || StringGetCharacter(json, vs)=='\n')) vs++;
+         int ve = vs;
+         while(ve < StringLen(json) && StringGetCharacter(json, ve) != ',' && StringGetCharacter(json, ve) != '\n' && StringGetCharacter(json, ve) != '}') ve++;
+         g_mlGateWeights[fi] = StringToDouble(StringSubstr(json, vs, ve - vs));
+      }
+      else g_mlGateWeights[fi] = 1.0 / ML_GATE_NFEAT;
+
+      // Extract mean
+      int statsStart = StringFind(json, "\"feature_stats\"");
+      int featSection = (statsStart >= 0) ? StringFind(json, "\"" + featNames[fi] + "\"", statsStart) : -1;
+      if(featSection >= 0)
+      {
+         string meanKey = "\"mean\":";
+         int mPos = StringFind(json, meanKey, featSection);
+         int stdPos2 = StringFind(json, "}", featSection);
+         if(mPos >= 0 && (stdPos2 < 0 || mPos < stdPos2))
+         {
+            int ms = mPos + StringLen(meanKey);
+            while(ms < StringLen(json) && (StringGetCharacter(json, ms)==' ')) ms++;
+            int me = ms;
+            while(me < StringLen(json) && StringGetCharacter(json, me) != ',' && StringGetCharacter(json, me) != '}') me++;
+            g_mlGateMeans[fi] = StringToDouble(StringSubstr(json, ms, me - ms));
+         }
+         string stdKey = "\"std\":";
+         int sPos = (featSection >= 0) ? StringFind(json, stdKey, featSection) : -1;
+         if(sPos >= 0 && (stdPos2 < 0 || sPos < stdPos2))
+         {
+            int ss = sPos + StringLen(stdKey);
+            while(ss < StringLen(json) && (StringGetCharacter(json, ss)==' ')) ss++;
+            int se = ss;
+            while(se < StringLen(json) && StringGetCharacter(json, se) != ',' && StringGetCharacter(json, se) != '}') se++;
+            double std = StringToDouble(StringSubstr(json, ss, se - ss));
+            g_mlGateStds[fi] = (std > 1e-9 ? std : 1.0);
+         }
+         else g_mlGateStds[fi] = 1.0;
+      }
+      else
+      {
+         g_mlGateMeans[fi] = 0.0;
+         g_mlGateStds[fi]  = 1.0;
+      }
+   }
+
+   g_mlGateLoaded = true;
+   g_mlGateLastLoad = TimeCurrent();
+   if(InpDebug)
+      PrintFormat("[MLGate] Loaded: threshold=%.4f", g_mlGateThreshold);
+}
+
+double MLGate_Score(const double atrPips, const double adxTrend, const double adxEntry,
+                    const double spreadPips, const double bodyPips, const double rMult)
+{
+   if(!g_mlGateLoaded) return 1.0; // pass-through if not loaded
+   double feats[] = {atrPips, adxTrend, adxEntry, spreadPips, bodyPips, rMult};
+   double z = 0.0;
+   for(int fi = 0; fi < ML_GATE_NFEAT; fi++)
+   {
+      double w    = g_mlGateWeights[fi];
+      double mean = g_mlGateMeans[fi];
+      double std  = (g_mlGateStds[fi] > 1e-9 ? g_mlGateStds[fi] : 1.0);
+      z += w * (feats[fi] - mean) / std;
+   }
+   return MLGate_Sigmoid(z);
+}
+
+// ----- B6: Auto-disable per symbol -----
+void AutoDisable_RecordTrade(const int symIdx, const double pnl)
+{
+   if(!InpAutoDisable_Enable || symIdx < 0 || symIdx >= g_symCount) return;
+   int cap = ArraySize(g_sym[symIdx].kellyPnL);
+   g_sym[symIdx].kellyPnL[g_sym[symIdx].kellyPnLHead] = pnl;
+   g_sym[symIdx].kellyPnLHead = (g_sym[symIdx].kellyPnLHead + 1) % cap;
+   if(g_sym[symIdx].kellyPnLN < cap) g_sym[symIdx].kellyPnLN++;
+}
+
+bool AutoDisable_IsBlocked(const int symIdx)
+{
+   if(!InpAutoDisable_Enable || symIdx < 0) return false;
+   if(g_sym[symIdx].autoDisabledUntil > TimeCurrent()) return true;
+   return false;
+}
+
+void AutoDisable_MaybeDisable(const int symIdx, const string sym)
+{
+   if(!InpAutoDisable_Enable || symIdx < 0 || symIdx >= g_symCount) return;
+   int n = MathMin(g_sym[symIdx].kellyPnLN, InpAutoDisable_Lookback);
+   if(n < MathMax(5, InpAutoDisable_Lookback / 2)) return; // need enough data
+
+   int cap = ArraySize(g_sym[symIdx].kellyPnL);
+   int wins=0; double sumWin=0, sumLoss=0;
+   for(int i=0; i<n; i++)
+   {
+      int idx2 = (g_sym[symIdx].kellyPnLHead - 1 - i + cap) % cap;
+      double p = g_sym[symIdx].kellyPnL[idx2];
+      if(p > 0) { wins++; sumWin += p; }
+      else       sumLoss += MathAbs(p);
+   }
+   double lossCount = n - wins;
+   double winRate   = (n > 0 ? (double)wins / n : 0.0);
+   double avgWin    = (wins > 0 ? sumWin / wins : 0.0);
+   double avgLoss   = (lossCount > 0 ? sumLoss / lossCount : 0.0);
+   double expectancy = winRate * avgWin - (1.0 - winRate) * avgLoss;
+
+   if(expectancy < 0.0)
+   {
+      // Disable until next Monday 00:00
+      datetime now = TimeCurrent();
+      MqlDateTime mdt; TimeToStruct(now, mdt);
+      int dow = mdt.day_of_week;
+      if(dow == 0) dow = 7;
+      int daysToMon = (8 - dow) % 7;
+      if(daysToMon == 0) daysToMon = 7;
+      datetime monNext = now - (datetime)(mdt.hour*3600 + mdt.min*60 + mdt.sec)
+                             + (datetime)(daysToMon * 86400);
+      g_sym[symIdx].autoDisabledUntil = monNext;
+      if(InpDebug)
+         PrintFormat("[AutoDisable] %s disabled until %s | exp=%.4f wr=%.2f avgW=%.2f avgL=%.2f n=%d",
+                     sym, TimeToString(monNext, TIME_DATE|TIME_MINUTES),
+                     expectancy, winRate, avgWin, avgLoss, n);
+   }
+}
+
+// ----- B7: Kelly sizing -----
+double Kelly_GetMult(const int symIdx)
+{
+   if(!InpUseKellyScaling || symIdx < 0) return 1.0;
+   int n = MathMin(g_sym[symIdx].kellyPnLN, InpKelly_Lookback);
+   if(n < MathMax(5, InpKelly_Lookback / 2)) return 1.0; // not enough data
+
+   int cap = ArraySize(g_sym[symIdx].kellyPnL);
+   int wins=0; double sumWin=0, sumLoss=0;
+   for(int i=0; i<n; i++)
+   {
+      int idx2 = (g_sym[symIdx].kellyPnLHead - 1 - i + cap) % cap;
+      double p = g_sym[symIdx].kellyPnL[idx2];
+      if(p > 0) { wins++; sumWin += p; }
+      else       sumLoss += MathAbs(p);
+   }
+   if(wins == 0 || wins == n) return 1.0; // degenerate: no Kelly signal
+   double lossCount = n - wins;
+   double winRate   = (double)wins / n;
+   double avgWin    = sumWin / wins;
+   double avgLoss   = (lossCount > 0 ? sumLoss / lossCount : 0.0);
+   if(avgLoss <= 0) return 1.0;
+   double bRatio    = avgWin / avgLoss;                      // b = avg_win / avg_loss
+   double kellyFull = (winRate * (bRatio + 1.0) - 1.0) / bRatio; // Kelly criterion
+   double kellyHalf = kellyFull * InpKelly_Fraction;
+   // Normalise: if kelly=0.25 means "use 25% of normal risk"; we set the lot multiplier
+   // relative to current baseline so Kelly=0 => minimal, Kelly=0.5 => normal, Kelly=1 => 2x.
+   // Interpretation: kellyHalf * 2 maps 0.5 -> 1.0, 0.25 -> 0.5, etc.
+   double mult = kellyHalf * 2.0;
+   mult = MathMax(InpKelly_MinMult, MathMin(InpKelly_MaxMult, mult));
+   return mult;
+}
+
+// ----- A3: Chandelier Exit -----
+double Chandelier_GetStop(const int symIdx, const string sym, const long posType, const double atrPips)
+{
+   if(!InpUseChandelierExit) return 0.0;
+   double pip = PipSize(sym);
+   if(pip <= 0 || atrPips <= 0) return 0.0;
+   int n = MathMax(2, InpChandelier_Period);
+
+   double prices[];
+   ArraySetAsSeries(prices, true);
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // For long: use highest high over N bars
+      double highs[];
+      ArraySetAsSeries(highs, true);
+      if(CopyHigh(sym, InpEntryTF, 0, n, highs) < n) return 0.0;
+      double hh = highs[0];
+      for(int i=1;i<n;i++) if(highs[i] > hh) hh = highs[i];
+      return hh - InpChandelier_Mult * atrPips * pip;
+   }
+   else
+   {
+      // For short: use lowest low over N bars
+      double lows[];
+      ArraySetAsSeries(lows, true);
+      if(CopyLow(sym, InpEntryTF, 0, n, lows) < n) return 0.0;
+      double ll = lows[0];
+      for(int i=1;i<n;i++) if(lows[i] < ll) ll = lows[i];
+      return ll + InpChandelier_Mult * atrPips * pip;
+   }
+}
+
+// ----- D10: Weekly symbol ranking -----
+void WeeklyRank_MaybeLoad()
+{
+   if(!InpUseWeeklySymbolRank) return;
+
+   // Refresh on Monday open (or if never loaded)
+   datetime now = TimeCurrent();
+   if(g_rankLastRefresh > 0)
+   {
+      // Reload once per week: check if it's been >= 7 days
+      if((now - g_rankLastRefresh) < 6 * 86400) return;
+   }
+
+   int flags = FILE_READ | FILE_CSV;
+   if(InpSymbolRank_UseCommonFolder) flags |= FILE_COMMON;
+   int h = FileOpen(InpSymbolRankFile, flags, ';');
+   if(h == INVALID_HANDLE)
+   {
+      if(InpDebug) PrintFormat("[RankLoad] Cannot open %s — all symbols enabled", InpSymbolRankFile);
+      // default: enable all
+      for(int i=0;i<g_symCount;i++) g_sym[i].rankEnabled = true;
+      g_rankLastRefresh = now;
+      return;
+   }
+
+   // Mark all disabled first
+   for(int i=0;i<g_symCount;i++) g_sym[i].rankEnabled = false;
+
+   int row = 0;
+   while(!FileIsEnding(h))
+   {
+      string sym_col = FileReadString(h);
+      if(FileIsLineEnding(h)) { row++; continue; }
+      string rank_col    = FileReadString(h);
+      string sharpe_col  = FileReadString(h);
+      string trades_col  = FileReadString(h);
+      string winrate_col = FileReadString(h);
+      string enabled_col = FileReadString(h);
+      if(row == 0) { row++; continue; } // header
+
+      string sym_upper = sym_col;
+      StringToUpper(sym_upper);
+      int enabled = (int)StringToInteger(TrimStr(enabled_col));
+
+      for(int i=0;i<g_symCount;i++)
+      {
+         string gs = g_syms[i]; StringToUpper(gs);
+         if(gs == sym_upper || StringFind(gs, sym_upper)==0)
+         {
+            g_sym[i].rankEnabled = (enabled == 1);
+         }
+      }
+      row++;
+   }
+   FileClose(h);
+   g_rankLastRefresh = now;
+   if(InpDebug)
+   {
+      string en="";
+      for(int i=0;i<g_symCount;i++) if(g_sym[i].rankEnabled) en += g_syms[i] + " ";
+      PrintFormat("[RankLoad] Loaded from %s | enabled: %s", InpSymbolRankFile, en);
+   }
+}
+
+// ----- C8: Expire stale pending limits -----
+void PendingLimits_ExpireStale()
+{
+   if(!InpUseLimitOnSpreadBlock) return;
+   datetime now = TimeCurrent();
+   for(int i = g_pendingLimitsN - 1; i >= 0; i--)
+   {
+      if(now >= g_pendingLimits[i].expiresAt)
+      {
+         // Try to delete the order
+         if(g_pendingLimits[i].ticket > 0)
+            trade.OrderDelete(g_pendingLimits[i].ticket);
+         // Remove from array (shift left)
+         for(int j=i; j<g_pendingLimitsN-1; j++)
+            g_pendingLimits[j] = g_pendingLimits[j+1];
+         g_pendingLimitsN--;
+      }
+   }
+}
+
+void PendingLimits_Add(const ulong ticket, const string sym, const datetime expiresAt)
+{
+   if(g_pendingLimitsN >= ArraySize(g_pendingLimits)) return;
+   g_pendingLimits[g_pendingLimitsN].ticket    = ticket;
+   g_pendingLimits[g_pendingLimitsN].sym       = sym;
+   g_pendingLimits[g_pendingLimitsN].expiresAt = expiresAt;
+   g_pendingLimitsN++;
+}
+
+bool PendingLimits_HasFor(const string sym)
+{
+   for(int i=0;i<g_pendingLimitsN;i++)
+      if(g_pendingLimits[i].sym == sym) return true;
+   return false;
 }
 
 string FileStamp()
@@ -5143,437 +4910,89 @@ bool DetectNewsSpike(const string sym, const int symIdx, const double atrPips)
    return false;
 }
 
-// -----------------------------------------
-// Stop modification safe helper with logging + optional retry (hedging-safe)
-// -----------------------------------------
-bool IsTransientRetcode(const int retcode)
+
+// --- Volatility percentile filter (v18): block entries when volatility is too low
+bool VolPctFilter_Block(const int symIdx, const string sym)
 {
-   // NOTE: keep this list limited to official ENUM_TRADE_RETURN_CODE values to ensure compilation on all MT5 builds.
-   // Transient conditions where a short retry can succeed.
-   switch(retcode)
+   if(!InpVolPctFilter_Enable) return false;
+   if(symIdx < 0 || symIdx >= g_symCount) return false;
+   if(g_atrHandle[symIdx] == INVALID_HANDLE) return false;
+
+   int shortN  = MathMax(5,  InpVolPctFilter_Period);
+   int baseN   = MathMax(20, InpVolPctFilter_Base);
+
+   double shortBuf[], baseBuf[];
+   ArraySetAsSeries(shortBuf, true);
+   ArraySetAsSeries(baseBuf,  true);
+
+   if(CopyBuffer(g_atrHandle[symIdx], 0, 0, shortN,  shortBuf) < shortN)  return false;
+   if(CopyBuffer(g_atrHandle[symIdx], 0, 0, baseN,   baseBuf)  < baseN)   return false;
+
+   double curATR = shortBuf[0];
+   if(curATR <= 0.0) return false;
+
+   int below = 0, total = 0;
+   for(int i = 1; i < baseN; i++)
    {
-      case TRADE_RETCODE_REQUOTE:
-      case TRADE_RETCODE_PRICE_CHANGED:
-      case TRADE_RETCODE_PRICE_OFF:
-      case TRADE_RETCODE_TIMEOUT:
-      case TRADE_RETCODE_TOO_MANY_REQUESTS:
-      case TRADE_RETCODE_CONNECTION:
-         return true;
+      if(baseBuf[i] <= 0.0) continue;
+      total++;
+      if(baseBuf[i] >= curATR) below++;   // curATR is <= baseBuf[i], so curATR ranks lower
    }
-   return false;
+   if(total < 10) return false;  // not enough data
+   double pct = (double)below / total * 100.0;
+   return (pct >= (100.0 - InpVolPctFilter_Threshold));  // blocked when in bottom X%
 }
 
-// NEW: modify SL/TP by POSITION TICKET (hedging-safe, works on netting too)
-bool SendSLTPModifyByTicket(const string sym, const ulong posTicket, const double sl, const double tp, int &retcode, string &comment)
+// --- Smart order routing: only enter when spread/ATR ratio is acceptable
+bool SmartOrderRoute_IsLiquid(const int symIdx, const string sym, const double atrPips)
 {
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action   = TRADE_ACTION_SLTP;
-   req.symbol   = sym;
-   req.position = posTicket;
-   req.sl       = sl;
-   req.tp       = tp;
-   req.magic    = InpMagic;
-
-   ResetLastError();
-   bool ok = OrderSend(req, res);
-
-   retcode = (int)res.retcode;
-   comment = res.comment;
-
-   if(!ok && comment=="")
-      comment = "OrderSend failed err=" + (string)GetLastError();
-
-   return ok;
+   if(!InpSmartOrderRoute) return true;  // disabled -> always allow
+   if(atrPips <= 0.0) return true;
+   double sp = SpreadPips(sym);
+   double ratio = sp / atrPips;
+   bool liquid = (ratio <= InpSOR_SpreadATRRatio);
+   if(!liquid && InpDebug)
+      PrintFormat("SOR_ILLIQUID %s spread=%.2f atr=%.2f ratio=%.3f (max=%.3f)",
+                  sym, sp, atrPips, ratio, InpSOR_SpreadATRRatio);
+   return liquid;
 }
-
-bool ModifySL_Safe(const int symIdx,
-                   const string sym,
-                   const ulong posTicket,     // NEW: position ticket (hedging-safe)
-                   const long posId,
-                   const long type,
-                   const string setup,
-                   double &slRef,
-                   const double tp,
-                   const double vol,
-                   const double openPrice,
-                   const double atrPips,
-                   const double profitPips,
-                   const double floatMoney,
-                   const double floatR,
-                   const double newSL,
-                   const double minStepPrice,
-                   const string modReason,
-                   const string kvExtra="")
-{
-   if(newSL<=0.0) return false;
-   if(!CanModifyStopsNow(sym, type, newSL)) return false;
-
-   double pt=SymbolInfoDouble(sym, SYMBOL_POINT);
-   double step = (minStepPrice>0.0 ? minStepPrice : pt);
-   if(MathAbs(newSL - slRef) < (step - pt*0.5)) return false;
-
-   double oldSL = slRef;
-
-   // NEW: never worsen SL (monotonic). Trailing/BE should only tighten risk.
-   if(slRef>0.0)
-   {
-      if(type==POSITION_TYPE_BUY  && newSL <= slRef) return false;
-      if(type==POSITION_TYPE_SELL && newSL >= slRef) return false;
-   }
-
-
-   bool accepted=false;
-   int ret=0;
-   string comm="";
-   int tries=0;
-
-   int maxRetries = (InpSLModRetryTransient ? MathMax(0, InpSLModMaxRetries) : 0);
-   // NEW: avoid rapid retry bursts in tick-based management
-   if(InpManageOnTick) maxRetries = 0;
-   for(int attempt=0; attempt<=maxRetries; attempt++)
-   {
-      tries = attempt+1;
-
-      bool ok = SendSLTPModifyByTicket(sym, posTicket, newSL, tp, ret, comm);
-      Status_SetTrade(StringFormat("SLMOD_%s_try%d", modReason, tries), ret, comm);
-
-      accepted = (ret==TRADE_RETCODE_DONE) || (ret==TRADE_RETCODE_NO_CHANGES);
-      if(accepted) break;
-
-      if(!(InpSLModRetryTransient && attempt<maxRetries && IsTransientRetcode(ret)))
-         break;
-
-      // NEW: short delay between retries (avoid hammering server); avoid Sleep in OnTick mgmt
-      if(InpSLModRetrySleepMS>0 && !InpManageOnTick)
-         Sleep(InpSLModRetrySleepMS);
-   }
-
-   // Always log details when not accepted
-   if(!accepted)
-   {
-      string kv = StringFormat("sym=%s|posTicket=%I64d|posId=%I64d|setup=%s|reason=%s|oldSL=%s|newSL=%s|ret=%d|cmt=%s",
-                               sym, (long)posTicket, posId, setup, modReason,
-                               FmtPriceSym(sym, oldSL),
-                               FmtPriceSym(sym, newSL),
-                               ret, KV_Safe(Shorten(comm,80)));
-      Audit_Log("SLMOD_FAIL", kv, false);
-   }
-   else if(tries>1)
-   {
-      string kv = StringFormat("sym=%s|posTicket=%I64d|posId=%I64d|setup=%s|reason=%s|tries=%d|ret=%d|cmt=%s",
-                               sym, (long)posTicket, posId, setup, modReason, tries, ret, KV_Safe(Shorten(comm,80)));
-      Audit_Log("SLMOD_RETRY_OK", kv, false);
-   }
-
-   if(InpEnableMLExport && InpMLLogSLMods)
-   {
-      string ts=NowStr();
-      string dir=(type==POSITION_TYPE_BUY?"BUY":"SELL");
-      string comment = StringFormat("%s|tries=%d|ret=%d|%s", modReason, tries, ret, Shorten(comm,80));
-      string kv = StringFormat("oldSL=%s|newSL=%s|posTicket=%I64d|%s",
-                               FmtPriceSym(sym, oldSL),
-                               FmtPriceSym(sym, newSL),
-                               (long)posTicket, kvExtra);
-      ML_WriteRowV2("slmod", ts, sym, setup, dir,
-                   openPrice, oldSL, tp, vol, 0,
-                   atrPips, 0,0, SpreadPips(sym), 0,
-                   "", "",
-                   posId, "SLMOD", profitPips, floatMoney, floatR,
-                   ret, comment, g_mlSchema, kv);
-   }
-
-   if(accepted)
-      slRef = newSL;
-
-   return accepted;
-}
-
 
 
 // -----------------------------------------
-// Position close helper (hedging + netting, compatible with older builds)
-// -----------------------------------------
-bool ClosePositionByTicketSafe(const string sym,
-                               const ulong posTicket,
-                               const long posType,
-                               const double volume,
-                               const int deviationPts,
-                               int &retcode,
-                               string &comment)
-{
-   retcode=0;
-   comment="";
-   if(sym=="" || posTicket==0 || volume<=0.0) return false;
-
-   double bid=SymbolInfoDouble(sym, SYMBOL_BID);
-   double ask=SymbolInfoDouble(sym, SYMBOL_ASK);
-   if(bid<=0.0 || ask<=0.0)
-   {
-      MqlTick tk;
-      if(!SymbolInfoTick(sym, tk)) return false;
-      bid=tk.bid; ask=tk.ask;
-   }
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action    = TRADE_ACTION_DEAL;
-   req.symbol    = sym;
-   req.position  = posTicket;
-   req.magic     = InpMagic;
-   req.volume    = volume;
-   req.deviation = (deviationPts>0 ? deviationPts : MathMax(1, InpDev_MinPoints));
-   req.type_time = ORDER_TIME_GTC;
-
-   if(posType==POSITION_TYPE_BUY)
-   {
-      req.type  = ORDER_TYPE_SELL;
-      req.price = bid;
-   }
-   else if(posType==POSITION_TYPE_SELL)
-   {
-      req.type  = ORDER_TYPE_BUY;
-      req.price = ask;
-   }
-   else
-      return false;
-
-   // Best-effort filling mode
-   long fm = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-   if(fm==SYMBOL_FILLING_FOK)      req.type_filling = ORDER_FILLING_FOK;
-   else if(fm==SYMBOL_FILLING_IOC) req.type_filling = ORDER_FILLING_IOC;
-   else                           req.type_filling = ORDER_FILLING_RETURN;
-
-   ResetLastError();
-   bool ok = OrderSend(req, res);
-
-   retcode = (int)res.retcode;
-   comment = res.comment;
-
-   if(!ok && comment=="")
-      comment = "OrderSend failed err=" + (string)GetLastError();
-
-   return ok;
-}
-
-// -----------------------------------------
-// Dashboard
-// -----------------------------------------
-void DashClear()
-{
-   if(!InpShowDashboard) return;
-   int total=ObjectsTotal(0,0,-1);
-   for(int i=total-1;i>=0;i--)
-   {
-      string name=ObjectName(0,i,0,-1);
-      if(StringFind(name,g_dashObjPrefix)==0)
-         ObjectDelete(0,name);
-   }
-}
-
-void DashSetLine(const int idx, const string text, const color col=clrWhite)
-{
-   if(!InpShowDashboard) return;
-   string name=g_dashObjPrefix+(string)idx;
-   // MQL5: ObjectFind() returns an index (>=0) when found, and -1 when not found.
-   // Do NOT use '!ObjectFind(...)' because index 0 is valid and '-1' is truthy in C-like contexts.
-   if(ObjectFind(0,name) < 0)
-   {
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetInteger(0,name,OBJPROP_XDISTANCE,10);
-      ObjectSetInteger(0,name,OBJPROP_YDISTANCE,10+idx*16);
-      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,10);
-      ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-   }
-   ObjectSetString(0,name,OBJPROP_TEXT,text);
-   ObjectSetInteger(0,name,OBJPROP_COLOR,col);
-}
-
-void DashboardUpdate()
-{
-   if(!InpShowDashboard) return;
-
-   int line=0;
-   string ts=NowStr();
-   DashSetLine(line++, StringFormat("%s | %s", TG_GetPrefix(), ts), clrWhite);
-
-   string status="OK";
-   color statusCol=clrLime;
-
-   if(g_failSafeStopEntries)
-   {
-      status="FAILSAFE_"+g_failSafeReason;
-      statusCol=clrRed;
-   }
-   else if(InpNews_Enable && News_LastError()!="" && InpNews_FailClosedOnError)
-   {
-      status="NEWS_FAIL_CLOSED";
-      statusCol=clrOrange;
-   }
-
-   DashSetLine(line++, StringFormat("Status: %s | EqReg: %s | RiskMult: %.2f", status, EqRegToStr(g_eqRegime), g_riskMult), statusCol);
-
-   // driver + news mode summary
-   string entryDrv = (InpUseTimerForEntries ? "TIMER" : "TICK");
-   string mgmtDrv  = (InpManageOnTick ? "TICK" : "TIMER");
-   string newsLine = StringFormat("%s | SpikeNews:%s | AvoidNewsEntries:%s",
-                                 News_StatusLine(),
-                                 (InpUseNewsAwareTrailing?"ON":"OFF"),
-                                 (InpAvoidEntriesDuringNews?"Y":"N"));
-   DashSetLine(line++, StringFormat("Driver: entries=%s manage=%s | %s", entryDrv, mgmtDrv, newsLine), clrSilver);
-
-   // sanity mode status (startup guard for spike/trailing)
-   if(InpSanityMode_Enable)
-   {
-      int ready=Sanity_ReadyCount();
-      int rem=Sanity_RemainingSeconds();
-      bool warm = (rem>0 || (g_symCount>0 && ready<g_symCount));
-      color sc = (warm ? clrOrange : clrSilver);
-      string extra = (rem>0 ? StringFormat(" | %ds", rem) : "");
-      DashSetLine(line++, StringFormat("Sanity: %s | indReady=%d/%d%s", (warm?"WARMUP":"OK"), ready, g_symCount, extra), sc);
-   }
-
-   double bal=AccountInfoDouble(ACCOUNT_BALANCE);
-   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
-   DashSetLine(line++, StringFormat("Balance: %.2f | Equity: %.2f", bal, eq), clrWhite);
-
-   double pr=CurrentPortfolioRiskPct();
-   DashSetLine(line++, StringFormat("PortRisk: %.2f%% (max %.2f%%)", pr, InpMaxPortfolioRiskPct), clrSilver);
-
-   // Rejections summary
-   string rej="Rej:";
-   for(int i=1;i<REJ_MAX;i++)
-      if(g_rejCounts[i]>0)
-         rej += StringFormat(" %s=%d", g_rejNames[i], g_rejCounts[i]);
-   DashSetLine(line++, rej, clrSilver);
-
-   // per symbol short
-   for(int s=0;s<g_symCount && line<20;s++)
-   {
-      string sym=g_syms[s];
-      int open=CountOpenPositionsOurMagic(sym);
-      double sp=SpreadPips(sym);
-      int cdSec=0;
-      if(InpUseSymbolCooldown && g_sym[s].cooldownUntil>0)
-      {
-         datetime now2=TimeCurrent();
-         if(now2 < g_sym[s].cooldownUntil) cdSec=(int)(g_sym[s].cooldownUntil - now2);
-      }
-      if(cdSec>0)
-         DashSetLine(line++, StringFormat("%s | open=%d | spread=%.2f | cd=%ds", sym, open, sp, cdSec), clrWhite);
-      else
-         DashSetLine(line++, StringFormat("%s | open=%d | spread=%.2f", sym, open, sp), clrWhite);
-   }
-}
-
-// -----------------------------------------
-// Core: entry logic (Setup1 / Setup2)
-// -----------------------------------------
-bool BreakPrevHighLow(const string sym,const bool isBuy,const bool useBreakPrev)
-{
-   if(!useBreakPrev) return true;
-   // Break previous bar high/low on entryTF using CLOSED candles (avoid intra-bar repaint).
-   // r[0] = current forming bar, r[1] = last closed, r[2] = bar before last closed
-   MqlRates r[3];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-   if(isBuy) return (r[1].close > r[2].high);
-   else      return (r[1].close < r[2].low);
-}
-
-bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double &adxTrend, double &adxEntry, double &atrPips, double &bodyPips)
-{
-   isBuy=false; adxTrend=0; adxEntry=0; atrPips=0; bodyPips=0;
-
-   // rates
-   MqlRates r[3];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-
-   double pip=PipSize(sym);
-   if(pip<=0) return false;
-
-   // Use last CLOSED candle for signal calculations (avoid intra-bar repaint).
-   bodyPips = MathAbs(r[1].close - r[1].open)/pip;
-
-   // ATR (use last closed bar value)
-   double atrBuf[2];
-   if(!CopyLast(g_atrHandle[symIdx],0,0,2,atrBuf)) return false;
-   atrPips = atrBuf[1]/pip;
-
-   // ADX filters are optional (InpUseADXFilter). If disabled, skip handle/buffer reads.
-   if(InpUseADXFilter)
-   {
-      // ADX (trend TF)
-      double adxBufT[2];
-      if(!CopyLast(g_adxHandle[symIdx],0,0,2,adxBufT)) return false;
-      adxTrend = adxBufT[1];
-
-      // ADX (entry TF)
-      double adxBufE[2];
-      if(!CopyLast(g_adxEntryHandle[symIdx],0,0,2,adxBufE)) return false;
-      adxEntry = adxBufE[1];
-   }
-   else
-   {
-      adxTrend = 999.0;
-      adxEntry = 999.0;
-   }
-
-   // Pullback EMA touch check (closed candle + closed EMA)
-   if(InpUsePullbackEMA || Sym_UsePullbackEMA(sym))
-   {
-      if(g_emaHandle[symIdx]==INVALID_HANDLE) return false;
-      double emaBuf[2];
-      if(!CopyLast(g_emaHandle[symIdx],0,0,2,emaBuf)) return false;
-      double ema=emaBuf[1];
-      bool touched = (r[1].low <= ema && r[1].high >= ema);
-      if(!touched) return false;
-   }
-
-   // direction: simple - close above open => buy, else sell
-   isBuy = (r[1].close > r[1].open);
-   return true;
-}
-
-bool EntrySignal_Setup2(const int symIdx, const string sym, bool &isBuy)
-{
-   // Simple fallback: contrarian direction based on last CLOSED candle (avoid intra-bar repaint)
-   MqlRates r[2];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r)) return false;
-   isBuy = (r[1].close < r[1].open); // contrarian
-   return true;
-}
-
-double ComputeSL(const string sym, const bool isBuy, const double entry, const double atrPips)
-{
-   double pip=PipSize(sym);
-   double slDist = atrPips * Sym_SL_ATR_Mult(sym) * pip;
-   if(isBuy) return entry - slDist;
-   else      return entry + slDist;
-}
-
-double ComputeTP(const string sym, const bool isBuy, const double entry, const double sl)
-{
-   double dist=MathAbs(entry-sl);
-   if(isBuy) return entry + dist*Sym_TP_RR(sym);
-   else      return entry - dist*Sym_TP_RR(sym);
-}
+// extracted to MSPB_EA_Entry.mqh
 
 // -----------------------------------------
 // ProcessSymbol
 // -----------------------------------------
 void ProcessSymbol(const int idx, const string sym)
 {
-   // NEW: fail-safe stop entries
+   // fail-safe stop entries
    if(g_failSafeStopEntries)
    {
       IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // P5-17: Telegram /pause command
+   if(TG_IsPaused())
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // v20-D10: Weekly symbol rank filter
+   if(InpUseWeeklySymbolRank && !g_sym[idx].rankEnabled)
+   {
+      IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // v20-B6: per-symbol auto-disable on negative expectancy
+   if(AutoDisable_IsBlocked(idx))
+   {
+      IncReject(idx, REJ_COOLDOWN);
+      if(InpDebug) PrintFormat("AUTO_DISABLE_BLOCK %s until %s",
+                               sym, TimeToString(g_sym[idx].autoDisabledUntil, TIME_DATE|TIME_MINUTES));
       return;
    }
 
@@ -5581,6 +5000,20 @@ void ProcessSymbol(const int idx, const string sym)
    if(!IsNewBar(idx, sym, InpEntryTF))
    {
       IncReject(idx, REJ_NEWBAR);
+      return;
+   }
+
+   // P3-8: weekday filter
+   if(!WeekdayAllows())
+   {
+      IncReject(idx, REJ_SESSION);
+      return;
+   }
+
+   // P3-9: weekly loss limit
+   if(!WeeklyLossAllows())
+   {
+      IncReject(idx, REJ_RISK_GUARDS);
       return;
    }
 
@@ -5624,9 +5057,88 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
+   // P3-10: bar-based SL cooldown
+   if(PostSL_CooldownBars_IsActive(idx, sym))
+   {
+      IncReject(idx, REJ_COOLDOWN);
+      return;
+   }
+
    // max positions (single-pass count)
    int openSym=0, openTot=0;
    CountOpenPositionsOurMagicBoth(sym, openSym, openTot);
+
+   // v20-A4: Pyramid re-entry — add a micro-lot to an existing BE position
+   // Condition: R1 TP hit + BE stop set + openSym already has a position
+   if(InpUsePyramiding && openSym > 0 && openSym < InpMaxPositionsPerSymbol &&
+      g_sym[idx].ladderR1Done && g_sym[idx].pyramidCount < InpPyramid_MaxAdds)
+   {
+      // Check if the existing position has BE set
+      bool hasBE = false;
+      for(int pi=PositionsTotal()-1; pi>=0; pi--)
+      {
+         ulong pTick2 = PositionGetTicket(pi);
+         if(pTick2==0 || !PositionSelectByTicket(pTick2)) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+         if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+         double pSL2   = PositionGetDouble(POSITION_SL);
+         double pOpen2 = PositionGetDouble(POSITION_PRICE_OPEN);
+         long   pType2 = PositionGetInteger(POSITION_TYPE);
+         // BE is set if SL >= openPrice (for BUY) or SL <= openPrice (for SELL)
+         bool beBuy  = (pType2==POSITION_TYPE_BUY  && pSL2 >= pOpen2 - 1e-9);
+         bool beSell = (pType2==POSITION_TYPE_SELL && pSL2 <= pOpen2 + 1e-9);
+         if(beBuy || beSell) { hasBE = true; break; }
+      }
+
+      if(hasBE)
+      {
+         // Compute pyramid SL/TP using pullback to current EMA if available
+         double bid2=0, ask2=0;
+         GetBidAskCached(idx, sym, bid2, ask2);
+         double atrBuf2[2]; double atrPips2=0;
+         if(CopyLast(g_atrHandle[idx],0,0,2,atrBuf2))
+            atrPips2 = atrBuf2[0] / MathMax(PipSize(sym), 1e-9);
+         if(atrPips2 > 0 && bid2 > 0 && ask2 > 0)
+         {
+            bool pyrBuy = false;
+            // Determine pyramid direction from existing position
+            for(int pi=PositionsTotal()-1; pi>=0; pi--)
+            {
+               ulong pTick3 = PositionGetTicket(pi);
+               if(pTick3==0 || !PositionSelectByTicket(pTick3)) continue;
+               if((long)PositionGetInteger(POSITION_MAGIC)!= InpMagic) continue;
+               if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+               pyrBuy = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+               break;
+            }
+            double pyrEntry = pyrBuy ? ask2 : bid2;
+            double pyrSL    = ComputeSL(sym, pyrBuy, pyrEntry, atrPips2);
+            pyrSL = ClampSLToStopsLevel(sym, pyrBuy?POSITION_TYPE_BUY:POSITION_TYPE_SELL, pyrEntry, pyrSL);
+            double pyrTP    = ComputeTP_Smart(sym, pyrBuy, pyrEntry, pyrSL);
+
+            double pyrRMult = (InpPyramid_RiskPct / MathMax(InpRiskPercent, 1e-9));
+            double pyrLots, pyrRiskMoney;
+            if(CalcRiskLotsEx(sym, pyrEntry, pyrSL, pyrRMult * g_riskMult, pyrLots, pyrRiskMoney) && pyrLots > 0)
+            {
+               trade.SetExpertMagicNumber((long)InpMagic);
+               int devPts3 = AdaptiveDeviationPointsPrices(sym, bid2, ask2, atrPips2);
+               trade.SetDeviationInPoints(devPts3);
+               bool pyrOk = pyrBuy ? trade.Buy(pyrLots, sym, 0.0, pyrSL, pyrTP, "PYRAMID")
+                                   : trade.Sell(pyrLots, sym, 0.0, pyrSL, pyrTP, "PYRAMID");
+               if(pyrOk)
+               {
+                  g_sym[idx].pyramidCount++;
+                  Audit_Log("PYRAMID_ADD",
+                            StringFormat("sym=%s|lots=%.2f|pyramidN=%d|sl=%s",
+                                         sym, pyrLots, g_sym[idx].pyramidCount,
+                                         FmtPriceSym(sym, pyrSL)),
+                            false);
+               }
+            }
+         }
+      }
+   }
+
    if(openSym >= InpMaxPositionsPerSymbol) return;
    if(openTot >= InpMaxPositionsTotal) return;
    // compute signals
@@ -5700,6 +5212,13 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
+   // v18: volatility percentile filter
+   if(VolPctFilter_Block(idx, sym))
+   {
+      IncReject(idx, REJ_VOL_REGIME);
+      return;
+   }
+
    // v9: higher timeframe bias filter
    if(InpUseHTFBias)
    {
@@ -5715,16 +5234,102 @@ void ProcessSymbol(const int idx, const string sym)
       if(bdir<0 &&  isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
    }
 
+   // P2-7: ultra-HTF (third TF) bias filter
+   if(InpUseUltraHTFBias)
+   {
+      if(g_ultraBiasFastHandle[idx] == INVALID_HANDLE || g_ultraBiasSlowHandle[idx] == INVALID_HANDLE)
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         if(InpDebug) PrintFormat("ULTRA_BIAS_NOT_READY %s tf=%s", sym, EnumToString(InpUltraBiasTF));
+         return;
+      }
+      double ubf[2], ubs[2];
+      bool ubfOk = CopyLast(g_ultraBiasFastHandle[idx], 0, 0, 2, ubf);
+      bool ubsOk = CopyLast(g_ultraBiasSlowHandle[idx], 0, 0, 2, ubs);
+      if(!ubfOk || !ubsOk)
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         return;
+      }
+      int ubdir = (ubf[1] > ubs[1]) ? 1 : ((ubf[1] < ubs[1]) ? -1 : 0);
+      if(ubdir > 0 && !isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
+      if(ubdir < 0 &&  isBuy) { IncReject(idx, REJ_BIAS_FAIL); return; }
+   }
+
+   // P2-5: dynamic spread/ATR filter (applies to all setups when enabled)
+   if(InpUseDynamicSpreadFilter && atrPips > 0.0)
+   {
+      double dynRatio = spreadPips / atrPips;
+      if(dynRatio > InpDynSpread_ATRRatio)
+      {
+         IncReject(idx, REJ_SPREAD);
+         if(InpDebug) PrintFormat("DYN_SPREAD_BLOCK %s spread=%.2f atr=%.2f ratio=%.3f (max=%.3f)",
+                                  sym, spreadPips, atrPips, dynRatio, InpDynSpread_ATRRatio);
+
+         // v20-C8: place pending limit order at signal price with TTL
+         if(InpUseLimitOnSpreadBlock && !PendingLimits_HasFor(sym))
+         {
+            double limEntry = isBuy ? ask : bid;
+            double limSL    = ComputeSL(sym, isBuy, limEntry, atrPips);
+            limSL = ClampSLToStopsLevel(sym, isBuy?POSITION_TYPE_BUY:POSITION_TYPE_SELL, limEntry, limSL);
+            double limTP    = ComputeTP_Smart(sym, isBuy, limEntry, limSL);
+            double limLots, limRiskMoney;
+            double limRMult = g_riskMult * volMult;
+            double limE2    = isBuy ? ask : bid;
+            if(CalcRiskLotsEx(sym, limE2, limSL, limRMult, limLots, limRiskMoney) && limLots > 0)
+            {
+               trade.SetExpertMagicNumber((long)InpMagic);
+               int devPts2 = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
+               trade.SetDeviationInPoints(devPts2);
+               bool limOk = false;
+               if(isBuy)  limOk = trade.BuyLimit(limLots, limEntry, sym, limSL, limTP, ORDER_TIME_SPECIFIED,
+                                                  TimeCurrent() + InpLimitOrderTTL_Min*60, "LIM_SPREAD");
+               else       limOk = trade.SellLimit(limLots, limEntry, sym, limSL, limTP, ORDER_TIME_SPECIFIED,
+                                                   TimeCurrent() + InpLimitOrderTTL_Min*60, "LIM_SPREAD");
+               if(limOk)
+               {
+                  ulong limTicket = trade.ResultOrder();
+                  PendingLimits_Add(limTicket, sym, TimeCurrent() + InpLimitOrderTTL_Min*60);
+                  if(InpDebug) PrintFormat("LIMIT_ON_SPREAD_BLOCK %s %s lots=%.2f price=%s ttl=%dm",
+                                           sym, (isBuy?"BUY":"SELL"), limLots, FmtPriceSym(sym, limEntry),
+                                           InpLimitOrderTTL_Min);
+               }
+            }
+         }
+         return;
+      }
+   }
+
 
    // combined risk multiplier (equity regime * vol regime)
    double tradeRiskMult = g_riskMult * volMult;
 
+   // v20-B7: apply Kelly fraction multiplier to risk
+   double kellyMult = Kelly_GetMult(idx);
+   if(InpUseKellyScaling && kellyMult != 1.0)
+      tradeRiskMult *= kellyMult;
+
+   // v20-A1: ML entry gate (block if weighted feature score < threshold)
+   if(InpUseMLEntryGate && g_mlGateLoaded)
+   {
+      double mlScore = MLGate_Score(atrPips, adxTrend, adxEntry, spreadPips, bodyPips, tradeRiskMult);
+      if(mlScore < MathMax(0.0, InpML_MinScore))
+      {
+         IncReject(idx, REJ_BIAS_FAIL);
+         if(InpDebug) PrintFormat("ML_GATE_BLOCK %s score=%.4f < min=%.4f", sym, mlScore, InpML_MinScore);
+         return;
+      }
+   }
 
    double entry = isBuy ? ask : bid;
 
    double sl = ComputeSL(sym, isBuy, entry, atrPips);
    sl = ClampSLToStopsLevel(sym, isBuy?POSITION_TYPE_BUY:POSITION_TYPE_SELL, entry, sl);
-   double tp = ComputeTP(sym, isBuy, entry, sl);
+   double tp = ComputeTP_Smart(sym, isBuy, entry, sl);
+
+   // v20-C9: micro-delay after bar open (reduces slippage at volatile openings)
+   if(InpEntryDelay_Ms > 0)
+      Sleep(InpEntryDelay_Ms);
 
    // risk lots
    double lots, riskMoney;
@@ -5795,6 +5400,12 @@ void ProcessSymbol(const int idx, const string sym)
          return;
 
 
+      if(!SmartOrderRoute_IsLiquid(idx, sym, atrPips))
+      {
+         IncReject(idx, REJ_SPREAD);
+         return;
+      }
+
       // send order
       trade.SetExpertMagicNumber((long)InpMagic);
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
@@ -5804,6 +5415,43 @@ void ProcessSymbol(const int idx, const string sym)
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
       Status_SetTrade("BUY", ret, trade.ResultComment());
+      // --- Partial fill detection (D1) ---
+      if(ret == TRADE_RETCODE_DONE_PARTIAL)
+      {
+         double filledVol = trade.ResultVolume();
+         if(filledVol > 0.0 && filledVol < lots - 1e-9)
+         {
+            double actualRisk = PositionRiskMoney(sym, entry, sl, filledVol);
+            if(InpDebug) PrintFormat("PARTIAL_FILL %s BUY: requested=%.2f filled=%.2f riskAdj=%.2f",
+                                     sym, lots, filledVol, actualRisk);
+            Audit_Log("PARTIAL_FILL",
+                      StringFormat("sym=%s|dir=BUY|requested=%.2f|filled=%.2f|risk_adj=%.2f",
+                                   sym, lots, filledVol, actualRisk),
+                      false);
+         }
+      }
+
+      // --- Slippage tracking (D2) ---
+      if(success && trade.ResultPrice() > 0.0)
+      {
+         double slipPips = (trade.ResultPrice() - entry) / MathMax(PipSize(sym), 1e-9);
+         // P5-16: accumulate slippage stats for OnTester score
+         g_totalSlippagePips += MathAbs(slipPips);
+         g_slippageCount++;
+         int sess = GetCurrentSession();
+         string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
+         if(InpDebug) PrintFormat("SLIPPAGE %s BUY: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
+                                  sym, entry, trade.ResultPrice(), slipPips, sessName);
+         if(InpEnableMLExport)
+         {
+            ML_WriteRowV2("slippage", NowStr(), sym, setup, "BUY",
+                         entry, sl, tp, lots, riskMoney,
+                         atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
+                         "", StringFormat("slip_pips=%.3f|sess=%s", slipPips, sessName),
+                         (long)trade.ResultDeal(), "SLIPPAGE", 0,0,tradeRiskMult,
+                         0, StringFormat("slip=%.3f|sess=%s", slipPips, sessName), g_mlSchema);
+         }
+      }
 
 
       if(InpEnableMLExport)
@@ -5844,6 +5492,18 @@ void ProcessSymbol(const int idx, const string sym)
                                              DoubleToString(entry,d),
                                              DoubleToString(sl,d),
                                              DoubleToString(tp,d)));
+         }
+
+         // v20-A4: initialise pyramid tracking for this new position
+         if(InpUsePyramiding && g_sym[idx].pyramidCount == 0)
+         {
+            double pip2 = PipSize(sym);
+            double initRisk2 = (pip2 > 0 && sl > 0) ? MathAbs(entry - sl) / pip2 : 0.0;
+            g_sym[idx].ladderPosId   = (long)trade.ResultDeal();
+            g_sym[idx].ladderInitRisk = initRisk2;
+            g_sym[idx].ladderVolInit  = lots;
+            g_sym[idx].ladderR1Done   = false;
+            g_sym[idx].ladderR2Done   = false;
          }
       }
    }
@@ -5912,6 +5572,12 @@ void ProcessSymbol(const int idx, const string sym)
          return;
 
 
+      if(!SmartOrderRoute_IsLiquid(idx, sym, atrPips))
+      {
+         IncReject(idx, REJ_SPREAD);
+         return;
+      }
+
       trade.SetExpertMagicNumber((long)InpMagic);
       int devPts = AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips);
       trade.SetDeviationInPoints(devPts);
@@ -5920,6 +5586,43 @@ void ProcessSymbol(const int idx, const string sym)
       int ret=(int)trade.ResultRetcode();
       bool success = (ok || ret==TRADE_RETCODE_DONE || ret==TRADE_RETCODE_DONE_PARTIAL);
       Status_SetTrade("SELL", ret, trade.ResultComment());
+      // --- Partial fill detection (D1) ---
+      if(ret == TRADE_RETCODE_DONE_PARTIAL)
+      {
+         double filledVol = trade.ResultVolume();
+         if(filledVol > 0.0 && filledVol < lots - 1e-9)
+         {
+            double actualRisk = PositionRiskMoney(sym, entry, sl, filledVol);
+            if(InpDebug) PrintFormat("PARTIAL_FILL %s SELL: requested=%.2f filled=%.2f riskAdj=%.2f",
+                                     sym, lots, filledVol, actualRisk);
+            Audit_Log("PARTIAL_FILL",
+                      StringFormat("sym=%s|dir=SELL|requested=%.2f|filled=%.2f|risk_adj=%.2f",
+                                   sym, lots, filledVol, actualRisk),
+                      false);
+         }
+      }
+
+      // --- Slippage tracking (D2) ---
+      if(success && trade.ResultPrice() > 0.0)
+      {
+         double slipPips = (entry - trade.ResultPrice()) / MathMax(PipSize(sym), 1e-9);
+         // P5-16: accumulate slippage stats for OnTester score
+         g_totalSlippagePips += MathAbs(slipPips);
+         g_slippageCount++;
+         int sess = GetCurrentSession();
+         string sessName = (sess==0?"Asia":(sess==1?"London":(sess==2?"NY":"Other")));
+         if(InpDebug) PrintFormat("SLIPPAGE %s SELL: intended=%.5f filled=%.5f slip=%.2fpips sess=%s",
+                                  sym, entry, trade.ResultPrice(), slipPips, sessName);
+         if(InpEnableMLExport)
+         {
+            ML_WriteRowV2("slippage", NowStr(), sym, setup, "SELL",
+                         entry, sl, tp, lots, riskMoney,
+                         atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
+                         "", StringFormat("slip_pips=%.3f|sess=%s", slipPips, sessName),
+                         (long)trade.ResultDeal(), "SLIPPAGE", 0,0,tradeRiskMult,
+                         0, StringFormat("slip=%.3f|sess=%s", slipPips, sessName), g_mlSchema);
+         }
+      }
 
 
       if(InpEnableMLExport)
@@ -5960,6 +5663,18 @@ void ProcessSymbol(const int idx, const string sym)
                                              DoubleToString(entry,d),
                                              DoubleToString(sl,d),
                                              DoubleToString(tp,d)));
+         }
+
+         // v20-A4: initialise pyramid tracking for this new SELL position
+         if(InpUsePyramiding && g_sym[idx].pyramidCount == 0)
+         {
+            double pip2 = PipSize(sym);
+            double initRisk2 = (pip2 > 0 && sl > 0) ? MathAbs(entry - sl) / pip2 : 0.0;
+            g_sym[idx].ladderPosId    = (long)trade.ResultDeal();
+            g_sym[idx].ladderInitRisk = initRisk2;
+            g_sym[idx].ladderVolInit  = lots;
+            g_sym[idx].ladderR1Done   = false;
+            g_sym[idx].ladderR2Done   = false;
          }
       }
    }
@@ -6067,19 +5782,118 @@ void ManagePositions()
       // Trailing
       if(InpUseATRTrailing && haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock)
       {
-         double trailMult=InpTrail_ATR_Mult;
-         if(spike) trailMult *= InpNewsSpike_TightenMult;
+         // v20-A3: Chandelier Exit replaces standard ATR trail when enabled
+         if(InpUseChandelierExit)
+         {
+            double chanStop = Chandelier_GetStop(symIdx, sym, type, atrPips);
+            if(chanStop > 0.0)
+            {
+               chanStop = ClampSLToStopsLevel(sym, type, (type==POSITION_TYPE_BUY?bid:ask), chanStop);
+               string kvC = StringFormat("chanPer=%d|chanMult=%.2f|level=%s",
+                                         InpChandelier_Period, InpChandelier_Mult, FmtPriceSym(sym, chanStop));
+               ModifySL_Safe(symIdx, sym, ticket, posId, type, setup,
+                            sl, tp, vol,
+                            openPrice, atrPips,
+                            profitPips, floatMoney, floatR,
+                            chanStop, InpTrail_MinStepPips*pip, "CHAN", kvC);
+            }
+         }
+         else
+         {
+            double trailMult=InpTrail_ATR_Mult;
+            if(spike) trailMult *= InpNewsSpike_TightenMult;
 
-         double dist=atrPips * trailMult * pip;
-         double desiredSL = (type==POSITION_TYPE_BUY ? bid - dist : ask + dist);
-         desiredSL = ClampSLToStopsLevel(sym, type, (type==POSITION_TYPE_BUY?bid:ask), desiredSL);
+            double dist=atrPips * trailMult * pip;
+            double desiredSL = (type==POSITION_TYPE_BUY ? bid - dist : ask + dist);
+            desiredSL = ClampSLToStopsLevel(sym, type, (type==POSITION_TYPE_BUY?bid:ask), desiredSL);
 
-         string kv=StringFormat("trailMult=%.2f|distPips=%.2f|spike=%s", trailMult, dist/pip, (spike?"Y":"N"));
+            string kv=StringFormat("trailMult=%.2f|distPips=%.2f|spike=%s", trailMult, dist/pip, (spike?"Y":"N"));
+            ModifySL_Safe(symIdx, sym, ticket, posId, type, setup,
+                         sl, tp, vol,
+                         openPrice, atrPips,
+                         profitPips, floatMoney, floatR,
+                         desiredSL, InpTrail_MinStepPips*pip, "TRAIL", kv);
+         }
+      }
+
+      // v20-A3: after-R3 trailing for ladder remainder (ATR mult override)
+      if(InpTP_Ladder_Enable && symIdx>=0 && g_sym[symIdx].ladderR2Done &&
+         haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock)
+      {
+         // Use a more aggressive trail for the remainder after R2
+         double r3TrailMult = InpTP_R3_Trail_Mult;
+         if(spike) r3TrailMult *= InpNewsSpike_TightenMult;
+         double r3Dist = atrPips * r3TrailMult * pip;
+         double r3SL   = (type==POSITION_TYPE_BUY ? bid - r3Dist : ask + r3Dist);
+         r3SL = ClampSLToStopsLevel(sym, type, (type==POSITION_TYPE_BUY?bid:ask), r3SL);
+         string kvR3 = StringFormat("R3trail|mult=%.2f", r3TrailMult);
          ModifySL_Safe(symIdx, sym, ticket, posId, type, setup,
-                      sl, tp, vol,
-                      openPrice, atrPips,
+                      sl, tp, vol, openPrice, atrPips,
                       profitPips, floatMoney, floatR,
-                      desiredSL, InpTrail_MinStepPips*pip, "TRAIL", kv);
+                      r3SL, InpTrail_MinStepPips*pip, "R3TRAIL", kvR3);
+      }
+
+      // v20-A2: TP ladder — partial closes at R1 and R2
+      if(InpTP_Ladder_Enable && symIdx>=0 && initRisk>0 && haveTick && pipOk && vol>0)
+      {
+         bool posTracked = (g_sym[symIdx].ladderPosId == posId);
+         if(!posTracked && g_sym[symIdx].ladderPosId == 0)
+         {
+            // First time we see this position — start tracking
+            g_sym[symIdx].ladderPosId    = posId;
+            g_sym[symIdx].ladderInitRisk = initRisk;
+            g_sym[symIdx].ladderVolInit  = vol;
+            g_sym[symIdx].ladderR1Done   = false;
+            g_sym[symIdx].ladderR2Done   = false;
+            posTracked = true;
+         }
+
+         if(posTracked)
+         {
+            double volInit = (g_sym[symIdx].ladderVolInit > 0 ? g_sym[symIdx].ladderVolInit : vol);
+
+            // R1: close InpTP_R1_ClosePct% at InpTP_R1_R * initRisk pips profit
+            if(!g_sym[symIdx].ladderR1Done && profitPips >= initRisk * InpTP_R1_R)
+            {
+               double r1CloseLots = NormalizeVolumeFloor(sym, volInit * (InpTP_R1_ClosePct / 100.0));
+               if(r1CloseLots > 0.0 && r1CloseLots < vol - 1e-9)
+               {
+                  int devPtsL = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
+                  trade.SetDeviationInPoints(devPtsL);
+                  bool partOk = trade.PositionClosePartial(ticket, r1CloseLots);
+                  if(partOk)
+                  {
+                     g_sym[symIdx].ladderR1Done = true;
+                     Audit_Log("LADDER_R1",
+                               StringFormat("sym=%s|posId=%I64d|closed=%.2f|pips=%.2f",
+                                            sym, posId, r1CloseLots, profitPips),
+                               false);
+                  }
+               }
+               else g_sym[symIdx].ladderR1Done = true; // vol too small; skip
+            }
+
+            // R2: close InpTP_R2_ClosePct% at InpTP_R2_R * initRisk pips profit
+            if(g_sym[symIdx].ladderR1Done && !g_sym[symIdx].ladderR2Done && profitPips >= initRisk * InpTP_R2_R)
+            {
+               double r2CloseLots = NormalizeVolumeFloor(sym, volInit * (InpTP_R2_ClosePct / 100.0));
+               if(r2CloseLots > 0.0 && r2CloseLots < vol - 1e-9)
+               {
+                  int devPtsL = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
+                  trade.SetDeviationInPoints(devPtsL);
+                  bool partOk = trade.PositionClosePartial(ticket, r2CloseLots);
+                  if(partOk)
+                  {
+                     g_sym[symIdx].ladderR2Done = true;
+                     Audit_Log("LADDER_R2",
+                               StringFormat("sym=%s|posId=%I64d|closed=%.2f|pips=%.2f",
+                                            sym, posId, r2CloseLots, profitPips),
+                               false);
+                  }
+               }
+               else g_sym[symIdx].ladderR2Done = true;
+            }
+         }
       }
 
       // Time stop
@@ -6308,6 +6122,17 @@ int OnInit()
       g_sym[g_symCount].volValid=false;
       g_sym[g_symCount].cooldownUntil=0;
       g_sym[g_symCount].cooldownReason=0;
+      // v20 fields
+      g_sym[g_symCount].autoDisabledUntil=0;
+      g_sym[g_symCount].pyramidCount=0;
+      g_sym[g_symCount].kellyPnLHead=0;
+      g_sym[g_symCount].kellyPnLN=0;
+      g_sym[g_symCount].ladderPosId=0;
+      g_sym[g_symCount].ladderR1Done=false;
+      g_sym[g_symCount].ladderR2Done=false;
+      g_sym[g_symCount].ladderInitRisk=0.0;
+      g_sym[g_symCount].ladderVolInit=0.0;
+      g_sym[g_symCount].rankEnabled=true; // default enabled until first rank load
       g_symCount++;
    }
    if(g_symCount<=0) return INIT_FAILED;
@@ -6334,6 +6159,11 @@ int OnInit()
       g_adxEntryHandle[i]=INVALID_HANDLE;
       g_biasFastHandle[i]=INVALID_HANDLE;
       g_biasSlowHandle[i]=INVALID_HANDLE;
+      g_rsiHandle[i]=INVALID_HANDLE;            // P2-4
+      g_ultraBiasFastHandle[i]=INVALID_HANDLE;  // P2-7
+      g_ultraBiasSlowHandle[i]=INVALID_HANDLE;  // P2-7
+      g_slCooldownBarTime[i]=0;                 // P3-10
+      g_slCooldownBarsLeft[i]=0;                // P3-10
    }
 
    // Initialize indicator handles. If one symbol fails (no data / invalid handle),
@@ -6352,11 +6182,14 @@ int OnInit()
       int adxE=INVALID_HANDLE;
       int bf=INVALID_HANDLE;
       int bs=INVALID_HANDLE;
+      int rsi=INVALID_HANDLE;       // P2-4
+      int ubf=INVALID_HANDLE;       // P2-7
+      int ubs=INVALID_HANDLE;       // P2-7
 
       if(useEMA)
          ema=iMA(sym, InpEntryTF, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
 
-      int atrPer = MathMax(1, InpATR_Period);
+      int atrPer = GetCurrentATRPeriod();
 
       atr=iATR(sym, InpEntryTF, atrPer);
 
@@ -6375,12 +6208,23 @@ int OnInit()
          bs=iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
       }
 
+      if(InpUseDivergenceFilter)
+         rsi = iRSI(sym, InpEntryTF, MathMax(2, InpRSI_Period), PRICE_CLOSE);
+
+      if(InpUseUltraHTFBias)
+      {
+         ubf = iMA(sym, InpUltraBiasTF, MathMax(1, InpUltraBiasEMAFast), 0, MODE_EMA, PRICE_CLOSE);
+         ubs = iMA(sym, InpUltraBiasTF, MathMax(1, InpUltraBiasEMASlow), 0, MODE_EMA, PRICE_CLOSE);
+      }
+
       bool ok=true;
       if(atr==INVALID_HANDLE) ok=false;
       if(useEMA && ema==INVALID_HANDLE) ok=false;
       if(InpUseVolRegime && atrVol==INVALID_HANDLE) ok=false;
       if(InpUseADXFilter && (adx==INVALID_HANDLE || adxE==INVALID_HANDLE)) ok=false;
       if(InpUseHTFBias && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
+      if(InpUseDivergenceFilter && rsi==INVALID_HANDLE) ok=false;
+      if(InpUseUltraHTFBias && (ubf==INVALID_HANDLE || ubs==INVALID_HANDLE)) ok=false;
 
       if(!ok)
       {
@@ -6393,6 +6237,9 @@ int OnInit()
          if(adxE!=INVALID_HANDLE)    IndicatorRelease(adxE);
          if(bf!=INVALID_HANDLE)      IndicatorRelease(bf);
          if(bs!=INVALID_HANDLE)      IndicatorRelease(bs);
+         if(rsi!=INVALID_HANDLE)     IndicatorRelease(rsi);
+         if(ubf!=INVALID_HANDLE)     IndicatorRelease(ubf);
+         if(ubs!=INVALID_HANDLE)     IndicatorRelease(ubs);
 
          continue;
       }
@@ -6410,6 +6257,9 @@ int OnInit()
       g_adxEntryHandle[valid]=adxE;
       g_biasFastHandle[valid]=bf;
       g_biasSlowHandle[valid]=bs;
+      g_rsiHandle[valid]=rsi;
+      g_ultraBiasFastHandle[valid]=ubf;
+      g_ultraBiasSlowHandle[valid]=ubs;
 
       valid++;
    }
@@ -6421,7 +6271,10 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   Sanity_UpdateReadiness(); // NEW: try to mark indicator buffers ready immediately
+   // P3-9: seed weekly equity baseline
+   WeeklyLoss_UpdateIfNewWeek();
+
+   Sanity_UpdateReadiness();
    // open logs
    Audit_Open();
    ML_Open();
@@ -6444,6 +6297,10 @@ int OnInit()
 
    AppliedLog_AppendIfChanged();
 
+   // v20: load optional ML gate + symbol rank on startup
+   MLGate_Load();
+   WeeklyRank_MaybeLoad();
+
    return INIT_SUCCEEDED;
 }
 
@@ -6460,13 +6317,16 @@ void OnDeinit(const int reason)
    // release indicators
    for(int i=0;i<g_symCount;i++)
    {
-      if(g_emaHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_emaHandle[i]);
-      if(g_atrHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrHandle[i]);
-      if(g_adxHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxHandle[i]);
-      if(g_adxEntryHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_adxEntryHandle[i]);
-      if(g_biasFastHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasFastHandle[i]);
-      if(g_biasSlowHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_biasSlowHandle[i]);
-      if(g_atrVolHandle[i]!=INVALID_HANDLE) IndicatorRelease(g_atrVolHandle[i]);
+      if(g_emaHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_emaHandle[i]);
+      if(g_atrHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_atrHandle[i]);
+      if(g_adxHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_adxHandle[i]);
+      if(g_adxEntryHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_adxEntryHandle[i]);
+      if(g_biasFastHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_biasFastHandle[i]);
+      if(g_biasSlowHandle[i]!=INVALID_HANDLE)       IndicatorRelease(g_biasSlowHandle[i]);
+      if(g_atrVolHandle[i]!=INVALID_HANDLE)         IndicatorRelease(g_atrVolHandle[i]);
+      if(g_rsiHandle[i]!=INVALID_HANDLE)            IndicatorRelease(g_rsiHandle[i]);
+      if(g_ultraBiasFastHandle[i]!=INVALID_HANDLE)  IndicatorRelease(g_ultraBiasFastHandle[i]);
+      if(g_ultraBiasSlowHandle[i]!=INVALID_HANDLE)  IndicatorRelease(g_ultraBiasSlowHandle[i]);
    }
 }
 
@@ -6474,12 +6334,22 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   // capture exit deals
+   // P1-1: capture exit deals; try immediate HistorySelectByPosition for lower latency.
    if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
    {
       ulong deal=trans.deal;
       if(deal>0)
       {
+         // Attempt to pre-select history using positionId (available on MT5 build 1820+).
+         // This avoids waiting for the next ProcessDealQueue / HistorySelect throttle cycle.
+         if(trans.position > 0)
+         {
+            if(HistorySelectByPosition(trans.position))
+            {
+               g_dealQHistoryFresh     = true;
+               g_dealQHistoryFreshTime = TimeCurrent();
+            }
+         }
          if(!DealQ_Push(deal))
          {
             PrintFormat("DEALQ_OVERFLOW: queue full, dropping deal %I64d", (long)deal);
@@ -6633,10 +6503,21 @@ void OnTimer()
    SymbolOverrides_UpdateIfDue();
    EqRegime_Update();
    News_UpdateIfDue();
-   Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
+   Sanity_UpdateReadiness();
+
+   // P1-2: periodically check and reinitialise indicator handles that became INVALID_HANDLE
+   // (e.g. after broker reconnect, chart reload). Runs once per timer cycle (cheap: O(n) checks).
+   Handles_CheckAndReinit();
+
+   // P3-9: check if the trading week has rolled over and reset the weekly equity baseline
+   WeeklyLoss_UpdateIfNewWeek();
 
    // HOTFIX: update correlation cache once per CorrTF bar (avoids repeated CopyClose in entry checks)
    if(InpUseCorrelationGuard) CorrCache_UpdateIfNeeded();
+
+   // v20: expire stale pending limit orders (C8) + weekly symbol rank refresh (D10)
+   PendingLimits_ExpireStale();
+   WeeklyRank_MaybeLoad();
 
    if(!InpManageOnTick) ManagePositions();
 
@@ -6655,6 +6536,8 @@ void OnTimer()
    // Optional hot-reload of Telegram config (also used by queue processor).
    TG_Config_UpdateIfDue(false);
    TelegramQueue_Process();
+   // P5-17: poll for inbound Telegram commands
+   TG_PollCommands();
 }
 
 // -----------------------------------------
@@ -6704,6 +6587,15 @@ double OnTester()
 
    // Score: prefer NetProfit, reward PF, penalize DD + low trade count.
    double score = net * (0.25 + pf) * ddFactor * tradeFactor;
+
+   // P5-16: slippage penalty — penalise runs where average slippage is high.
+   // Uses slippage tracked via the SLIPPAGE ML rows accumulated during the test.
+   if(InpTester_SlippagePenalty && g_slippageCount > 0)
+   {
+      double avgSlipPips = g_totalSlippagePips / (double)g_slippageCount;
+      if(avgSlipPips > 0.0)
+         score -= InpTester_SlippagePenalty_Mult * avgSlipPips;
+   }
 
    // Hard penalize non-profitable runs
    if(net <= 0.0)

@@ -1,0 +1,137 @@
+name: CI — pytest + version-check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    # E12: weekly WFO pipeline — runs every Saturday at 02:00 UTC
+    - cron: "0 2 * * 6"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: pytest (all tests in tools/)
+  # ---------------------------------------------------------------------------
+  pytest:
+    name: pytest tools/
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          # Install optional numeric deps (non-fatal if unavailable in tox/local envs)
+          pip install numpy xgboost || true
+
+      - name: Run pytest
+        run: pytest tools/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Job 2: EA_VERSION ↔ CHANGELOG.md version-check
+  # Verifies that the version string in MSPB_Expert_Advisor.mq5 matches the
+  # most-recent section heading in CHANGELOG.md  (format: ## [X.Y] — …)
+  # ---------------------------------------------------------------------------
+  version-check:
+    name: version-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check EA_VERSION matches CHANGELOG.md
+        run: |
+          set -euo pipefail
+
+          # Extract EA_VERSION from .mq5 — expects: #define EA_VERSION "X.Y"
+          MQ5_VERSION=$(grep -E '^\s*#define\s+EA_VERSION\s+"[^"]+"' MSPB_Expert_Advisor.mq5 \
+                        | head -1 \
+                        | sed -E 's/.*"([^"]+)".*/\1/')
+
+          if [ -z "$MQ5_VERSION" ]; then
+            echo "ERROR: Could not find EA_VERSION in MSPB_Expert_Advisor.mq5"
+            exit 1
+          fi
+
+          # Extract most-recent version from CHANGELOG.md — expects: ## [X.Y]
+          CL_VERSION=$(grep -E '^\s*##\s+\[[0-9]+\.[0-9]+\]' CHANGELOG.md \
+                       | head -1 \
+                       | sed -E 's/.*\[([0-9]+\.[0-9]+)\].*/\1/')
+
+          if [ -z "$CL_VERSION" ]; then
+            echo "ERROR: Could not find a version heading in CHANGELOG.md"
+            exit 1
+          fi
+
+          echo "EA_VERSION   : $MQ5_VERSION"
+          echo "CHANGELOG    : $CL_VERSION"
+
+          if [ "$MQ5_VERSION" != "$CL_VERSION" ]; then
+            echo ""
+            echo "ERROR: EA_VERSION ($MQ5_VERSION) does not match the latest"
+            echo "       CHANGELOG.md entry ($CL_VERSION)."
+            echo "       Please update CHANGELOG.md or bump EA_VERSION."
+            exit 1
+          fi
+
+          echo "Version check passed: $MQ5_VERSION"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Walk-Forward Optimisation (E12)
+  # Runs only on the weekly Saturday cron schedule.
+  # Uses the ml_export_v2.csv committed to the repo (if present) to produce
+  # an updated config/wfo_latest.json and pushes it back to the branch.
+  # ---------------------------------------------------------------------------
+  wfo:
+    name: weekly-wfo
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy xgboost || true
+
+      - name: Run WFO pipeline
+        run: |
+          mkdir -p config
+          # Run WFO pipeline if ml_export_v2.csv exists (non-fatal if absent)
+          if [ -f ml_export_v2.csv ]; then
+            python tools/wfo_pipeline.py \
+              --csv ml_export_v2.csv \
+              --output config/wfo_latest.json \
+              || echo "WFO pipeline failed (non-fatal)"
+          else
+            echo "ml_export_v2.csv not found — skipping WFO run"
+            echo "{\"generated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"status\": \"no_data\"}" \
+              > config/wfo_latest.json
+          fi
+
+      - name: Commit and push wfo_latest.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/wfo_latest.json || true
+          git diff --cached --quiet || git commit -m "chore(wfo): weekly WFO update [skip ci]"
+          git push origin HEAD || true

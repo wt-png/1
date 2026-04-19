@@ -1,0 +1,11 @@
+# MSPB Expert Advisor — Python tooling dependencies
+# Install with: pip install -r requirements.txt
+
+# ML feedback loop (tools/ml_feedback.py)
+xgboost>=1.7.0
+numpy>=1.24.0
+
+# Walk-forward pipeline (tools/wfo_pipeline.py) — stdlib only, no extra deps
+
+# Testing
+pytest>=7.0.0
