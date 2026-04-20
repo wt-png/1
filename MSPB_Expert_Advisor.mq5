@@ -439,8 +439,8 @@ input bool     InpSymbolOverrides_PrintOnLoad= true;   // print loaded overrides
 input long     InpMagic                   = 20250213;
 input bool     InpAllowBuy                = true;
 input bool     InpAllowSell               = true;
-input int      InpMaxPositionsPerSymbol   = 2;
-input int      InpMaxPositionsTotal       = 6;
+input int      InpMaxPositionsPerSymbol   = 1;
+input int      InpMaxPositionsTotal       = 3;
 
 // --- Entry driver / management
 input bool     InpUseTimerForEntries      = true;   // if true, entries evaluated in OnTimer; else in OnTick
@@ -449,7 +449,8 @@ input int      InpTimerSec                = 1;
 
 // --- Risk
 input bool     InpUseRiskPercent          = true;
-input double   InpRiskPercent             = 0.30;  // per trade (0.25 = nog stabieler)
+input double   InpRiskPercent             = 0.25;  // per trade risk budget in % of equity
+input double   InpMaxRiskPercentPerTrade  = 0.50;  // hard cap (% of equity) regardless of multipliers
 input double   InpLots                    = 0.01; // fixed lot fallback when risk sizing disabled
 input bool     InpUsePortfolioRiskGuard   = true;
 input double   InpMaxPortfolioRiskPct     = 2.0;
@@ -462,8 +463,10 @@ input bool     InpRisk_Cap_LogDetail      = true;
 input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
 // --- SL/TP
-input double   InpSL_ATR_Mult             = 1.2;  // DATA mode: slightly tighter SL for more turnover
-input double   InpTP_RR                   = 0.8;  // DATA mode: faster TP
+input double   InpSL_ATR_Mult             = 1.6;  // wider structural SL to reduce noise stop-outs
+input double   InpTP_RR                   = 1.4;  // base RR target
+input double   InpMinSLPips               = 6.0;  // hard minimum SL distance
+input double   InpMinTP_RR                = 1.2;  // hard minimum RR floor
 
 // --- Filters
 input bool     InpUsePullbackEMA          = false;
@@ -477,6 +480,10 @@ input double   InpMinADXForEntry          = 20.0;
 input double   InpMinADXEntryFilter       = 20.0;
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
+input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
+input bool     InpEntryUseFollowThrough   = true; // require previous bar in same direction
+input bool     InpEntryUseWickFilter      = true; // reject indecision candles with big opposite wick
+input double   InpEntryMaxOppWickBodyFrac = 0.45; // opposite wick <= X * body
 
 
 // --- Advanced filters / regimes (v9)
@@ -523,7 +530,7 @@ input bool     InpVolLowBlockEntries      = true;  // block entries in low regim
 input double   InpVolHighRiskMult         = 0.50;  // risk multiplier in high regime
 
 // --- Setup2
-input bool     InpUseSetup2               = true;
+input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
@@ -534,10 +541,10 @@ input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 25.0;
-input double   InpMaxSpreadPips_XAU       = 500.0;
+input double   InpMaxSpreadPips_FX        = 3.0;
+input double   InpMaxSpreadPips_XAU       = 80.0;
 
-input double   InpMaxSpreadPips_STOCK     = 50.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
+input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
 // --- Break-even / trailing
 input bool     InpUseBreakEven            = true;
 input double   InpBE_At_R                 = 0.8;
@@ -558,7 +565,8 @@ input bool     InpNewsFreezeBE            = true;
 input double   InpNewsSpike_MinATRPips     = 0.0;   // NEW: minimum ATR(pips) required for spike detection (0 => disabled)
 // --- Exits
 input bool     InpUseTimeStop             = true;
-input int      InpTimeStopBars            = 2;    // DATA mode: faster timeout on M1
+input int      InpTimeStopBars            = 8;    // avoid hyper-fast churn exits
+input bool     InpTimeStopOnlyIfNonPositiveR = true; // only force-close stagnating/non-performing trades
 input bool     InpUseProtectMode          = true;
 input bool     InpDSP_CloseWinnerBelowPipsIfNoSL = true;
 input double   InpDSP_CloseWinnerBelowPips = 3.0;
@@ -669,6 +677,8 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
+input int      InpMinMinutesBetweenEntries = 15;   // anti-overtrading spacing per symbol
+input int      InpMaxEntriesPerSymbolPerDay = 6;   // anti-overtrading daily cap per symbol (0=off)
 
 // -----------------------------------------
 // Globals / enums
@@ -1056,6 +1066,7 @@ struct SymbolState
 {
    datetime lastBar;
    datetime lastConfirmBar;
+   datetime lastEntryTime;
    datetime lastNewsSpike; // for spike cooldown
    // v9 caches
    datetime lastBiasBar;
@@ -1068,6 +1079,8 @@ struct SymbolState
    // v10 cooldown (entry throttle after exit)
    datetime cooldownUntil;
    int      cooldownReason; // 0 none, 2 SL, 3 TP, 4 MANUAL/OTHER
+   int      dayKey;
+   int      entriesToday;
 };
 SymbolState g_sym[64];
 
@@ -2205,9 +2218,21 @@ bool CalcRiskLotsEx(const string sym, const double entry, const double sl, const
    double eq=AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
 
-   double riskBudget=eq * (InpRiskPercent/100.0);
+   double baseRiskPct=InpRiskPercent;
+   if(InpMaxRiskPercentPerTrade>0.0)
+      baseRiskPct=MathMin(baseRiskPct, InpMaxRiskPercentPerTrade);
+   if(baseRiskPct<=0.0) return false;
+
+   double riskBudget=eq * (baseRiskPct/100.0);
    if(riskMult<=0.0) return false;
    riskBudget *= riskMult;
+
+   if(InpMaxRiskPercentPerTrade>0.0)
+   {
+      double hardCap = eq * (InpMaxRiskPercentPerTrade/100.0);
+      if(hardCap>0.0 && riskBudget>hardCap) riskBudget=hardCap;
+   }
+   if(riskBudget<=0.0) return false;
 
    double riskPerLot=PositionRiskMoney(sym, entry, sl, 1.0);
    if(riskPerLot<=0.0) return false;
@@ -3215,6 +3240,34 @@ bool SessionAllows()
    bool london=(h>=InpLondonStartHour && h<InpLondonEndHour);
    bool ny=(h>=InpNYStartHour && h<InpNYEndHour);
    return (london || ny);
+}
+
+int Entry_DayKey(const datetime t)
+{
+   MqlDateTime dt; TimeToStruct(t, dt);
+   return dt.year*10000 + dt.mon*100 + dt.day;
+}
+
+bool EntryRateLimitAllows(const int idx)
+{
+   if(idx<0 || idx>=g_symCount) return false;
+   datetime now=TimeCurrent();
+   int dkey=Entry_DayKey(now);
+
+   if(g_sym[idx].dayKey != dkey)
+   {
+      g_sym[idx].dayKey=dkey;
+      g_sym[idx].entriesToday=0;
+   }
+
+   if(InpMaxEntriesPerSymbolPerDay>0 && g_sym[idx].entriesToday>=InpMaxEntriesPerSymbolPerDay)
+      return false;
+
+   int waitSec = MathMax(0, InpMinMinutesBetweenEntries) * 60;
+   if(waitSec>0 && g_sym[idx].lastEntryTime>0 && (now - g_sym[idx].lastEntryTime) < waitSec)
+      return false;
+
+   return true;
 }
 
 bool SpreadAllows(const string sym)
@@ -5505,6 +5558,7 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
    double atrBuf[2];
    if(!CopyLast(g_atrHandle[symIdx],0,0,2,atrBuf)) return false;
    atrPips = atrBuf[1]/pip;
+   if(atrPips<=0.0) return false;
 
    // ADX filters are optional (InpUseADXFilter). If disabled, skip handle/buffer reads.
    if(InpUseADXFilter)
@@ -5538,6 +5592,36 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
 
    // direction: simple - close above open => buy, else sell
    isBuy = (r[1].close > r[1].open);
+
+   // minimum body quality relative to current volatility
+   if(InpEntryMinBodyATRFrac>0.0)
+   {
+      double bodyAtrFrac = bodyPips / atrPips;
+      if(bodyAtrFrac < InpEntryMinBodyATRFrac) return false;
+   }
+
+   // require follow-through from previous closed bar to avoid one-candle flips
+   if(InpEntryUseFollowThrough)
+   {
+      bool prevIsBuy = (r[2].close > r[2].open);
+      if(prevIsBuy != isBuy) return false;
+   }
+
+   // reject indecision bars with too-large opposite wick
+   if(InpEntryUseWickFilter && bodyPips>0.0)
+   {
+      double oppWickPips = 0.0;
+      if(isBuy)
+      {
+         if(r[1].high>=r[1].close) oppWickPips = (r[1].high-r[1].close)/pip;
+      }
+      else
+      {
+         if(r[1].close>=r[1].low) oppWickPips = (r[1].close-r[1].low)/pip;
+      }
+      if(oppWickPips > bodyPips * MathMax(0.0, InpEntryMaxOppWickBodyFrac)) return false;
+   }
+
    return true;
 }
 
@@ -5554,6 +5638,8 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
 {
    double pip=PipSize(sym);
    double slDist = atrPips * Sym_SL_ATR_Mult(sym) * pip;
+   if(pip>0.0 && InpMinSLPips>0.0)
+      slDist = MathMax(slDist, InpMinSLPips*pip);
    if(isBuy) return entry - slDist;
    else      return entry + slDist;
 }
@@ -5561,8 +5647,10 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
 double ComputeTP(const string sym, const bool isBuy, const double entry, const double sl)
 {
    double dist=MathAbs(entry-sl);
-   if(isBuy) return entry + dist*Sym_TP_RR(sym);
-   else      return entry - dist*Sym_TP_RR(sym);
+   double rr=Sym_TP_RR(sym);
+   rr=MathMax(rr, InpMinTP_RR);
+   if(isBuy) return entry + dist*rr;
+   else      return entry - dist*rr;
 }
 
 // -----------------------------------------
@@ -5619,6 +5707,12 @@ void ProcessSymbol(const int idx, const string sym)
 
    // v10: per-symbol cooldown after exits
    if(InpUseSymbolCooldown && g_sym[idx].cooldownUntil>0 && TimeCurrent() < g_sym[idx].cooldownUntil)
+   {
+      IncReject(idx, REJ_COOLDOWN);
+      return;
+   }
+
+   if(!EntryRateLimitAllows(idx))
    {
       IncReject(idx, REJ_COOLDOWN);
       return;
@@ -5829,6 +5923,16 @@ void ProcessSymbol(const int idx, const string sym)
 
       if(ok)
       {
+         datetime nowEntry=TimeCurrent();
+         int dkey=Entry_DayKey(nowEntry);
+         if(g_sym[idx].dayKey!=dkey)
+         {
+            g_sym[idx].dayKey=dkey;
+            g_sym[idx].entriesToday=0;
+         }
+         g_sym[idx].lastEntryTime=nowEntry;
+         g_sym[idx].entriesToday++;
+
          Audit_Log("ENTRY_BUY",
                    StringFormat("sym=%s|setup=%s|lots=%.2f|sl=%s|tp=%s",
                                 sym, setup, lots,
@@ -5945,6 +6049,16 @@ void ProcessSymbol(const int idx, const string sym)
 
       if(ok)
       {
+         datetime nowEntry=TimeCurrent();
+         int dkey=Entry_DayKey(nowEntry);
+         if(g_sym[idx].dayKey!=dkey)
+         {
+            g_sym[idx].dayKey=dkey;
+            g_sym[idx].entriesToday=0;
+         }
+         g_sym[idx].lastEntryTime=nowEntry;
+         g_sym[idx].entriesToday++;
+
          Audit_Log("ENTRY_SELL",
                    StringFormat("sym=%s|setup=%s|lots=%.2f|sl=%s|tp=%s",
                                 sym, setup, lots,
@@ -6088,11 +6202,16 @@ void ManagePositions()
          int bars=BarsSinceOpen(sym, openTime);
          if(bars>=InpTimeStopBars)
          {
-            int ret=0; string cmt="";
-            int devPts = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
-            bool ok=ClosePositionByTicketSafe(sym, ticket, type, vol, devPts, ret, cmt);
-            Status_SetTrade("TIMESTOP_CLOSE", ret, cmt);
-            if(ok) Audit_Log("EXIT_TIMESTOP", StringFormat("sym=%s|posId=%I64d|bars=%d", sym, posId, bars), false);
+            bool allowTimeExit=true;
+            if(InpTimeStopOnlyIfNonPositiveR && floatR>0.0) allowTimeExit=false;
+            if(allowTimeExit)
+            {
+               int ret=0; string cmt="";
+               int devPts = (haveTick ? AdaptiveDeviationPointsPrices(sym, bid, ask, atrPips) : MathMax(1, InpDev_MinPoints));
+               bool ok=ClosePositionByTicketSafe(sym, ticket, type, vol, devPts, ret, cmt);
+               Status_SetTrade("TIMESTOP_CLOSE", ret, cmt);
+               if(ok) Audit_Log("EXIT_TIMESTOP", StringFormat("sym=%s|posId=%I64d|bars=%d", sym, posId, bars), false);
+            }
          }
       }
 
@@ -6298,6 +6417,7 @@ int OnInit()
       g_syms[g_symCount]=sym;
       g_sym[g_symCount].lastBar=0;
       g_sym[g_symCount].lastConfirmBar=0;
+      g_sym[g_symCount].lastEntryTime=0;
       g_sym[g_symCount].lastNewsSpike=0;
       g_sym[g_symCount].lastBiasBar=0;
       g_sym[g_symCount].biasDir=0;
@@ -6308,6 +6428,8 @@ int OnInit()
       g_sym[g_symCount].volValid=false;
       g_sym[g_symCount].cooldownUntil=0;
       g_sym[g_symCount].cooldownReason=0;
+      g_sym[g_symCount].dayKey=0;
+      g_sym[g_symCount].entriesToday=0;
       g_symCount++;
    }
    if(g_symCount<=0) return INIT_FAILED;
