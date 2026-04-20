@@ -1103,8 +1103,12 @@ struct SymbolState
 SymbolState g_sym[64];
 int g_entriesDayKey=0;
 int g_entriesTotalToday=0;
+// Entry close-location clamp bounds:
+// - minimum 0.50 keeps directional close at least in candle half,
+// - maximum 0.95 avoids requiring near-perfect closes that over-filter signals.
 const double ENTRY_CLOSE_LOCATION_MIN_FRAC = 0.50;
 const double ENTRY_CLOSE_LOCATION_MAX_FRAC = 0.95;
+// Minimum bars needed for a meaningful recent swing structure.
 const int    SL_STRUCTURE_MIN_LOOKBACK_BARS = 2;
 
 // --- Equity regime
@@ -6552,6 +6556,11 @@ int OnInit()
 {
    Sanity_Reset(); // NEW: startup warm-up baseline
    EquityDD_Reset(); // init DD tracker for OnTester()
+   if(InpEntryMinCloseInRangeFrac < ENTRY_CLOSE_LOCATION_MIN_FRAC || InpEntryMinCloseInRangeFrac > ENTRY_CLOSE_LOCATION_MAX_FRAC)
+      PrintFormat("[INIT] InpEntryMinCloseInRangeFrac=%.2f is outside [%.2f, %.2f] and will be clamped at runtime.",
+                  InpEntryMinCloseInRangeFrac, ENTRY_CLOSE_LOCATION_MIN_FRAC, ENTRY_CLOSE_LOCATION_MAX_FRAC);
+   if(InpTP_RR_TrendBonus < 0.0)
+      PrintFormat("[INIT] InpTP_RR_TrendBonus=%.2f is negative and will be treated as 0.0.", InpTP_RR_TrendBonus);
    // Load Telegram config early (if enabled) so startup test messages can be sent immediately.
    TG_Config_UpdateIfDue(true);
    // parse symbols
