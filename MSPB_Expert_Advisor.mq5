@@ -1102,9 +1102,9 @@ struct SymbolState
 SymbolState g_sym[64];
 int g_entriesDayKey=0;
 int g_entriesTotalToday=0;
-const double ENTRY_CLOSE_FRAC_MIN = 0.50;
-const double ENTRY_CLOSE_FRAC_MAX = 0.95;
-const int    SL_SWING_MIN_LOOKBACK_BARS = 2;
+const double ENTRY_CLOSE_LOCATION_MIN_FRAC = 0.50;
+const double ENTRY_CLOSE_LOCATION_MAX_FRAC = 0.95;
+const int    SL_STRUCTURE_MIN_LOOKBACK_BARS = 2;
 
 // --- Equity regime
 enum EqRegime { EQ_NEUTRAL=0, EQ_CAUTION=1, EQ_DEFENSIVE=2 };
@@ -2146,7 +2146,7 @@ void LossStreak_UpdateOnClose(const string sym, const datetime now, const double
    if(i<0 || i>=g_symCount) return;
 
    if(posProfit < 0.0) g_sym[i].consecLosses++;
-   else g_sym[i].consecLosses=0;
+   else if(posProfit > 0.0) g_sym[i].consecLosses=0;
 
    int trigger=MathMax(1, InpLossStreakBlockAfter);
    int blockMin=MathMax(1, InpLossStreakBlockMinutes);
@@ -5710,14 +5710,14 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
       double range=(r[1].high-r[1].low);
       if(range<=0.0) return false;
       double closeFrac=(r[1].close-r[1].low)/range; // 0..1
-      double need=MathMin(ENTRY_CLOSE_FRAC_MAX, MathMax(ENTRY_CLOSE_FRAC_MIN, InpEntryMinCloseInRangeFrac));
+      double minCloseFrac=MathMin(ENTRY_CLOSE_LOCATION_MAX_FRAC, MathMax(ENTRY_CLOSE_LOCATION_MIN_FRAC, InpEntryMinCloseInRangeFrac));
       if(isBuy)
       {
-         if(closeFrac < need) return false;
+         if(closeFrac < minCloseFrac) return false;
       }
       else
       {
-         if(closeFrac > (1.0-need)) return false;
+         if(closeFrac > (1.0-minCloseFrac)) return false;
       }
    }
 
@@ -5744,7 +5744,7 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
    // Optional structure-aware widening: protect behind recent swing levels.
    if(InpSL_UseSwingStructure && pip>0.0)
    {
-      int lb=MathMax(SL_SWING_MIN_LOOKBACK_BARS, InpSL_SwingLookbackBars);
+      int lb=MathMax(SL_STRUCTURE_MIN_LOOKBACK_BARS, InpSL_SwingLookbackBars);
       double buff=MathMax(0.0, InpSL_SwingBufferPips)*pip;
       if(isBuy)
       {
@@ -6355,8 +6355,8 @@ void ManagePositions()
       }
 
       // Trailing
-      bool canTrailNow = (InpUseATRTrailing && haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock && floatR>=InpTrailStartR);
-      if(canTrailNow)
+      bool trailingConditionsMet = (InpUseATRTrailing && haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock && floatR>=InpTrailStartR);
+      if(trailingConditionsMet)
       {
          double trailMult=InpTrail_ATR_Mult;
          if(spike) trailMult *= InpNewsSpike_TightenMult;
