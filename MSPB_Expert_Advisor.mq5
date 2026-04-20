@@ -718,12 +718,13 @@ enum RejectReason
    REJ_CORR_GUARD,
    REJ_VOL_REGIME,
    REJ_COOLDOWN,    // NEW v10
+   REJ_GLOBAL_CAP,  // global entry/day limits
    REJ_FAILSAFE,     // NEW
    REJ_MAX
 };
 
 string g_rejNames[REJ_MAX] = {
-   "NONE","NEWBAR","SESSION","SPREAD","ATR_MIN","ADX_TREND_MIN","ADX_ENTRY_MIN","BODY_MIN","BREAKPREV_FAIL","RISK_GUARDS","NEWS_STATE","BIAS_FAIL","CORR_GUARD","VOL_REGIME","COOLDOWN","FAILSAFE"
+   "NONE","NEWBAR","SESSION","SPREAD","ATR_MIN","ADX_TREND_MIN","ADX_ENTRY_MIN","BODY_MIN","BREAKPREV_FAIL","RISK_GUARDS","NEWS_STATE","BIAS_FAIL","CORR_GUARD","VOL_REGIME","COOLDOWN","GLOBAL_CAP","FAILSAFE"
 };
 
 int g_rejCounts[REJ_MAX];
@@ -5710,7 +5711,9 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
       double range=(r[1].high-r[1].low);
       if(range<=0.0) return false;
       double closeFrac=(r[1].close-r[1].low)/range; // 0..1
-      double minCloseFrac=MathMin(ENTRY_CLOSE_LOCATION_MAX_FRAC, MathMax(ENTRY_CLOSE_LOCATION_MIN_FRAC, InpEntryMinCloseInRangeFrac));
+      // Clamp required close location to sane bounds (50%..95% of candle range).
+      double minCloseFrac=MathMax(ENTRY_CLOSE_LOCATION_MIN_FRAC, InpEntryMinCloseInRangeFrac);
+      minCloseFrac=MathMin(ENTRY_CLOSE_LOCATION_MAX_FRAC, minCloseFrac);
       if(isBuy)
       {
          if(closeFrac < minCloseFrac) return false;
@@ -5744,19 +5747,19 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
    // Optional structure-aware widening: protect behind recent swing levels.
    if(InpSL_UseSwingStructure && pip>0.0)
    {
-      int lb=MathMax(SL_STRUCTURE_MIN_LOOKBACK_BARS, InpSL_SwingLookbackBars);
-      double buff=MathMax(0.0, InpSL_SwingBufferPips)*pip;
+      int swingLookbackBars=MathMax(SL_STRUCTURE_MIN_LOOKBACK_BARS, InpSL_SwingLookbackBars);
+      double swingBufferDistance=MathMax(0.0, InpSL_SwingBufferPips)*pip;
       if(isBuy)
       {
          double lows[];
          ArraySetAsSeries(lows,true);
-         int got=CopyLow(sym, InpEntryTF, 1, lb, lows);
+         int got=CopyLow(sym, InpEntryTF, 1, swingLookbackBars, lows);
          if(got>0)
          {
-            int mi=ArrayMinimum(lows,0,got);
-            if(mi>=0)
+            int minIndex=ArrayMinimum(lows,0,got);
+            if(minIndex>=0)
             {
-               double swingSL=lows[mi]-buff;
+               double swingSL=lows[minIndex]-swingBufferDistance;
                if(swingSL<sl) sl=swingSL; // widen only
             }
          }
@@ -5765,13 +5768,13 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
       {
          double highs[];
          ArraySetAsSeries(highs,true);
-         int got=CopyHigh(sym, InpEntryTF, 1, lb, highs);
+         int got=CopyHigh(sym, InpEntryTF, 1, swingLookbackBars, highs);
          if(got>0)
          {
-            int mi=ArrayMaximum(highs,0,got);
-            if(mi>=0)
+            int maxIndex=ArrayMaximum(highs,0,got);
+            if(maxIndex>=0)
             {
-               double swingSL=highs[mi]+buff;
+               double swingSL=highs[maxIndex]+swingBufferDistance;
                if(swingSL>sl) sl=swingSL; // widen only
             }
          }
@@ -5858,7 +5861,7 @@ void ProcessSymbol(const int idx, const string sym)
    }
    if(!EntryGlobalRateLimitAllows())
    {
-      IncReject(idx, REJ_COOLDOWN);
+      IncReject(idx, REJ_GLOBAL_CAP);
       return;
    }
 
