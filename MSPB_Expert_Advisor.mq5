@@ -1102,6 +1102,9 @@ struct SymbolState
 SymbolState g_sym[64];
 int g_entriesDayKey=0;
 int g_entriesTotalToday=0;
+const double ENTRY_CLOSE_FRAC_MIN = 0.50;
+const double ENTRY_CLOSE_FRAC_MAX = 0.95;
+const int    SL_SWING_MIN_LOOKBACK_BARS = 2;
 
 // --- Equity regime
 enum EqRegime { EQ_NEUTRAL=0, EQ_CAUTION=1, EQ_DEFENSIVE=2 };
@@ -3326,6 +3329,17 @@ bool EntryGlobalRateLimitAllows()
    if(InpMaxEntriesTotalPerDay>0 && g_entriesTotalToday>=InpMaxEntriesTotalPerDay)
       return false;
    return true;
+}
+
+void EntryGlobalCounter_OnEntry(const datetime nowEntry)
+{
+   int dkey=Entry_DayKey(nowEntry);
+   if(g_entriesDayKey!=dkey)
+   {
+      g_entriesDayKey=dkey;
+      g_entriesTotalToday=0;
+   }
+   g_entriesTotalToday++;
 }
 
 bool SpreadAllows(const string sym)
@@ -5696,7 +5710,7 @@ bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double 
       double range=(r[1].high-r[1].low);
       if(range<=0.0) return false;
       double closeFrac=(r[1].close-r[1].low)/range; // 0..1
-      double need=MathMin(0.95, MathMax(0.50, InpEntryMinCloseInRangeFrac));
+      double need=MathMin(ENTRY_CLOSE_FRAC_MAX, MathMax(ENTRY_CLOSE_FRAC_MIN, InpEntryMinCloseInRangeFrac));
       if(isBuy)
       {
          if(closeFrac < need) return false;
@@ -5730,7 +5744,7 @@ double ComputeSL(const string sym, const bool isBuy, const double entry, const d
    // Optional structure-aware widening: protect behind recent swing levels.
    if(InpSL_UseSwingStructure && pip>0.0)
    {
-      int lb=MathMax(2, InpSL_SwingLookbackBars);
+      int lb=MathMax(SL_SWING_MIN_LOOKBACK_BARS, InpSL_SwingLookbackBars);
       double buff=MathMax(0.0, InpSL_SwingBufferPips)*pip;
       if(isBuy)
       {
@@ -6077,8 +6091,7 @@ void ProcessSymbol(const int idx, const string sym)
          }
          g_sym[idx].lastEntryTime=nowEntry;
          g_sym[idx].entriesToday++;
-         if(g_entriesDayKey!=dkey){ g_entriesDayKey=dkey; g_entriesTotalToday=0; }
-         g_entriesTotalToday++;
+         EntryGlobalCounter_OnEntry(nowEntry);
 
          Audit_Log("ENTRY_BUY",
                    StringFormat("sym=%s|setup=%s|lots=%.2f|sl=%s|tp=%s",
@@ -6220,8 +6233,7 @@ void ProcessSymbol(const int idx, const string sym)
          }
          g_sym[idx].lastEntryTime=nowEntry;
          g_sym[idx].entriesToday++;
-         if(g_entriesDayKey!=dkey){ g_entriesDayKey=dkey; g_entriesTotalToday=0; }
-         g_entriesTotalToday++;
+         EntryGlobalCounter_OnEntry(nowEntry);
 
          Audit_Log("ENTRY_SELL",
                    StringFormat("sym=%s|setup=%s|lots=%.2f|sl=%s|tp=%s",
@@ -6343,7 +6355,8 @@ void ManagePositions()
       }
 
       // Trailing
-      if(InpUseATRTrailing && haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock && floatR>=InpTrailStartR)
+      bool canTrailNow = (InpUseATRTrailing && haveTick && pipOk && sl>0 && atrPips>0.0 && !sanityBlock && floatR>=InpTrailStartR);
+      if(canTrailNow)
       {
          double trailMult=InpTrail_ATR_Mult;
          if(spike) trailMult *= InpNewsSpike_TightenMult;
