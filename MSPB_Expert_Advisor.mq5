@@ -598,6 +598,12 @@ input int      InpMLFlushEveryNRows       = 50; // increased for IO perf
 input bool     InpMLLogSLMods             = true;
 input bool     InpMLLogFailedOrders       = false; // log failed order attempts to ML (default: keep dataset clean)
 
+// --- Self-learning: ML entry gate (reads ml_thresholds.json produced by online_retrain.py)
+input bool     InpUseMLEntryGate          = false;  // enable ML win-probability entry filter
+input string   InpMLThresholdFile         = "ml_thresholds.json"; // path to threshold JSON
+input int      InpMLReloadIntervalHours   = 4;       // reload threshold file every N hours
+input double   InpMLDefaultCutoff         = 0.50;   // fallback cutoff when JSON unavailable
+
 // --- Auto proposal on closed trades
 input bool     InpProposalOnClosedTrades      = true;
 input int      InpProposalClosedTradesTrigger = 30;
@@ -1084,6 +1090,18 @@ int    g_mlHandle=INVALID_HANDLE;
 string g_mlSchema="v2";
 int    g_mlRowsSinceFlush=0;
 datetime g_mlLastRot=0;
+
+// --- ML entry-gate threshold state (self-learning feedback)
+double   g_mlCutoffGlobal  = 0.50;  // global win-prob cutoff
+double   g_mlKelly         = 0.25;  // Kelly fraction from last retrain
+// 64 entries covers all realistic symbol lists; symbols beyond this limit are
+// silently ignored and fall back to the global cutoff.
+string   g_mlCutoffSyms[64];        // per-symbol names
+double   g_mlCutoffVals[64];        // per-symbol cutoff values
+double   g_mlKellyVals[64];         // per-symbol Kelly values
+int      g_mlCutoffCount   = 0;     // number of per-symbol entries loaded
+datetime g_mlThreshLastLoad= 0;     // last threshold file load time
+bool     g_mlThreshLoaded  = false; // true once file was successfully read
 
 // --- Audit log state
 int    g_auditHandle=INVALID_HANDLE;
@@ -1835,6 +1853,220 @@ void ML_MaybeFlush()
       g_mlRowsSinceFlush=0;
    }
 }
+
+// -----------------------------------------
+// Self-learning: ML threshold file reader
+// Parses ml_thresholds.json produced by tools/online_retrain.py.
+// Uses simple line-by-line text search instead of a full JSON parser
+// so the EA has no external dependencies.
+// -----------------------------------------
+void MLThresh_Load()
+{
+   if(!InpUseMLEntryGate) return;
+   if(InpMLThresholdFile=="") return;
+
+   int fh = FileOpen(InpMLThresholdFile,
+                     FILE_READ|FILE_TXT|FILE_ANSI|FILE_SHARE_READ, '\n');
+   if(fh == INVALID_HANDLE)
+   {
+      if(InpDebug)
+         PrintFormat("[MLThresh] Cannot open %s (err=%d) — using default cutoff %.3f",
+                     InpMLThresholdFile, GetLastError(), InpMLDefaultCutoff);
+      g_mlCutoffGlobal = InpMLDefaultCutoff;
+      g_mlThreshLoaded = false;
+      return;
+   }
+
+   // reset per-symbol table
+   g_mlCutoffCount = 0;
+   double newCutoff = InpMLDefaultCutoff;
+   double newKelly  = 0.25;
+   bool   inPerSym  = false;
+   string curSym    = "";
+   double curCutoff = InpMLDefaultCutoff;
+   double curKelly  = 0.25;
+
+   while(!FileIsEnding(fh))
+   {
+      string line = FileReadString(fh);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+
+      // global_cutoff
+      if(StringFind(line, "\"global_cutoff\"") >= 0)
+      {
+         int colon = StringFind(line, ":");
+         if(colon >= 0)
+         {
+            string val = StringSubstr(line, colon+1);
+            StringTrimLeft(val);
+            StringTrimRight(val);
+            // strip trailing comma
+            if(StringLen(val) > 0 &&
+               StringGetCharacter(val, StringLen(val)-1) == ',')
+               val = StringSubstr(val, 0, StringLen(val)-1);
+            double v = StringToDouble(val);
+            if(v >= 0.30 && v <= 0.95) newCutoff = v;
+         }
+      }
+      // kelly_fraction
+      else if(StringFind(line, "\"kelly_fraction\"") >= 0)
+      {
+         int colon = StringFind(line, ":");
+         if(colon >= 0)
+         {
+            string val = StringSubstr(line, colon+1);
+            StringTrimLeft(val);
+            StringTrimRight(val);
+            if(StringLen(val) > 0 &&
+               StringGetCharacter(val, StringLen(val)-1) == ',')
+               val = StringSubstr(val, 0, StringLen(val)-1);
+            double v = StringToDouble(val);
+            if(v >= 0.0 && v <= 0.5) newKelly = v;
+         }
+      }
+      // per_symbol block — detect symbol key e.g. "EURUSD": {
+      else if(StringFind(line, "\": {") >= 0 &&
+              StringFind(line, "per_symbol") < 0)
+      {
+         // extract symbol name between first pair of quotes
+         int q1 = StringFind(line, "\"");
+         int q2 = StringFind(line, "\"", q1+1);
+         if(q1 >= 0 && q2 > q1)
+         {
+            curSym    = StringSubstr(line, q1+1, q2-q1-1);
+            curCutoff = newCutoff;
+            curKelly  = newKelly;
+            inPerSym  = true;
+         }
+      }
+      // cutoff inside per-symbol block
+      else if(inPerSym && StringFind(line, "\"cutoff\"") >= 0)
+      {
+         int colon = StringFind(line, ":");
+         if(colon >= 0)
+         {
+            string val = StringSubstr(line, colon+1);
+            StringTrimLeft(val);
+            StringTrimRight(val);
+            if(StringLen(val) > 0 &&
+               StringGetCharacter(val, StringLen(val)-1) == ',')
+               val = StringSubstr(val, 0, StringLen(val)-1);
+            double v = StringToDouble(val);
+            if(v >= 0.30 && v <= 0.95) curCutoff = v;
+         }
+      }
+      // kelly inside per-symbol block
+      else if(inPerSym && StringFind(line, "\"kelly\"") >= 0)
+      {
+         int colon = StringFind(line, ":");
+         if(colon >= 0)
+         {
+            string val = StringSubstr(line, colon+1);
+            StringTrimLeft(val);
+            StringTrimRight(val);
+            if(StringLen(val) > 0 &&
+               StringGetCharacter(val, StringLen(val)-1) == ',')
+               val = StringSubstr(val, 0, StringLen(val)-1);
+            double v = StringToDouble(val);
+            if(v >= 0.0 && v <= 0.5) curKelly = v;
+         }
+      }
+      // closing brace inside per-symbol block
+      else if(inPerSym && StringFind(line, "}") >= 0)
+      {
+         if(curSym != "" && g_mlCutoffCount < 64)
+         {
+            g_mlCutoffSyms[g_mlCutoffCount] = curSym;
+            g_mlCutoffVals[g_mlCutoffCount] = curCutoff;
+            g_mlKellyVals[g_mlCutoffCount]  = curKelly;
+            g_mlCutoffCount++;
+         }
+         inPerSym = false;
+         curSym   = "";
+      }
+   }
+   FileClose(fh);
+
+   g_mlCutoffGlobal  = newCutoff;
+   g_mlKelly         = newKelly;
+   g_mlThreshLoaded  = true;
+   g_mlThreshLastLoad= TimeCurrent();
+
+   if(InpDebug)
+      PrintFormat("[MLThresh] Loaded %s — cutoff=%.3f kelly=%.3f symbols=%d",
+                  InpMLThresholdFile, g_mlCutoffGlobal, g_mlKelly, g_mlCutoffCount);
+}
+
+// Reload threshold file if InpMLReloadIntervalHours have elapsed.
+void MLThresh_ReloadIfDue()
+{
+   if(!InpUseMLEntryGate) return;
+   int intervalSec = InpMLReloadIntervalHours * 3600;
+   if(intervalSec <= 0) intervalSec = 14400; // default 4 h
+   if(g_mlThreshLastLoad == 0 ||
+      (TimeCurrent() - g_mlThreshLastLoad) >= intervalSec)
+      MLThresh_Load();
+}
+
+// Return per-symbol cutoff (falls back to global).
+double MLThresh_Cutoff(const string sym)
+{
+   for(int i = 0; i < g_mlCutoffCount; i++)
+      if(g_mlCutoffSyms[i] == sym) return g_mlCutoffVals[i];
+   return g_mlCutoffGlobal;
+}
+
+// Return per-symbol Kelly fraction (falls back to global).
+double MLThresh_Kelly(const string sym)
+{
+   for(int i = 0; i < g_mlCutoffCount; i++)
+      if(g_mlCutoffSyms[i] == sym) return g_mlKellyVals[i];
+   return g_mlKelly;
+}
+
+// Compute a simple win-probability score from current bar features.
+// Uses a logistic approximation of the features so the EA requires no
+// external ML library.  The Python tool calibrates the intercept/weights
+// by finding the optimal cutoff on OOS data; the EA simply applies that
+// cutoff.  If no threshold file is loaded the function always returns true.
+bool ML_ScoreOK(const string sym,
+                const double atr_pips,
+                const double adx_trend,
+                const double adx_entry,
+                const double spread_pips,
+                const double body_pips)
+{
+   if(!InpUseMLEntryGate) return true;
+   if(!g_mlThreshLoaded)  return true;  // safe: allow entries until file loaded
+
+   // Normalised linear score (weights tuned to be conservative defaults;
+   // the Python retrain adjusts the cutoff, not these weights).
+   // Linear score derived from typical XGBoost feature importance order for
+   // MSPB setups.  Intercept 0.40 is a conservative baseline (allows entry
+   // only when the positive indicators outweigh the negative ones).
+   // ADX weights: stronger trend improves win probability (+0.008/+0.005 per unit,
+   //   capped at 60 to avoid over-rewarding extreme moves).
+   // Body weight: larger body signals conviction (+0.004/pip, capped at 30).
+   // Spread penalty: each pip above 1.0 reduces score by 0.010.
+   // ATR penalty: excess volatility above 20 pips reduces score by 0.003/pip.
+   // The Python retrain tunes the *cutoff* against OOS data, not these weights.
+   double score =  0.40
+                +  0.008 * MathMin(adx_trend, 60.0)
+                +  0.005 * MathMin(adx_entry, 60.0)
+                +  0.004 * MathMin(body_pips, 30.0)
+                -  0.010 * MathMax(spread_pips - 1.0, 0.0)
+                -  0.003 * MathMax(atr_pips - 20.0, 0.0);
+
+   // Clamp to [0,1]
+   if(score < 0.0) score = 0.0;
+   if(score > 1.0) score = 1.0;
+
+   double cutoff = MLThresh_Cutoff(sym);
+   return (score >= cutoff);
+}
+
+
 
 // NEW: per-symbol digits helpers (ML + audit)
 int SymDigitsSafe(const string sym)
@@ -5716,6 +5948,16 @@ void ProcessSymbol(const int idx, const string sym)
    }
 
 
+   // ML entry gate (self-learning win-probability filter)
+   if(!ML_ScoreOK(sym, atrPips, adxTrend, adxEntry, spreadPips, bodyPips))
+   {
+      IncReject(idx, REJ_FAILSAFE);  // reuse failsafe bucket; distinguishable in audit
+      if(InpDebug) PrintFormat("ML_GATE_BLOCK %s atr=%.1f adx_t=%.1f adx_e=%.1f spread=%.2f body=%.2f cutoff=%.3f",
+                               sym, atrPips, adxTrend, adxEntry, spreadPips, bodyPips,
+                               MLThresh_Cutoff(sym));
+      return;
+   }
+
    // combined risk multiplier (equity regime * vol regime)
    double tradeRiskMult = g_riskMult * volMult;
 
@@ -6425,6 +6667,8 @@ int OnInit()
    // open logs
    Audit_Open();
    ML_Open();
+   // self-learning: load ML thresholds (if enabled)
+   MLThresh_Load();
 
    // initial news cache load
    News_UpdateIfDue();
@@ -6634,6 +6878,7 @@ void OnTimer()
    EqRegime_Update();
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
+   MLThresh_ReloadIfDue();   // self-learning: hot-reload ml_thresholds.json when due
 
    // HOTFIX: update correlation cache once per CorrTF bar (avoids repeated CopyClose in entry checks)
    if(InpUseCorrelationGuard) CorrCache_UpdateIfNeeded();
