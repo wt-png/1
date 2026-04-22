@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.8: tighter entry quality filters, structure-aware SL/TP, safer trailing/time-stop exits, strict fixed-lot risk cap, and stronger anti-overtrading guards."
+#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.9: stricter ADX/body/spread filters, improved RR defaults, session filter on, aggressive cooldown & anti-overtrading, custom tester criterion enabled."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -421,7 +421,7 @@ string News_StatusLine()
 // -----------------------------------------
 
 // --- Symbols / TF
-input string   InpSymbols                 = "EURUSD,GBPUSD,CUCUSD";
+input string   InpSymbols                 = "EURUSD,GBPUSD";
 input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M1;  // DATA mode: more signals
 input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_M5;  // DATA mode: faster confirm
 
@@ -464,9 +464,9 @@ input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.6;  // wider structural SL to reduce noise stop-outs
-input double   InpTP_RR                   = 1.4;  // base RR target
+input double   InpTP_RR                   = 1.6;  // base RR target
 input double   InpMinSLPips               = 6.0;  // hard minimum SL distance
-input double   InpMinTP_RR                = 1.2;  // hard minimum RR floor
+input double   InpMinTP_RR                = 1.3;  // hard minimum RR floor
 input bool     InpSL_UseSwingStructure    = true; // widen SL to recent swing structure when needed
 input int      InpSL_SwingLookbackBars    = 5;    // recent closed bars to detect swing high/low
 input double   InpSL_SwingBufferPips      = 1.0;  // extra safety buffer beyond swing
@@ -482,9 +482,9 @@ input double   InpMinATR_Pips             = 10.0;
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 7;   // DATA mode: faster warm-up
 input int      InpATR_Period             = 7;   // DATA mode: ATR period (was hardcoded 14)
-input double   InpMinADXForEntry          = 20.0;
-input double   InpMinADXEntryFilter       = 20.0;
-input bool     InpUseBodyFilter           = false;
+input double   InpMinADXForEntry          = 25.0;
+input double   InpMinADXEntryFilter       = 25.0;
+input bool     InpUseBodyFilter           = true;
 input double   InpMinBodyPips             = 2.0;
 input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
 input bool     InpEntryUseFollowThrough   = true; // require previous bar in same direction
@@ -524,10 +524,10 @@ input double   InpCorrMaxWeightedLots     = 2.0;    // block if sum(abs(corr)*op
 // --- Per-symbol cooldown after exits (v11)
 input bool     InpUseSymbolCooldown       = true;
 input bool     InpCooldownLossOnly        = true;   // apply cooldown only when net position P/L < 0
-input double   InpCooldownLossMinR        = 0.10;  // apply cooldown only if loss <= -X R (e.g. 0.10). 0 => any loss
-input int      InpCooldownSLMin           = 5;      // cooldown minutes after SL close (when loss-only: only if loss)
+input double   InpCooldownLossMinR        = 0.05;  // apply cooldown only if loss <= -X R (e.g. 0.05). 0 => any loss
+input int      InpCooldownSLMin           = 15;     // cooldown minutes after SL close (when loss-only: only if loss)
 input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP close (when loss-only: usually not applied)
-input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
+input int      InpCooldownManualMin       = 5;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
 input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
 input bool     InpUseVolRegime            = true;
@@ -543,14 +543,14 @@ input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = false;
+input bool     InpUseSessions             = true;
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 3.0;
+input double   InpMaxSpreadPips_FX        = 2.0;
 input double   InpMaxSpreadPips_XAU       = 80.0;
 
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
@@ -563,7 +563,7 @@ input double   InpBE_MinStepPips          = 0.5;
 input bool     InpUseATRTrailing          = true;
 input double   InpTrail_ATR_Mult          = 1.2;
 input double   InpTrail_MinStepPips       = 0.8;
-input double   InpTrailStartR             = 0.40; // start trailing only after minimum unrealized R
+input double   InpTrailStartR             = 0.60; // start trailing only after minimum unrealized R
 
 input bool     InpUseNewsAwareTrailing    = true; // spike-based trail tightening (no calendar)
 input bool     InpIgnoreNewsTriggersDuringRollover = false;
@@ -575,7 +575,7 @@ input bool     InpNewsFreezeBE            = true;
 input double   InpNewsSpike_MinATRPips     = 0.0;   // NEW: minimum ATR(pips) required for spike detection (0 => disabled)
 // --- Exits
 input bool     InpUseTimeStop             = true;
-input int      InpTimeStopBars            = 8;    // avoid hyper-fast churn exits
+input int      InpTimeStopBars            = 12;   // avoid hyper-fast churn exits
 input bool     InpTimeStopOnlyIfNonPositiveR = true; // only force-close stagnating/non-performing trades
 input double   InpTimeStopMinAbsR         = 0.15; // only time-exit if |R| is small (stagnation filter)
 input bool     InpUseProtectMode          = true;
@@ -680,7 +680,7 @@ input bool     InpShowDashboard           = true;
 
 // --- Tester / robustness / diagnostics (NEW v12)
 input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% spread stress (affects spread checks + deviation only)
-input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
+input bool     InpTester_UseCustomCriterion = true; // enable OnTester() custom score (Strategy Tester optimization)
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
 input double   InpTester_DDCapPct         = 20.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
 input bool     InpAppliedLog_Enable       = true;  // append applied settings snapshot to CSV when changed
@@ -688,9 +688,9 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 15;   // anti-overtrading spacing per symbol
-input int      InpMaxEntriesPerSymbolPerDay = 6;   // anti-overtrading daily cap per symbol (0=off)
-input int      InpMaxEntriesTotalPerDay   = 12;    // anti-overtrading daily cap across all symbols (0=off)
+input int      InpMinMinutesBetweenEntries = 30;   // anti-overtrading spacing per symbol
+input int      InpMaxEntriesPerSymbolPerDay = 4;   // anti-overtrading daily cap per symbol (0=off)
+input int      InpMaxEntriesTotalPerDay   = 8;     // anti-overtrading daily cap across all symbols (0=off)
 input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N consecutive losing positions
 input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses
 input int      InpLossStreakBlockMinutes  = 180;   // lock duration after loss-streak trigger
