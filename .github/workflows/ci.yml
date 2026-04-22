@@ -15,6 +15,8 @@ jobs:
   test:
     name: Lint & pytest
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +41,8 @@ jobs:
   wfo:
     name: Walk-Forward Optimisation
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
 
     steps:
