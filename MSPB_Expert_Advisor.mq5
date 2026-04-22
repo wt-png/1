@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.8: tighter entry quality filters, structure-aware SL/TP, safer trailing/time-stop exits, strict fixed-lot risk cap, and stronger anti-overtrading guards."
+#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v21.0: tighter entry quality filters, structure-aware SL/TP, safer trailing/time-stop exits, strict fixed-lot risk cap, stronger anti-overtrading guards, daily loss circuit breaker."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -695,6 +695,14 @@ input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N conse
 input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses
 input int      InpLossStreakBlockMinutes  = 180;   // lock duration after loss-streak trigger
 
+// --- Daily loss limit (circuit breaker)
+input bool   InpDailyLoss_Enable       = true;   // halt new entries if daily P&L < -X% balance
+input double InpDailyLoss_PctBalance   = 2.0;    // daily loss threshold in % of balance
+input bool   InpDailyLoss_CloseAll     = false;  // if true: also close all open positions on breach
+// --- Equity circuit breaker (session-level)
+input bool   InpEquityCB_Enable        = true;   // block entries when equity DD from session-start > X%
+input double InpEquityCB_Pct           = 5.0;    // equity DD% from session-start that triggers CB
+
 // -----------------------------------------
 // Globals / enums
 // -----------------------------------------
@@ -1115,6 +1123,13 @@ const int    SL_STRUCTURE_MIN_LOOKBACK_BARS = 2;
 enum EqRegime { EQ_NEUTRAL=0, EQ_CAUTION=1, EQ_DEFENSIVE=2 };
 EqRegime g_eqRegime=EQ_NEUTRAL;
 double   g_riskMult=1.0;
+
+// --- Daily loss circuit breaker state
+double   g_dayStartBalance    = 0.0;
+double   g_sessionStartEquity = 0.0;
+datetime g_dayKey             = 0;      // date portion of today
+bool     g_dailyLossBreached  = false;
+bool     g_equityCBBreached   = false;
 
 // --- Dashboard
 string g_dashObjPrefix="MSPB_DASH_";
@@ -3464,6 +3479,54 @@ void EqRegime_Update()
    if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
    if(g_eqRegime==EQ_CAUTION) g_riskMult=0.7;
    if(g_eqRegime==EQ_DEFENSIVE) g_riskMult=0.4;
+   DailyLoss_Update();
+}
+
+// -----------------------------------------
+// Daily loss / equity circuit breaker update
+// -----------------------------------------
+void DailyLoss_Update()
+{
+   datetime now = TimeCurrent();
+   MqlDateTime dt; TimeToStruct(now, dt);
+   datetime todayKey = StringToTime(IntegerToString(dt.year)+"."+
+                       IntegerToString(dt.mon)+"."+IntegerToString(dt.day));
+
+   // Reset at day change
+   if(todayKey != g_dayKey)
+   {
+      g_dayKey             = todayKey;
+      g_dayStartBalance    = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_dailyLossBreached  = false;
+      g_sessionStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      g_equityCBBreached   = false;
+   }
+
+   if(InpDailyLoss_Enable && !g_dailyLossBreached)
+   {
+      double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double dayPnL = currentBalance - g_dayStartBalance;
+      double threshold = -MathAbs(InpDailyLoss_PctBalance / 100.0 * g_dayStartBalance);
+      if(dayPnL <= threshold)
+      {
+         g_dailyLossBreached = true;
+         Print("DAILY LOSS LIMIT BREACHED: dayPnL=", DoubleToString(dayPnL,2),
+               " threshold=", DoubleToString(threshold,2), " — new entries halted for today.");
+      }
+   }
+
+   if(InpEquityCB_Enable && !g_equityCBBreached)
+   {
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      double ddPct = (g_sessionStartEquity > 0.0) ?
+                     (g_sessionStartEquity - eq) / g_sessionStartEquity * 100.0 : 0.0;
+      if(ddPct >= InpEquityCB_Pct)
+      {
+         g_equityCBBreached = true;
+         Print("EQUITY CIRCUIT BREAKER TRIGGERED: DD=", DoubleToString(ddPct,2),
+               "% from session start — new entries halted.");
+      }
+   }
 }
 
 // -----------------------------------------
@@ -5810,6 +5873,9 @@ void ProcessSymbol(const int idx, const string sym)
       IncReject(idx, REJ_FAILSAFE);
       return;
    }
+
+   // Daily loss / equity circuit breaker
+   if(g_dailyLossBreached || g_equityCBBreached) return; // daily CB active
 
    // once-per-bar guard on entryTF
    if(!IsNewBar(idx, sym, InpEntryTF))
