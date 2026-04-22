@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    # Weekly WFO + Monte Carlo — every Wednesday at 02:00 UTC
+    - cron: "0 2 * * 3"
+  workflow_dispatch:
+
+jobs:
+  # ── 1. Python lint + tests ────────────────────────────────────────────────
+  test:
+    name: Lint & pytest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy pandas scipy
+
+      - name: Syntax check (contracts.py)
+        run: python -m py_compile contracts.py
+
+      - name: Run pytest
+        run: python -m pytest tools/test_tools.py -v --tb=short
+
+  # ── 2. Weekly WFO pipeline (cron + manual) ───────────────────────────────
+  wfo:
+    name: Walk-Forward Optimisation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy
+
+      - name: Run WFO pipeline (no live data — demo mode)
+        run: |
+          python - <<'EOF'
+          # Generate synthetic trade data for CI demo
+          import csv, os, random, math
+          random.seed(42)
+          os.makedirs("tools/wfo_results", exist_ok=True)
+          trades = []
+          for i in range(300):
+              side = random.choice(["BUY","SELL"])
+              profit = random.gauss(12, 40)
+              trades.append({
+                  "symbol": random.choice(["EURUSD","GBPUSD"]),
+                  "profit": round(profit, 2),
+                  "lots": 0.01,
+                  "sl_pips": 15,
+                  "r_risk": 15.0,
+                  "spread_pips": round(random.uniform(0.5, 2.0), 2),
+                  "entry_time": f"2023.{(i//25)+1:02d}.{(i%25)+1:02d} 09:00:00",
+                  "exit_time":  f"2023.{(i//25)+1:02d}.{(i%25)+1:02d} 09:45:00",
+              })
+          with open("ci_demo_trades.csv","w",newline="") as f:
+              w = csv.DictWriter(f, fieldnames=trades[0].keys(), delimiter=";")
+              w.writeheader(); w.writerows(trades)
+          EOF
+
+          python tools/wfo_pipeline.py ci_demo_trades.csv \
+            --windows 5 --oos-ratio 0.30 \
+            --out tools/wfo_results/wfo_ci.json || true
+
+      - name: Run Monte Carlo (demo mode)
+        run: |
+          python tools/monte_carlo_analysis.py ci_demo_trades.csv \
+            --iterations 500 \
+            --out tools/stress_results/mc_ci.json || true
+
+      - name: Upload WFO results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wfo-results
+          path: |
+            tools/wfo_results/
+            tools/stress_results/
+          retention-days: 30

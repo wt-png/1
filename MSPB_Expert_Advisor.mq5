@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v14.8: tighter entry quality filters, structure-aware SL/TP, safer trailing/time-stop exits, strict fixed-lot risk cap, and stronger anti-overtrading guards."
+#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v22.0: optimisation infrastructure — KPI framework, WFO pipeline, Monte Carlo, stress-test, session analysis, phased deployment + governance."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -6991,40 +6991,59 @@ double OnTester()
    if(!InpTester_UseCustomCriterion)
       return 0.0; // use built-in criterion
 
-   double trades = TesterStatistics(STAT_TRADES);
-   double pf     = TesterStatistics(STAT_PROFIT_FACTOR);
-   double net    = TesterStatistics(STAT_PROFIT);
-   double ddPct  = EquityDD_MaxPct();
+   double trades  = TesterStatistics(STAT_TRADES);
+   double pf      = TesterStatistics(STAT_PROFIT_FACTOR);
+   double net     = TesterStatistics(STAT_PROFIT);
+   double gross_p = TesterStatistics(STAT_GROSS_PROFIT);
+   double gross_l = MathAbs(TesterStatistics(STAT_GROSS_LOSS));
+   double ddPct   = EquityDD_MaxPct();
+   double sharpe  = TesterStatistics(STAT_SHARPE_RATIO);
 
-   if(trades<=0)
+   if(trades <= 0)
       return -1e9;
 
-   if(InpTester_DDCapPct>0.0 && ddPct > InpTester_DDCapPct)
+   // Hard reject: drawdown cap exceeded
+   if(InpTester_DDCapPct > 0.0 && ddPct > InpTester_DDCapPct)
       return -1e9;
 
-   // Cap extreme PF values (usually caused by too few trades)
+   // Hard reject: losing strategy — immediate hard penalty
+   if(net <= 0.0 || pf < 1.0)
+      return net - 1000000.0;
+
+   // Cap extreme PF values (too few trades inflate PF)
    if(pf > 10.0) pf = 10.0;
-   if(pf < 0.0)  pf = 0.0;
+
+   // Expectancy proxy: net profit per trade normalised to initial balance
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance <= 0.0) balance = 10000.0;
+   double exp_pct  = (trades > 0) ? (net / trades / balance * 100.0) : 0.0;
 
    // Trade-count penalty
    double tradeFactor = 1.0;
-   if(InpTester_MinTradesForFullScore>0)
+   if(InpTester_MinTradesForFullScore > 0)
    {
       tradeFactor = trades / (double)InpTester_MinTradesForFullScore;
-      if(tradeFactor > 1.0) tradeFactor = 1.0;
+      if(tradeFactor > 1.0)  tradeFactor = 1.0;
       if(tradeFactor < 0.05) tradeFactor = 0.05;
    }
 
-   // Drawdown factor
-   double ddFactor = 1.0 - ddPct/100.0;
+   // Drawdown factor — quadratic penalty for large DDs
+   double ddFactor = 1.0 - (ddPct / 100.0) * (ddPct / 100.0);
    if(ddFactor < 0.0) ddFactor = 0.0;
 
-   // Score: prefer NetProfit, reward PF, penalize DD + low trade count.
-   double score = net * (0.25 + pf) * ddFactor * tradeFactor;
+   // Sharpe bonus (capped; negative Sharpe penalises score)
+   double sharpeFactor = 1.0;
+   if(sharpe > 0.0)
+      sharpeFactor = 1.0 + MathMin(sharpe / 3.0, 0.5); // max +50 % bonus at Sharpe >= 3
+   else if(sharpe < 0.0)
+      sharpeFactor = MathMax(1.0 + sharpe / 2.0, 0.1);  // min 10 % at very negative Sharpe
 
-   // Hard penalize non-profitable runs
-   if(net <= 0.0)
-      score = net - 1000000.0;
+   // Recovery factor component: reward strategies that recover from DD quickly
+   double recov = (ddPct > 0.0) ? (net / (balance * ddPct / 100.0)) : 1.0;
+   recov = MathMin(MathMax(recov, 0.1), 5.0); // clamp to [0.1, 5.0]
+
+   // Final score: rewards net profit, PF, recovery, Sharpe; penalises DD + thin history
+   double score = net * (0.20 + pf) * ddFactor * tradeFactor * sharpeFactor * (0.5 + recov / 10.0);
 
    return score;
 }
