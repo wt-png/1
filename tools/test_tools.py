@@ -28,6 +28,7 @@ sys.path.insert(0, _TOOLS_DIR)
 
 from baseline_report import (
     _safe_div,
+    _profit_factor,
     _sharpe,
     _max_dd_pct,
     _cagr,
@@ -35,27 +36,36 @@ from baseline_report import (
     compute_kpis,
     _parse_dt,
     load_trades_from_csv,
+    _load_builtin,
+    _load_pandas,
+    _print_kpis,
     main as baseline_main,
 )
 from wfo_pipeline import (
     detect_regime,
     split_windows,
     run_wfo,
+    main as wfo_main,
 )
 from monte_carlo_analysis import (
     run_monte_carlo,
     _percentile,
+    main as mc_main,
 )
 from stress_test import (
     apply_stress,
     run_stress_test,
     _label,
+    main as stress_main,
 )
 from session_analysis import (
     _session_name,
     _weekday_name,
     classify_trades,
+    classify_by_weekday,
+    _session_summary,
     run_session_analysis,
+    main as session_main,
 )
 
 
@@ -175,6 +185,29 @@ class TestComputeKpis:
         kpis = compute_kpis(trades)
         assert kpis["avg_hold_min"] >= 0
 
+    def test_expectancy_zero_when_no_valid_risk(self):
+        trades = [_make_trade(10.0, r_risk=0.0), _make_trade(-5.0, r_risk=0.0)]
+        kpis = compute_kpis(trades)
+        assert kpis["net_expectancy_R"] == 0.0
+
+    def test_years_fallback_single_exit(self):
+        trades = [_make_trade(10.0, entry_time="2023.01.02 10:00:00", exit_time="2023.01.02 10:10:00")]
+        kpis = compute_kpis(trades)
+        assert "cagr_pct" in kpis
+
+
+class TestProfitFactorAndCagr:
+    def test_profit_factor_all_winners(self):
+        assert _profit_factor(100.0, 0.0) == 100.0
+
+    def test_profit_factor_zero_when_no_profit_no_loss(self):
+        assert _profit_factor(0.0, 0.0) == 0.0
+
+    def test_cagr_invalid_inputs(self):
+        assert _cagr(0.0, 10_000.0, 1.0) == 0.0
+        assert _cagr(10_000.0, 0.0, 1.0) == 0.0
+        assert _cagr(10_000.0, 11_000.0, 0.0) == 0.0
+
 
 class TestParseDt:
     def test_mql5_format(self):
@@ -191,6 +224,64 @@ class TestParseDt:
 
     def test_invalid_string(self):
         assert _parse_dt("not-a-date") is None
+
+    def test_datetime_passthrough(self):
+        dt = datetime(2024, 1, 1, 12, 0, 0)
+        assert _parse_dt(dt) == dt
+
+
+class TestCsvLoaders:
+    def test_load_builtin_skips_invalid_rows(self, tmp_path):
+        csv_path = tmp_path / "builtin.csv"
+        csv_path.write_text(
+            "profit;r_risk;entry_time\n"
+            "10;5;2023.01.01 10:00:00\n"
+            "oops;5;2023.01.01 11:00:00\n"
+            "20;7\n",
+            encoding="utf-8",
+        )
+        rows = _load_builtin(str(csv_path))
+        assert len(rows) == 1
+        assert rows[0]["profit"] == 10.0
+        assert rows[0]["r_risk"] == 5.0
+
+    def test_load_pandas_raises_without_profit(self, tmp_path):
+        csv_path = tmp_path / "missing_profit.csv"
+        csv_path.write_text("r_risk;lots\n10;0.01\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            _load_pandas(str(csv_path))
+
+    def test_load_pandas_derives_risk(self, tmp_path):
+        csv_path = tmp_path / "derive_rrisk.csv"
+        csv_path.write_text("profit;lots;sl_pips\n10;0.02;15\n-5;0.01;20\n", encoding="utf-8")
+        rows = _load_pandas(str(csv_path))
+        assert len(rows) == 2
+        assert rows[0]["r_risk"] == pytest.approx(3.0)
+        assert rows[1]["r_risk"] == pytest.approx(2.0)
+
+    def test_load_trades_uses_builtin_when_pandas_disabled(self, tmp_path, monkeypatch):
+        import baseline_report as br
+
+        csv_path = tmp_path / "fallback.csv"
+        csv_path.write_text("profit;r_risk\n1;1\n", encoding="utf-8")
+        monkeypatch.setattr(br, "_HAS_PANDAS", False)
+        rows = load_trades_from_csv(str(csv_path))
+        assert len(rows) == 1
+
+    def test_print_kpis_smoke(self, capsys):
+        _print_kpis({"a": 1, "b": 2})
+        out = capsys.readouterr().out
+        assert "MSPB Baseline KPI Snapshot" in out
+
+
+class TestBaselineMain:
+    def test_baseline_main_success(self, tmp_path):
+        csv_path = tmp_path / "ok.csv"
+        out_path = tmp_path / "kpis.json"
+        _write_csv(_mixed_trades(4, 2), str(csv_path))
+        rc = baseline_main([str(csv_path), "--out", str(out_path)])
+        assert rc == 0
+        assert out_path.exists()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -211,6 +302,10 @@ class TestDetectRegime:
     def test_few_trades_default(self):
         assert detect_regime([]) == "range"
         assert detect_regime([_make_trade(10.0)]) == "range"
+
+    def test_volatile_regime(self):
+        trades = [_make_trade(200.0)] * 4 + [_make_trade(-150.0)] * 6
+        assert detect_regime(trades) == "volatile"
 
 
 class TestSplitWindows:
@@ -233,6 +328,25 @@ class TestSplitWindows:
         is_t, oos_t = windows[0]
         total = len(is_t) + len(oos_t)
         assert total <= 100
+
+    def test_all_windows_filtered_then_fallback(self):
+        trades = [_make_trade(1.0)] * 20
+        windows = split_windows(trades, n_windows=5, oos_ratio=1.0)
+        assert len(windows) == 1
+
+
+class TestWfoMain:
+    def test_missing_csv(self, tmp_path):
+        rc = wfo_main([str(tmp_path / "missing.csv"), "--out", str(tmp_path / "wfo.json")])
+        assert rc == 1
+
+    def test_success_path_writes_output(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "wfo.json"
+        _write_csv(_winning_trades(40), str(csv_path))
+        rc = wfo_main([str(csv_path), "--windows", "3", "--oos-ratio", "0.3", "--out", str(out_path)])
+        assert rc in (0, 2)
+        assert out_path.exists()
 
 
 class TestRunWFO:
@@ -289,6 +403,25 @@ class TestRunMonteCarlo:
         result = run_monte_carlo(trades, iterations=50, seed=7)
         for key in ("p5", "p25", "p50", "p75", "p95"):
             assert key in result["mc_pf_distribution"]
+
+    def test_zero_iterations_still_returns_structure(self):
+        result = run_monte_carlo(_mixed_trades(5, 5), iterations=0, seed=7)
+        assert result["iterations"] == 0
+        assert result["real_pf_percentile"] == 50.0
+
+
+class TestMonteCarloMain:
+    def test_missing_csv(self, tmp_path):
+        rc = mc_main([str(tmp_path / "missing.csv"), "--out", str(tmp_path / "mc.json")])
+        assert rc == 1
+
+    def test_success_path_writes_output(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "mc.json"
+        _write_csv(_mixed_trades(20, 10), str(csv_path))
+        rc = mc_main([str(csv_path), "--iterations", "20", "--out", str(out_path)])
+        assert rc in (0, 2)
+        assert out_path.exists()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -347,6 +480,34 @@ class TestRunStressTest:
         assert "scenarios" in result
         assert "verdict" in result
 
+    def test_fail_path_sets_all_passed_false(self):
+        trades = _losing_trades(20)
+        result = run_stress_test(trades, [(1.0, 0.0)])
+        assert result["all_passed"] is False
+        assert result["verdict"] == "FAIL"
+
+
+class TestStressMain:
+    def test_mismatch_lengths(self, tmp_path):
+        rc = stress_main([
+            str(tmp_path / "missing.csv"),
+            "--multipliers", "1.0", "1.4",
+            "--slippage", "0.0",
+        ])
+        assert rc == 1
+
+    def test_missing_csv(self, tmp_path):
+        rc = stress_main([str(tmp_path / "missing.csv"), "--out", str(tmp_path / "stress.json")])
+        assert rc == 1
+
+    def test_success_path_writes_output(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "stress.json"
+        _write_csv(_mixed_trades(20, 10), str(csv_path))
+        rc = stress_main([str(csv_path), "--out", str(out_path)])
+        assert rc in (0, 2)
+        assert out_path.exists()
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # session_analysis tests
@@ -367,6 +528,9 @@ class TestSessionName:
 
     def test_overlap(self):
         assert _session_name(13) == "Overlap"
+
+    def test_unknown(self):
+        assert _session_name(24) == "Unknown"
 
 
 class TestWeekdayName:
@@ -393,6 +557,30 @@ class TestClassifyTrades:
         grouped = classify_trades(trades, gmt_offset_hours=0)
         assert len(grouped["Unknown"]) == 1
 
+    def test_invalid_entry_time(self):
+        trades = [{"profit": 5.0, "entry_time": "not-a-date"}]
+        grouped = classify_trades(trades, gmt_offset_hours=0)
+        assert len(grouped["Unknown"]) == 1
+
+
+class TestClassifyByWeekday:
+    def test_skips_missing_or_invalid_entry_time(self):
+        trades = [
+            _make_trade(1.0, entry_time="2023.01.02 08:00:00"),
+            {"profit": 2.0},
+            {"profit": 3.0, "entry_time": "invalid"},
+        ]
+        grouped = classify_by_weekday(trades, gmt_offset_hours=0)
+        assert grouped["Monday"][0]["profit"] == 1.0
+        assert len(grouped) == 1
+
+
+class TestSessionSummary:
+    def test_reduce_risk_recommendation(self):
+        trades = [_make_trade(50.0)] * 3 + [_make_trade(-10.0)] * 7
+        summary = _session_summary("London", trades, 10_000.0)
+        assert summary["recommendation"] == "REDUCE_RISK"
+
 
 class TestRunSessionAnalysis:
     def test_basic_structure(self):
@@ -415,6 +603,20 @@ class TestRunSessionAnalysis:
         result = run_session_analysis(trades)
         for s in result["sessions"]:
             assert s["recommendation"] in ("KEEP", "REDUCE_RISK", "BLOCK_ENTRIES", "NO_DATA")
+
+
+class TestSessionMain:
+    def test_missing_csv(self, tmp_path):
+        rc = session_main([str(tmp_path / "missing.csv"), "--out", str(tmp_path / "session.json")])
+        assert rc == 1
+
+    def test_success_path_writes_output(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "session.json"
+        _write_csv(_mixed_trades(20, 10), str(csv_path))
+        rc = session_main([str(csv_path), "--gmt-offset", "0", "--out", str(out_path)])
+        assert rc == 0
+        assert out_path.exists()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
