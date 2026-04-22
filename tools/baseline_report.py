@@ -248,6 +248,9 @@ def _load_builtin(path: str) -> List[Dict[str, Any]]:
             try:
                 row["profit"] = float(row.get("profit", 0) or 0)
                 row["r_risk"] = float(row.get("r_risk", 0) or 0)
+                for _num_col in ("lots", "sl_pips", "slippage_pts", "spread_pips"):
+                    if _num_col in row and row[_num_col] != "":
+                        row[_num_col] = float(row[_num_col])
             except ValueError:
                 continue
             trades.append(row)

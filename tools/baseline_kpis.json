@@ -1,0 +1,14 @@
+{
+  "total_trades": 40,
+  "win_rate_pct": 55.0,
+  "profit_factor": 2.114,
+  "net_profit_usd": 311.0,
+  "net_expectancy_R": 0.0,
+  "max_equity_dd_pct": 0.32,
+  "sharpe_ratio": 19.378,
+  "calmar_ratio": 147.023,
+  "cagr_pct": 47.07,
+  "avg_hold_min": 111.2,
+  "avg_slippage_pts": 0.36,
+  "recovery_factor": 9.71
+}
