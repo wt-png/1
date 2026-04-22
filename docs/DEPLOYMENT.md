@@ -1,4 +1,4 @@
-# Staged Production Rollout Protocol — MSPB Expert Advisor v21.0
+# Staged Production Rollout Protocol — MSPB Expert Advisor
 
 ---
 
