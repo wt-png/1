@@ -3529,7 +3529,7 @@ void DailyLoss_Update()
 
    double eq        = AccountInfoDouble(ACCOUNT_EQUITY);
    double pnl       = eq - g_dailyLossStartBal;           // negative = daily loss
-   double threshold = -(MathAbs(InpDailyLoss_PctBalance) / 100.0 * g_dailyLossStartBal);
+   double threshold = -(InpDailyLoss_PctBalance / 100.0 * g_dailyLossStartBal);
 
    if(pnl <= threshold)
    {
