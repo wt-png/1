@@ -5806,7 +5806,7 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    //   met de trend (het signaal). FollowThrough eiste bar[2] IN dezelfde richting als bar[1],
    //   wat alleen opeenvolgende same-direction bars toeliet — géén pullback-patroon.
    // Resultaat: de slechtste setups werden geselecteerd (prijs al in trend-richting, kort
-   //   EMA-tik), de beste gereject (klassieke pullback + keercande l). Win-rate: 5.56%.
+   //   EMA-tik), de beste gereject (klassieke pullback + keercandle). Win-rate: 5.56%.
    // De EMA-close-bevestiging (Step 6) + close-in-range + wick-filter voorkomen al spikes;
    //   FollowThrough is hier overbodig en schadelijk. InpEntryUseFollowThrough blijft
    //   actief voor Setup1 waar het wél zinvol is.
