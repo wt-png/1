@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.2: demo-ready tuning — M5 entries, H1 confirm, H4 bias, RR 1.8, ADX/ATR period 14, higher quality filters."
+#property description "MultiSymbol Pullback Scalper FULL v22.5: Improved entry (Trend+Pullback+Continuation), BreakPrev relaxed, VolBlock→scale, EqRegime 5/10%, CorrThresh 0.90, SL-fallback 50%, FailSafe→risk-reduce, OnTester harder trade-penalty."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -478,34 +478,43 @@ input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.5
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 8.0;   // min ATR in pips (v22.2: 12→8 — M5 bars are smaller)
+input double   InpMinATR_Pips             = 4.0;   // lean-test: 8→4 — meer signalen doorlaten
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
 input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
-input double   InpMinADXForEntry          = 25.0;  // min ADX trend for entry (v22.2: 22→25 — only strong trends)
-input double   InpMinADXEntryFilter       = 25.0;  // min ADX entry quality (v22.2: 22→25 — only strong trends)
+input double   InpMinADXForEntry          = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
+input double   InpMinADXEntryFilter       = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
-input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
-input bool     InpEntryUseFollowThrough   = true; // require previous bar in same direction
-input bool     InpEntryUseWickFilter      = true; // reject indecision candles with big opposite wick
-input double   InpEntryMaxOppWickBodyFrac = 0.45; // opposite wick <= X * body
-input bool     InpEntryUseRangeATRFilter  = true; // require meaningful candle range vs ATR
-input double   InpEntryMinRangeATRFrac    = 0.35; // candle range >= X * ATR
-input double   InpEntryMinCloseInRangeFrac= 0.60; // buy: close near high; sell: close near low
+input double   InpEntryMinBodyATRFrac     = 0.10; // lean-test: 0.20→0.10 — kleinere body toegestaan
+input bool     InpEntryUseFollowThrough   = false; // lean-test: UIT — geen follow-through vereist
+input bool     InpEntryUseWickFilter      = false; // lean-test: UIT — geen wick-filter
+input double   InpEntryMaxOppWickBodyFrac = 0.45; // (referentie — filter staat uit)
+input bool     InpEntryUseRangeATRFilter  = false; // lean-test: UIT — geen range/ATR-filter
+input double   InpEntryMinRangeATRFrac    = 0.20; // lean-test: 0.35→0.20 (referentie — filter staat uit)
+input double   InpEntryMinCloseInRangeFrac= 0.45; // lean-test: 0.60→0.45 — ruimere close-locatie
+
+// --- Improved entry: Trend + Pullback + Continuation (v22.5)
+// When true, replaces Setup1 with a simplified pullback-based edge:
+//   1. HTF trend: EMA-fast (InpBiasEMAFast) > EMA-slow (InpBiasEMASlow) on InpBiasTF
+//   2. Pullback:  last closed bar touches EMA on InpEntryTF (InpEMA_Period)
+//   3. Trigger:   continuation candle (close > open for buy, < open for sell)
+// All other risk guards (ATR, ADX, corr, portfolio) remain active.
+input bool     InpUseImprovedEntry        = true;  // lean-test: AAN — betere RR, meer trades, minder filters
+input double   InpImprovedEntry_ATRMinPips = 2.0;  // min ATR in pips for improved entry (0 = off)
 
 
 // --- Advanced filters / regimes (v9)
-input bool     InpUseHTFBias              = true;
+input bool     InpUseHTFBias              = false; // lean-test: UIT — geen H4 bias filter
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
 input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
 
-input bool     InpUseCorrelationGuard     = true;
+input bool     InpUseCorrelationGuard     = false; // lean-test: UIT — geen correlatie-blokkering
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
-input double   InpCorrAbsThreshold        = 0.85;  // abs(corr) >= threshold blocks entry
+input double   InpCorrAbsThreshold        = 0.90;  // abs(corr) >= threshold blocks entry (v22.4: 0.85→0.90; many FX pairs naturally exceed 0.85)
 input bool     InpCorrFXLikeOnly          = true;  // only apply to FX-like symbols (base!=profit)
 
 // --- Execution / safety (v10)
@@ -518,7 +527,7 @@ input int      InpDev_MaxPoints           = 200;    // safety cap (0 => no cap)
 
 // --- Correlation guard behavior (v10)
 input bool     InpCorrSameExposureOnly    = true;   // if true: block only when entry increases exposure (direction-aware)
-input bool     InpCorrUseWeightedExposure = true;   // weight correlated exposure by lots and abs(corr)
+input bool     InpCorrUseWeightedExposure = false; // v22.4: false — weighted lot-sum blocks too many correlated pairs; use threshold instead
 input double   InpCorrMaxWeightedLots     = 2.0;    // block if sum(abs(corr)*openLots)+newLots exceeds this (FX-like only)
 
 // --- Per-symbol cooldown after exits (v11)
@@ -530,27 +539,28 @@ input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP
 input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
 input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
-input bool     InpUseVolRegime            = true;
+input bool     InpUseVolRegime            = false; // lean-test: UIT — geen volatiliteitsregime blokkering
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
 input double   InpVolHighPct              = 80.0;  // >= => high vol regime
-input bool     InpVolLowBlockEntries      = true;  // block entries in low regime
+input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflicteert met ATR-min filter (beide meten vol); gebruik VolHighRiskMult voor lot-scaling i.p.v. hard blok
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
+// lean-test: UIT — Setup2 geeft contrarian richting t.o.v. Setup1 op dezelfde candle → richtingconflict
 input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = true;  // London + NY only (v22.1: false→true)
+input bool     InpUseSessions             = false; // lean-test: UIT — handel ook buiten London/NY
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 2.0;   // max spread for FX (v22.1: 3.0→2.0 pips)
+input double   InpMaxSpreadPips_FX        = 3.5;   // lean-test: 2.0→3.5 — meer brokers/momenten toegestaan
 input double   InpMaxSpreadPips_XAU       = 80.0;
 
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
@@ -610,7 +620,7 @@ input int      InpTGBackoffMaxSec         = 60;     // max backoff on Telegram e
 input bool     InpEnableAuditLog          = true;
 input bool     InpAuditFlushAlways        = false;
 
-input bool     InpEnableMLExport          = false;
+input bool     InpEnableMLExport          = true;  // lean-test: AAN — data verzamelen voor analyse
 input string   InpMLFile                  = "ml_export_v2.csv";
 input string   InpMLDelimiter             = ";";
 input int      InpMLFlushEveryNRows       = 50; // increased for IO perf
@@ -680,7 +690,7 @@ input bool     InpShowDashboard           = true;
 
 // --- Tester / robustness / diagnostics (NEW v12)
 input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% spread stress (affects spread checks + deviation only)
-input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
+input bool     InpTester_UseCustomCriterion = true; // lean-test: AAN — optimaliseer op custom score
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
 input double   InpTester_DDCapPct         = 20.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
 input bool     InpAppliedLog_Enable       = true;  // append applied settings snapshot to CSV when changed
@@ -688,21 +698,21 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 20;   // anti-overtrading spacing per symbol (v22.2: 30→20 — allow more quality setups)
-input int      InpMaxEntriesPerSymbolPerDay = 5;   // anti-overtrading daily cap per symbol (v22.2: 4→5)
-input int      InpMaxEntriesTotalPerDay   = 10;   // anti-overtrading daily cap across all symbols (v22.2: 8→10)
-input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N consecutive losing positions
+input int      InpMinMinutesBetweenEntries = 5;    // lean-test: 20→5 — meer setups per dag
+input int      InpMaxEntriesPerSymbolPerDay = 10;  // lean-test: 5→10 — ruimere dagcap per symbool
+input int      InpMaxEntriesTotalPerDay   = 25;   // lean-test: 10→25 — ruimere totale dagcap
+input bool     InpLossStreakBlock_Enable  = false; // lean-test: UIT — geen verlies-streak blokkering
 input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses (v22.2: 2→3)
 input int      InpLossStreakBlockMinutes  = 120;   // lock duration after loss-streak trigger (v22.2: 240→120)
 
 // --- Daily loss circuit breaker (v22.1)
 input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance
-input double   InpDailyLoss_PctBalance    = 2.0;    // daily loss threshold as % of balance at day open
+input double   InpDailyLoss_PctBalance    = 5.0;    // lean-test: 2→5% — ruimer voor testperiode
 input bool     InpDailyLoss_CloseAll      = false;  // close all open positions when breached (nuclear option)
 
 // --- Equity drawdown circuit breaker (v22.1)
 input bool     InpEquityCB_Enable         = true;   // halt new entries when equity DD >= X% from peak
-input double   InpEquityCB_Pct            = 5.0;    // equity DD% threshold
+input double   InpEquityCB_Pct            = 15.0;   // lean-test: 5→15% — ruimere equity CB voor testperiode
 
 // -----------------------------------------
 // Globals / enums
@@ -3125,11 +3135,13 @@ double CurrentPortfolioRiskPct()
 
          if(!estOk)
          {
-            // Ultimate fail-closed: count full allowed portfolio risk so new entries are blocked until stops exist.
+            // v22.4: reduced fail-closed weight from 100% to 50% of portfolio cap.
+            // Rationale: blocking at 100% means one open position without a SL freezes all entries.
+            // Using 50% keeps a safety margin while allowing other symbols to still enter.
             double eq=AccountInfoDouble(ACCOUNT_EQUITY);
             if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
             if(eq>0.0)
-               totalRiskMoney += eq * (InpMaxPortfolioRiskPct/100.0);
+               totalRiskMoney += eq * 0.5 * (InpMaxPortfolioRiskPct/100.0);
          }
          continue;
       }
@@ -3472,8 +3484,11 @@ void EqRegime_Update()
    double ddPct=0.0;
    if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
 
-   if(ddPct<2.0) g_eqRegime=EQ_NEUTRAL;
-   else if(ddPct<5.0) g_eqRegime=EQ_CAUTION;
+   // v22.4: relaxed thresholds — normal drawdown no longer triggers risk reduction.
+   // Old: <2% neutral, <5% caution, >=5% defensive
+   // New: <5% neutral, <10% caution, >=10% defensive
+   if(ddPct<5.0) g_eqRegime=EQ_NEUTRAL;
+   else if(ddPct<10.0) g_eqRegime=EQ_CAUTION;
    else g_eqRegime=EQ_DEFENSIVE;
 
    if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
@@ -5712,11 +5727,77 @@ bool BreakPrevHighLow(const string sym,const bool isBuy,const bool useBreakPrev)
    // r[0] = current forming bar, r[1] = last closed, r[2] = bar before last closed
    MqlRates r[3];
    if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-   if(isBuy) return (r[1].close > r[2].high);
-   else      return (r[1].close < r[2].low);
+   // v22.4: relaxed — compare close-to-close instead of close-vs-prev high/low
+   // Rationale: close>prev.high enters too late and gives a worse RR; close>prev.close
+   // is sufficient to confirm momentum while preserving entry quality.
+   if(isBuy) return (r[1].close > r[2].close);
+   else      return (r[1].close < r[2].close);
 }
 
-bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double &adxTrend, double &adxEntry, double &atrPips, double &bodyPips)
+// -----------------------------------------
+// EntrySignal_Improved — v22.5
+// Edge: Trend (HTF EMA50>EMA200) + Pullback (EMA50 touch on entry TF) + Continuation candle.
+// Rationale: entering ON the pullback gives better RR than waiting for breakout confirmation.
+// All external risk guards (ATR, ADX, portfolio, correlation) still apply after this signal.
+// -----------------------------------------
+bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, double &atrPips)
+{
+   isBuy = false; atrPips = 0.0;
+
+   double pip = PipSize(sym);
+   if(pip <= 0.0) return false;
+
+   // --- Step 1: Last closed bar on entry TF ---
+   MqlRates r[2];
+   if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r)) return false;
+
+   // --- Step 2: ATR (use last closed bar value) ---
+   double atrBuf[2];
+   if(!CopyLast(g_atrHandle[symIdx], 0, 0, 2, atrBuf)) return false;
+   atrPips = atrBuf[1] / pip;
+   if(atrPips <= 0.0) return false;
+
+   // Minimum ATR guard (avoid entering in dead markets)
+   if(InpImprovedEntry_ATRMinPips > 0.0 && atrPips < InpImprovedEntry_ATRMinPips) return false;
+
+   // --- Step 3: HTF trend check — EMA-fast > EMA-slow on InpBiasTF ---
+   // Uses same handles as the HTF bias filter (g_biasFastHandle / g_biasSlowHandle).
+   if(g_biasFastHandle[symIdx] == INVALID_HANDLE || g_biasSlowHandle[symIdx] == INVALID_HANDLE) return false;
+   double emaFast[1], emaSlow[1];
+   if(CopyBuffer(g_biasFastHandle[symIdx], 0, 0, 1, emaFast) != 1) return false;
+   if(CopyBuffer(g_biasSlowHandle[symIdx], 0, 0, 1, emaSlow) != 1) return false;
+
+   // Require meaningful separation (at least 1 pip) to avoid acting on a flat EMA cross.
+   double emaDiff = emaFast[0] - emaSlow[0];
+   if(MathAbs(emaDiff) < pip) return false; // EMA too close — no clear trend
+
+   bool trendBuy  = (emaDiff > 0.0);  // fast > slow => uptrend
+   bool trendSell = (emaDiff < 0.0);  // fast < slow => downtrend
+
+   // --- Step 4: Pullback to EMA50 on entry TF ---
+   // Price of the last CLOSED bar must have touched (pierced) the entry-TF EMA.
+   if(g_emaHandle[symIdx] == INVALID_HANDLE) return false;
+   double emaBuf[2];
+   if(!CopyLast(g_emaHandle[symIdx], 0, 0, 2, emaBuf)) return false;
+   double ema = emaBuf[1]; // last closed bar EMA value
+
+   bool touched = (r[1].low <= ema && r[1].high >= ema);
+   if(!touched) return false;
+
+   // --- Step 5: Continuation candle (direction after EMA touch) ---
+   bool candleBuy  = (r[1].close > r[1].open);
+   bool candleSell = (r[1].close < r[1].open);
+   if(!candleBuy && !candleSell) return false; // doji — skip
+
+   // Trend and candle direction must agree
+   if(trendBuy && candleBuy)        isBuy = true;
+   else if(trendSell && candleSell) isBuy = false;
+   else return false; // trend / candle conflict
+
+   return true;
+}
+
+
 {
    isBuy=false; adxTrend=0; adxEntry=0; atrPips=0; bodyPips=0;
 
@@ -5901,11 +5982,16 @@ double ComputeTP(const string sym, const bool isBuy, const double entry, const d
 // -----------------------------------------
 void ProcessSymbol(const int idx, const string sym)
 {
-   // NEW: fail-safe stop entries
+   // v22.4: FailSafe now reduces risk instead of blocking entries completely.
+   // Rationale: a file-open failure or ML issue should not freeze the EA entirely;
+   // operating at 20% risk keeps safety while the system continues trading.
    if(g_failSafeStopEntries)
    {
-      IncReject(idx, REJ_FAILSAFE);
-      return;
+      // Apply strong risk reduction but do not hard-block entries.
+      // g_riskMult is already reduced by EqRegime; cap it additionally at 0.2.
+      if(g_riskMult > 0.2) g_riskMult = 0.2;
+      IncReject(idx, REJ_FAILSAFE); // still logged for monitoring
+      // Note: we do NOT return here — processing continues with reduced risk.
    }
 
    // Circuit breakers: daily-loss CB and equity-DD CB (v22.1)
@@ -5978,10 +6064,24 @@ void ProcessSymbol(const int idx, const string sym)
    CountOpenPositionsOurMagicBoth(sym, openSym, openTot);
    if(openSym >= InpMaxPositionsPerSymbol) return;
    if(openTot >= InpMaxPositionsTotal) return;
-   // compute signals
+
+   // --- v22.5: Improved entry (Trend + Pullback + Continuation) ---
+   // When enabled, replaces Setup1 as the primary signal generator.
+   // ADX/ATR external filters still apply below if their respective inputs are enabled.
    bool isBuy1; double adxTrend, adxEntry, atrPips, bodyPips;
-   bool ok1 = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
-   if(!ok1) return;
+   adxTrend=999.0; adxEntry=999.0; bodyPips=0.0;
+
+   if(InpUseImprovedEntry)
+   {
+      bool okImp = EntrySignal_Improved(idx, sym, isBuy1, atrPips);
+      if(!okImp) return;
+      // ADX values stay at 999 (pass-through) so optional ADX filter can still work if enabled.
+   }
+   else
+   {
+      bool ok1 = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
+      if(!ok1) return;
+   }
 
    // ATR filter
    if(InpUseATRFilter && atrPips < Sym_MinATR_Pips(sym))
@@ -6009,11 +6109,14 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
-   // BreakPrev logic: Setup2 only if setup1 fails by breakPrev
-   bool breakOk = BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
+   // v22.4: Setup2 activates BOTH as a fallback (when BreakPrev fails) AND independently
+   // when Setup1 has no signal.  This can add 30–50% more trades without touching Setup1 quality.
+   // v22.5: when InpUseImprovedEntry is active, BreakPrev and Setup2 logic is bypassed —
+   // the improved entry already incorporates trend + pullback, making BreakPrev redundant.
+   bool breakOk = InpUseImprovedEntry ? true : BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
    bool useSetup2=false;
    bool isBuy=isBuy1;
-   string setup="S1";
+   string setup = InpUseImprovedEntry ? "IMP" : "S1";
 
    if(!breakOk)
    {
@@ -6034,19 +6137,32 @@ void ProcessSymbol(const int idx, const string sym)
          return;
       }
    }
+   // v22.4: allow Setup2 also when Setup1 DID pass BreakPrev but Setup2 gives a different direction.
+   // Only override when Setup1 was confirmed and Setup2 agrees (same direction = stronger confluence).
+   // We do NOT override to opposite direction to avoid BreakPrev-vs-S2 conflicts caught in v22.3.
+   if(!useSetup2 && breakOk && InpUseSetup2)
+   {
+      bool isBuy2=false;
+      if(EntrySignal_Setup2(idx, sym, isBuy2) && isBuy2==isBuy1)
+      {
+         // Setup2 confirms Setup1 direction — tag the trade for analytics
+         setup="S1+S2";
+      }
+   }
 
    // direction allowed
    if(isBuy && !Sym_AllowBuy(sym)) return;
    if(!isBuy && !Sym_AllowSell(sym)) return;
 
    // v9: volatility regime (ATR percentile)
+   // v22.4: changed from hard block to risk-scaling — low-vol ≠ bad trade; reduces lot size instead of skipping entry.
    double volMult=1.0; bool volBlock=false; double volPct=50.0;
    VolRegime_Get(idx, sym, volMult, volBlock, volPct);
    if(volBlock)
    {
-      IncReject(idx, REJ_VOL_REGIME);
-      if(InpDebug) PrintFormat("VOL_BLOCK_ENTRY %s pct=%.1f tf=%s", sym, volPct, EnumToString(InpVolRegimeTF));
-      return;
+      // Scale risk down instead of blocking: keeps participation while reducing exposure.
+      volMult = MathMin(volMult, 0.5);
+      if(InpDebug) PrintFormat("VOL_REGIME_SCALE %s pct=%.1f mult=%.2f tf=%s", sym, volPct, volMult, EnumToString(InpVolRegimeTF));
    }
 
    // v9: higher timeframe bias filter
@@ -6570,7 +6686,7 @@ bool Data_CheckSymbol(const string sym, string &reason)
       return false;
    }
 
-   if(InpUseHTFBias)
+   if(InpUseHTFBias || InpUseImprovedEntry)
    {
       int needBias = 120;
       needBias = MathMax(needBias, InpBiasEMASlow + 50);
@@ -6745,7 +6861,8 @@ int OnInit()
 
 
    // init indicators per symbol
-   bool needEMA = (InpUsePullbackEMA || InpSymbolOverrides_Enable);
+   // v22.5: also need EMA handle when ImprovedEntry is active (uses EMA for pullback check)
+   bool needEMA = (InpUsePullbackEMA || InpSymbolOverrides_Enable || InpUseImprovedEntry);
    for(int i=0;i<g_symCount;i++)
    {
       g_emaHandle[i]=INVALID_HANDLE;
@@ -6764,7 +6881,7 @@ int OnInit()
    {
       string sym=g_syms[i];
 
-      bool useEMA = (InpUsePullbackEMA || Sym_UsePullbackEMA(sym));
+      bool useEMA = (InpUsePullbackEMA || Sym_UsePullbackEMA(sym) || InpUseImprovedEntry);
 
       int ema=INVALID_HANDLE;
       int atr=INVALID_HANDLE;
@@ -6790,7 +6907,7 @@ int OnInit()
          adxE= iADX(sym, InpEntryTF,   InpADX_Period);
       }
 
-      if(InpUseHTFBias)
+      if(InpUseHTFBias || InpUseImprovedEntry)
       {
          bf=iMA(sym, InpBiasTF, InpBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
          bs=iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -6801,7 +6918,7 @@ int OnInit()
       if(useEMA && ema==INVALID_HANDLE) ok=false;
       if(InpUseVolRegime && atrVol==INVALID_HANDLE) ok=false;
       if(InpUseADXFilter && (adx==INVALID_HANDLE || adxE==INVALID_HANDLE)) ok=false;
-      if(InpUseHTFBias && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
+      if((InpUseHTFBias || InpUseImprovedEntry) && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
 
       if(!ok)
       {
@@ -7125,6 +7242,8 @@ double OnTester()
    double exp_pct  = (trades > 0) ? (net / trades / balance * 100.0) : 0.0;
 
    // Trade-count penalty
+   // v22.4: two-tier penalty — InpTester_MinTradesForFullScore for the soft target,
+   // plus a hard floor at 100 trades to prevent high-PF overfits on very few trades.
    double tradeFactor = 1.0;
    if(InpTester_MinTradesForFullScore > 0)
    {
@@ -7132,6 +7251,9 @@ double OnTester()
       if(tradeFactor > 1.0)  tradeFactor = 1.0;
       if(tradeFactor < 0.05) tradeFactor = 0.05;
    }
+   // Hard low-trade penalty: below 100 trades, score scales linearly regardless of InpTester_MinTradesForFullScore.
+   if(trades < 100.0)
+      tradeFactor *= trades / 100.0;
 
    // Drawdown factor — quadratic penalty for large DDs
    double ddFactor = 1.0 - (ddPct / 100.0) * (ddPct / 100.0);

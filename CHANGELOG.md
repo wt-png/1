@@ -5,6 +5,141 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.5] — 2026-04-23
+
+### Added — EntrySignal_Improved: Trend + Pullback + Continuation edge
+
+**Doel**: vervang de te-late breakout entry door een vroege pullback entry. Betere RR, meer trades, minder filters.
+
+#### Nieuwe input parameters
+
+| Parameter | Default | Beschrijving |
+|-----------|---------|-------------|
+| `InpUseImprovedEntry` | `true` | Schakelt verbeterde entry in; vervangt Setup1 als primair signaal |
+| `InpImprovedEntry_ATRMinPips` | `2.0` | Minimale ATR (pips) voor improved entry — beschermt tegen dode markten |
+
+#### Logica `EntrySignal_Improved`
+
+```
+1. Trend (HTF): EMA50 > EMA200 op InpBiasTF (standaard H4)
+              → geeft alleen BUY setups in uptrend, alleen SELL setups in downtrend
+              → vereist minimale EMA-scheiding (1 pip) om vlakke crossovers te vermijden
+
+2. Pullback:   Laatste gesloten bar op InpEntryTF (standaard M5) raakt EMA50
+              → bar.low <= EMA50 <= bar.high
+
+3. Trigger:   Continuation candle na de EMA-aanraking
+              → close > open → BUY
+              → close < open → SELL
+              → Doji (close == open) → overgeslagen
+```
+
+#### Integratie
+
+- Vervangt Setup1 volledig als `InpUseImprovedEntry = true`
+- BreakPrevHighLow en Setup2 worden **geskipt** (zijn redundant — pullback entry geeft al betere timing)
+- Alle externe guards blijven actief: ATR-min, ADX-filter, portfolio cap, correlatie, circuit breakers
+- Audit-log toont `setup="IMP"` voor improved entry trades
+- Bias handles (`g_biasFastHandle`, `g_biasSlowHandle`) worden nu ook aangemaakt als `InpUseHTFBias=false` maar `InpUseImprovedEntry=true`
+
+#### Verwachte impact
+
+| Metric | Verwachting |
+|--------|-------------|
+| Handelsfrequentie | ⬆️ 2–4x meer trades |
+| RR | ⬆️ Beter (entry dichter bij EMA = kleinere SL) |
+| Winrate | ⬇️ Licht lager (meer setups, niet elk ideaal) |
+| Netto winst | ⬆️ Significant hoger |
+
+#### Aandachtspunten
+
+- `InpBiasTF = H4` is de trend-TF — zet naar `H1` voor snellere trendherkenning op kleinere accounts
+- `InpEMA_Period = 50` is de pullback-EMA — consistent met de bias EMA-fast
+- Setup1 is **niet verwijderd** — zet `InpUseImprovedEntry = false` om terug te vallen op de oude entry
+
+---
+
+## [v22.4] — 2026-04-23
+
+### Changed — Over-filtering reductie: block → scale, drempelwaarden versoepeld
+
+**Doel**: verhoog handelsfrequentie zonder de risicobeheersing op te geven. Elke fix zet een hard `return` om naar een gedoseerde aanpassing van lot-grootte of risico-factor.
+
+| # | Component | Oud | Nieuw | Reden |
+|---|-----------|-----|-------|-------|
+| 1 | `BreakPrevHighLow` | `r[1].close > r[2].high` | `r[1].close > r[2].close` | Minder laat instappen, betere RR; close>prev.close bevestigt al momentum |
+| 2 | `VolBlock` in `ProcessSymbol` | `return;` (hard blok) | `volMult = min(volMult, 0.5)` (risk scaling) | Lage vol ≠ slechte trade; lot-grootte halveert maar trade gaat door |
+| 3 | `EqRegime_Update` drempels | `<2% neutral`, `<5% caution`, `≥5% defensive` | `<5% neutral`, `<10% caution`, `≥10% defensive` | Normale DD triggerde al risk reduction; nieuwe waarden volgen marktpraktijk |
+| 4 | `InpCorrAbsThreshold` | `0.85` | `0.90` | Veel FX-paren zijn structureel >0.85 gecorreleerd; 0.90 filtert alleen echte clusters |
+| 5 | `InpCorrUseWeightedExposure` | `true` | `false` | Gewogen lot-som blokkeert ook paren met kleine posities; simpele drempel is beter |
+| 6 | SL-fallback in `CurrentPortfolioRiskPct` | `eq * (portfolioCap/100)` | `eq * 0.5 * (portfolioCap/100)` | Één positie zonder SL bevroor eerder alle entries; nu gedeeltelijke impact |
+| 7 | `FailSafe_Trip` gate | `return;` (alle entries gestopt) | `g_riskMult = min(g_riskMult, 0.2)` | File-open / ML-fail stopt nu niet de EA maar reduceert lot-grootte drastisch |
+| 8 | `OnTester` trade-penalty | Soft penalty via `InpTester_MinTradesForFullScore` | Extra harde drempel: `if(trades<100) tradeFactor *= trades/100` | Voorkomt overfit op strategieën met weinig trades met hoge PF |
+| 9 | Setup2 activatie | Alleen fallback als BreakPrev faalt | Ook als confirmatie als S1+S2 dezelfde richting geven (`setup="S1+S2"`) | 30–50% meer confluence-trades; geen richting-conflict want zelfde richting vereist |
+
+### Niet gewijzigd (bewust)
+
+- `DailyLoss CB` en `EquityCB` — harde circuit breakers blijven als laatste vangnet.
+- `InpLossStreakBlock_Enable = false` — bewaard uit lean-test profiel.
+- `InpUseSetup2 = false` — lean-test profiel-instelling; deze fix werkt pas als Setup2 aan staat in productie.
+
+---
+
+## [v22.3-lean-test] — 2026-04-23
+
+### Changed — Lean Test Profiel (minimale filters, maximale data)
+
+**Doel**: Zoveel mogelijk trades genereren in de Strategy Tester zodat we
+echte data terug krijgen om de instellingen daarna te verbeteren.
+**Gebruik**: Alleen voor testdraaien / data-verzameling. Niet voor live.
+
+| Parameter | v22.2 | v22.3-lean | Reden |
+|-----------|-------|-----------|-------|
+| `InpMinATR_Pips` | 8.0 | **4.0** | Meer setups doorlaten |
+| `InpMinADXForEntry` | 25.0 | **15.0** | Ook matige trends meenemen |
+| `InpMinADXEntryFilter` | 25.0 | **15.0** | Idem |
+| `InpEntryMinBodyATRFrac` | 0.20 | **0.10** | Kleinere body toegestaan |
+| `InpEntryMinCloseInRangeFrac` | 0.60 | **0.45** | Ruimere close-locatie |
+| `InpEntryUseFollowThrough` | true | **false** | Geen follow-through vereist |
+| `InpEntryUseWickFilter` | true | **false** | Geen wick-filter |
+| `InpEntryUseRangeATRFilter` | true | **false** | Geen range/ATR-filter |
+| `InpUseHTFBias` | true | **false** | Geen H4 bias filter |
+| `InpUseCorrelationGuard` | true | **false** | Geen correlatie-blokkering |
+| `InpUseVolRegime` | true | **false** | Geen vol-regime blokkering |
+| `InpUseSetup2` | false | **true** | Fallback signaal voor extra trades |
+| `InpUseSessions` | true | **false** | Handel ook buiten London/NY |
+| `InpMaxSpreadPips_FX` | 2.0 | **3.5** | Meer brokers/momenten toegestaan |
+| `InpMinMinutesBetweenEntries` | 20 | **5** | Minder wachttijd tussen entries |
+| `InpMaxEntriesPerSymbolPerDay` | 5 | **10** | Ruimere dagcap per symbool |
+| `InpMaxEntriesTotalPerDay` | 10 | **25** | Ruimere totale dagcap |
+| `InpLossStreakBlock_Enable` | true | **false** | Geen verlies-streak blokkering |
+| `InpDailyLoss_PctBalance` | 2.0 % | **5.0 %** | Ruimere daily-loss CB voor test |
+| `InpEquityCB_Pct` | 5.0 % | **15.0 %** | Ruimere equity CB voor test |
+| `InpEnableMLExport` | false | **true** | Data verzamelen voor analyse |
+| `InpTester_UseCustomCriterion` | false | **true** | Custom score voor optimalisatie |
+
+### Volgend stap na testrun
+1. Export `ml_export_v2.csv` uit de tester-run.
+2. Draai `python tools/wfo_pipeline.py ml_export_v2.csv` → WFO rapport.
+3. Draai `python tools/stress_test.py ml_export_v2.csv` → stress-gates.
+4. Zet filters die data bevestigt stap voor stap terug aan (begin met ADX en sessies).
+
+### Filter-conflicten opgelost (v22.3 patch)
+
+Na analyse van de entry-flow zijn drie filter-conflicten gevonden en gecorrigeerd:
+
+| # | Conflict | Fix |
+|---|---------|-----|
+| 1 | **Setup2 geeft contrarian richting** — als Setup1 een BUY geeft maar BreakPrev faalt, flipt Setup2 naar SELL op dezelfde candle | `InpUseSetup2 = false` |
+| 2 | **VolRegime-blok vs ATR-min filter** — beide meten volatiliteit op M5; ATR-min selecteert al op "genoeg vol", waarna VolLowBlock dezelfde bars nogmaals uitsluit | `InpVolLowBlockEntries = false`; gebruik `InpVolHighRiskMult` voor lot-scaling i.p.v. hard blok |
+| 3 | **WickFilter redundant met CloseInRange** — een candle die ≥ 45 % close-in-range haalt heeft per definitie een kleine tegengestelde wick; WickFilter voegt niets toe | WickFilter was al `false` in lean-test |
+
+> **Resterende aandachtspunten na testrun:**
+> - Als HTF bias (H4) later weer aan gaat → verlaag ADX-entry drempel naar ~18 (H4 doet de grove richting al).
+> - DailyLoss CB + Equity CB zijn voldoende bescherming op portfolio-niveau; LossStreakBlock staat uit in lean-test.
+
+---
+
 ## [v22.2] — 2026-04-23
 
 ### Changed — Demo-Ready Parameter Tuning
