@@ -549,7 +549,7 @@ input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflic
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
-// lean-test: AAN — Setup2 runs in parallel as an extra signal path
+// lean-test: ON — Setup2 runs in parallel as an extra signal path
 input bool     InpUseSetup2               = true;
 input bool     InpUseBreakPrevHighLow     = true;
 
@@ -6162,7 +6162,7 @@ void ProcessSymbol(const int idx, const string sym)
    // v22.5: when InpUseImprovedEntry is active, BreakPrev and Setup2 logic is bypassed —
    // the improved entry already incorporates trend + pullback, making BreakPrev redundant.
    bool breakOk = InpUseImprovedEntry ? true : BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
-   bool useSetup2=setup2Standalone;
+   bool setup2Active=setup2Standalone;
    bool isBuy=false;
    string setup="";
    if(setup2Standalone)
@@ -6183,13 +6183,13 @@ void ProcessSymbol(const int idx, const string sym)
          bool isBuy2=false;
          if(EntrySignal_Setup2(idx, sym, isBuy2))
          {
-            useSetup2=true;
+            setup2Active=true;
             isBuy=isBuy2;
             setup="S2";
          }
       }
       // HOTFIX: only count BreakPrev rejection when we *actually* reject (no Setup2 fallback)
-      if(!useSetup2)
+      if(!setup2Active)
       {
          IncReject(idx, REJ_BREAKPREV_FAIL);
          return;
@@ -6198,7 +6198,7 @@ void ProcessSymbol(const int idx, const string sym)
    // v22.4: allow Setup2 also when Setup1 DID pass BreakPrev but Setup2 gives a different direction.
    // Only override when Setup1 was confirmed and Setup2 agrees (same direction = stronger confluence).
    // We do NOT override to opposite direction to avoid BreakPrev-vs-S2 conflicts caught in v22.3.
-   if(!useSetup2 && breakOk && InpUseSetup2)
+   if(!setup2Active && breakOk && InpUseSetup2)
    {
       bool isBuy2=false;
       if(EntrySignal_Setup2(idx, sym, isBuy2) && isBuy2==isBuy1)
