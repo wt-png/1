@@ -5,7 +5,72 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [v22.5] — 2026-04-23
+## [v22.6] — 2026-04-23
+
+### Fixed — Drie kritieke bugs gecorrigeerd
+
+**Probleem**: backtests toonden 100% eén-richting trades (bijv. 78 SHORT / 0 LONG) met Profit Factor ~0.04.
+
+#### Bug 1: Setup2 contrarian-lock bij ImprovedEntry (kritiek)
+
+`EntrySignal_Setup2` geeft altijd de **tegengestelde** richting van de M5-candle (contrarian).
+Wanneer `InpUseImprovedEntry=true` actief is én H4 in dalende trend zit:
+
+| Situatie | ImprovedEntry | Setup2 standalone | Resultaat |
+|----------|--------------|-------------------|-----------|
+| M5 bearish bar | ✅ SELL | — | SELL |
+| M5 bullish bar | ❌ faalt | contrarian van bullish → SELL | SELL |
+
+→ **100% SELL in elke aanhoudende trend**, ongeacht de werkelijke marktrichting.
+
+**Fix**: Setup2 standalone wordt **niet** uitgevoerd wanneer `InpUseImprovedEntry=true`.
+Setup2 confluence-tag (`S1+S2`) wordt ook overgeslagen wanneer ImprovedEntry actief is.
+
+#### Bug 2: ADX-filter werkte niet voor ImprovedEntry
+
+Wanneer `InpUseImprovedEntry=true` bleven `adxTrend` en `adxEntry` op `999` (pass-through),
+waardoor de ADX-filter nooit kon blokkeren — ook niet bij zwakke, ruis-achtige markten.
+
+**Fix**: Na `EntrySignal_Improved` worden werkelijke ADX-waarden gelezen van
+`g_adxHandle` en `g_adxEntryHandle` wanneer `InpUseADXFilter=true`.
+
+#### Bug 3: Lean-test defaults niet teruggedraaid naar live-safe
+
+Alle lean-test parameters zijn hersteld naar productie-veilige waarden:
+
+| Parameter | Lean-test | v22.6 (live-safe) |
+|-----------|-----------|-------------------|
+| `InpMinATR_Pips` | 4.0 | **8.0** |
+| `InpMinADXForEntry` | 15.0 | **25.0** |
+| `InpMinADXEntryFilter` | 15.0 | **25.0** |
+| `InpEntryMinBodyATRFrac` | 0.10 | **0.20** |
+| `InpEntryUseFollowThrough` | false | **true** |
+| `InpEntryUseWickFilter` | false | **true** |
+| `InpEntryUseRangeATRFilter` | false | **true** |
+| `InpEntryMinRangeATRFrac` | 0.20 | **0.35** |
+| `InpEntryMinCloseInRangeFrac` | 0.45 | **0.60** |
+| `InpUseHTFBias` | false | **true** |
+| `InpUseCorrelationGuard` | false | **true** |
+| `InpUseVolRegime` | false | **true** |
+| `InpUseSetup2` | true | **false** |
+| `InpUseSessions` | false | **true** |
+| `InpMaxSpreadPips_FX` | 3.5 | **2.0** |
+| `InpMinMinutesBetweenEntries` | 5 | **20** |
+| `InpMaxEntriesPerSymbolPerDay` | 10 | **5** |
+| `InpMaxEntriesTotalPerDay` | 25 | **10** |
+| `InpLossStreakBlock_Enable` | false | **true** |
+| `InpDailyLoss_PctBalance` | 5.0 % | **2.0 %** |
+| `InpEquityCB_Pct` | 15.0 % | **5.0 %** |
+| `InpEnableMLExport` | true | **false** |
+
+### Niet gewijzigd (bewust behouden uit v22.4)
+- `InpCorrUseWeightedExposure = false` — gewogen lot-som blokkeert te veel valide paren
+- `InpVolLowBlockEntries = false` — ATR-min doet hetzelfde; gebruik VolHighRiskMult voor lot-scaling
+- `InpSL_ATR_Mult = 1.5`, `InpTP_RR = 1.8` — v22.2 waarden blijven correct
+
+---
+
+
 
 ### Added — EntrySignal_Improved: Trend + Pullback + Continuation edge
 
