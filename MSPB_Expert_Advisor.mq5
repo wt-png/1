@@ -5830,8 +5830,11 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    // Opposite wick filter: reject bars with an oversized opposing wick
    if(InpEntryUseWickFilter && bodyPips > 0.0)
    {
-      double oppWickPips = isBuy ? (r[1].high  >= r[1].close ? (r[1].high  - r[1].close) / pip : 0.0)
-                                 : (r[1].close >= r[1].low   ? (r[1].close - r[1].low)   / pip : 0.0);
+      double oppWickPips;
+      if(isBuy)
+         oppWickPips = (r[1].high >= r[1].close) ? (r[1].high - r[1].close) / pip : 0.0;
+      else
+         oppWickPips = (r[1].close >= r[1].low)  ? (r[1].close - r[1].low)  / pip : 0.0;
       if(oppWickPips > bodyPips * MathMax(0.0, InpEntryMaxOppWickBodyFrac)) return false;
    }
 

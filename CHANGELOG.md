@@ -17,8 +17,8 @@ lage-kwaliteit entries kwamen door die in Setup1 geblokkeerd zouden zijn.
 
 | Richting | Vereiste | Reden |
 |----------|----------|-------|
-| BUY | `close >= EMA50` | EMA moet als steun werken — als close onder EMA sluit, heeft de pullback de EMA doorbroken |
-| SELL | `close <= EMA50` | EMA moet als weerstand werken — als close boven EMA sluit, is de neerwaartse kracht afwezig |
+| BUY | `close >= EMA (InpEMA_Period)` | EMA moet als steun werken — als close onder EMA sluit, heeft de pullback de EMA doorbroken |
+| SELL | `close <= EMA (InpEMA_Period)` | EMA moet als weerstand werken — als close boven EMA sluit, is de neerwaartse kracht afwezig |
 
 #### Stap 7: Kwaliteitsfilters (hergebruikt bestaande inputs)
 
