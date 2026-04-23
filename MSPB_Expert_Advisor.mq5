@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v22.1: anti-loss hardening — daily-loss CB, equity-DD CB, tighter filters, session guard, lower overtrading caps."
+#property description "MultiSymbol Pullback Scalper FULL v22.2: demo-ready tuning — M5 entries, H1 confirm, H4 bias, RR 1.8, ADX/ATR period 14, higher quality filters."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -422,8 +422,8 @@ string News_StatusLine()
 
 // --- Symbols / TF
 input string   InpSymbols                 = "EURUSD,GBPUSD,CUCUSD";
-input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M1;  // DATA mode: more signals
-input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_M5;  // DATA mode: faster confirm
+input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M5;  // entry signal timeframe (v22.2: M1→M5 — less noise)
+input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_H1;  // confirmation timeframe (v22.2: M5→H1 — stronger confirm)
 
 
 // --- Optional: auto-resolve + per-symbol overrides (CSV in MQL5/Files)
@@ -463,27 +463,27 @@ input bool     InpRisk_Cap_LogDetail      = true;
 input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
 // --- SL/TP
-input double   InpSL_ATR_Mult             = 1.6;  // wider structural SL to reduce noise stop-outs
-input double   InpTP_RR                   = 1.4;  // base RR target
+input double   InpSL_ATR_Mult             = 1.5;  // SL as ATR multiple (v22.2: 1.6→1.5 — slightly tighter)
+input double   InpTP_RR                   = 1.8;  // base RR target (v22.2: 1.4→1.8 — better risk/reward)
 input double   InpMinSLPips               = 6.0;  // hard minimum SL distance
 input double   InpMinTP_RR                = 1.2;  // hard minimum RR floor
 input bool     InpSL_UseSwingStructure    = true; // widen SL to recent swing structure when needed
 input int      InpSL_SwingLookbackBars    = 5;    // recent closed bars to detect swing high/low
 input double   InpSL_SwingBufferPips      = 1.0;  // extra safety buffer beyond swing
-input double   InpTP_RR_TrendBonusADX     = 30.0; // add RR bonus when ADX trend >= this
-input double   InpTP_RR_TrendBonus        = 0.30; // RR bonus in strong trends
-input double   InpTP_RR_Max               = 2.50; // hard RR ceiling (0 => uncapped)
+input double   InpTP_RR_TrendBonusADX     = 28.0; // add RR bonus when ADX trend >= this (v22.2: 30→28)
+input double   InpTP_RR_TrendBonus        = 0.40; // RR bonus in strong trends (v22.2: 0.30→0.40)
+input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.50→3.00 — let winners run)
 
 // --- Filters
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 12.0;  // min ATR in pips (v22.1: 10.0→12.0)
+input double   InpMinATR_Pips             = 8.0;   // min ATR in pips (v22.2: 12→8 — M5 bars are smaller)
 input bool     InpUseADXFilter            = true;
-input int      InpADX_Period              = 7;   // DATA mode: faster warm-up
-input int      InpATR_Period             = 7;   // DATA mode: ATR period (was hardcoded 14)
-input double   InpMinADXForEntry          = 22.0;  // min ADX trend for entry (v22.1: 20→22)
-input double   InpMinADXEntryFilter       = 22.0;  // min ADX entry quality (v22.1: 20→22)
+input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
+input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
+input double   InpMinADXForEntry          = 25.0;  // min ADX trend for entry (v22.2: 22→25 — only strong trends)
+input double   InpMinADXEntryFilter       = 25.0;  // min ADX entry quality (v22.2: 22→25 — only strong trends)
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
 input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
@@ -497,7 +497,7 @@ input double   InpEntryMinCloseInRangeFrac= 0.60; // buy: close near high; sell:
 
 // --- Advanced filters / regimes (v9)
 input bool     InpUseHTFBias              = true;
-input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H1;
+input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
 input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
@@ -688,12 +688,12 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 30;   // anti-overtrading spacing per symbol (v22.1: 15→30)
-input int      InpMaxEntriesPerSymbolPerDay = 4;   // anti-overtrading daily cap per symbol (v22.1: 6→4; 0=off)
-input int      InpMaxEntriesTotalPerDay   = 8;    // anti-overtrading daily cap across all symbols (v22.1: 12→8; 0=off)
+input int      InpMinMinutesBetweenEntries = 20;   // anti-overtrading spacing per symbol (v22.2: 30→20 — allow more quality setups)
+input int      InpMaxEntriesPerSymbolPerDay = 5;   // anti-overtrading daily cap per symbol (v22.2: 4→5)
+input int      InpMaxEntriesTotalPerDay   = 10;   // anti-overtrading daily cap across all symbols (v22.2: 8→10)
 input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N consecutive losing positions
-input int      InpLossStreakBlockAfter    = 2;     // trigger block at this many consecutive losses (v22.1: 3→2)
-input int      InpLossStreakBlockMinutes  = 240;   // lock duration after loss-streak trigger (v22.1: 180→240)
+input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses (v22.2: 2→3)
+input int      InpLossStreakBlockMinutes  = 120;   // lock duration after loss-streak trigger (v22.2: 240→120)
 
 // --- Daily loss circuit breaker (v22.1)
 input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance

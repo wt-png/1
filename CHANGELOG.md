@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.2] — 2026-04-23
+
+### Changed — Demo-Ready Parameter Tuning
+
+**Goal**: Achieve positive Profit Factor on demo by reducing signal noise and improving risk/reward.
+
+| Parameter | Old | New | Reden |
+|-----------|-----|-----|-------|
+| `InpEntryTF` | M1 | **M5** | M1 is te ruis-gevoelig; M5 geeft schonere signalen |
+| `InpConfirmTF` | M5 | **H1** | H1 bevestiging filtert false breakouts eruit |
+| `InpBiasTF` | H1 | **H4** | H4 trend-bias = alleen traden met sterke trend |
+| `InpATR_Period` | 7 | **14** | Standaard periode; stabieler en minder gevoelig voor uitschieters |
+| `InpADX_Period` | 7 | **14** | Standaard periode; stabieler ADX-meting |
+| `InpMinADXForEntry` | 22.0 | **25.0** | Alleen instappen bij duidelijke trend |
+| `InpMinADXEntryFilter` | 22.0 | **25.0** | Idem |
+| `InpMinATR_Pips` | 12.0 | **8.0** | M5-bars zijn kleiner; 8 pip ATR is voldoende volatiliteit |
+| `InpSL_ATR_Mult` | 1.6 | **1.5** | Iets kleiner verlies per trade |
+| `InpTP_RR` | 1.4 | **1.8** | Hogere RR compenseert lagere win-rate |
+| `InpTP_RR_TrendBonus` | 0.30 | **0.40** | Laat winnaars verder lopen in sterke trends |
+| `InpTP_RR_TrendBonusADX` | 30.0 | **28.0** | Bonus al bij iets zwakkere trend |
+| `InpTP_RR_Max` | 2.50 | **3.00** | Meer ruimte voor winnaars |
+| `InpLossStreakBlockAfter` | 2 | **3** | Minder vroeg blokkeren = meer herstelopties |
+| `InpLossStreakBlockMinutes` | 240 | **120** | Kortere cooldown zodat goede setups niet gemist worden |
+| `InpMinMinutesBetweenEntries` | 30 | **20** | Iets meer setups per dag mogelijk |
+| `InpMaxEntriesPerSymbolPerDay` | 4 | **5** | Iets meer kansen per symbool |
+| `InpMaxEntriesTotalPerDay` | 8 | **10** | Meer totale kansen |
+
+### Context
+Met M1 + periode=7 genereerde de EA te veel ruis-signalen (PF ~0.73, verlies).
+Door M5 entries + H1 bevestiging + H4 bias worden alleen echte trends gehandeld.
+RR van 1.8 betekent dat zelfs bij 37% win-rate de EA winstgevend is.
+
+---
+
 ## [v22.1] — 2026-04-23
 
 ### Added — Anti-Loss Hardening
