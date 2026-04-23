@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.4: BreakPrev relaxed, VolBlock→scale, EqRegime 5/10%, CorrThresh 0.90, SL-fallback 50%, FailSafe→risk-reduce, OnTester harder trade-penalty, Setup2 confluence."
+#property description "MultiSymbol Pullback Scalper FULL v22.5: Improved entry (Trend+Pullback+Continuation), BreakPrev relaxed, VolBlock→scale, EqRegime 5/10%, CorrThresh 0.90, SL-fallback 50%, FailSafe→risk-reduce, OnTester harder trade-penalty."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -493,6 +493,15 @@ input double   InpEntryMaxOppWickBodyFrac = 0.45; // (referentie — filter staa
 input bool     InpEntryUseRangeATRFilter  = false; // lean-test: UIT — geen range/ATR-filter
 input double   InpEntryMinRangeATRFrac    = 0.20; // lean-test: 0.35→0.20 (referentie — filter staat uit)
 input double   InpEntryMinCloseInRangeFrac= 0.45; // lean-test: 0.60→0.45 — ruimere close-locatie
+
+// --- Improved entry: Trend + Pullback + Continuation (v22.5)
+// When true, replaces Setup1 with a simplified pullback-based edge:
+//   1. HTF trend: EMA-fast (InpBiasEMAFast) > EMA-slow (InpBiasEMASlow) on InpBiasTF
+//   2. Pullback:  last closed bar touches EMA on InpEntryTF (InpEMA_Period)
+//   3. Trigger:   continuation candle (close > open for buy, < open for sell)
+// All other risk guards (ATR, ADX, corr, portfolio) remain active.
+input bool     InpUseImprovedEntry        = true;  // lean-test: AAN — betere RR, meer trades, minder filters
+input double   InpImprovedEntry_ATRMinPips = 2.0;  // min ATR in pips for improved entry (0 = off)
 
 
 // --- Advanced filters / regimes (v9)
@@ -5725,7 +5734,70 @@ bool BreakPrevHighLow(const string sym,const bool isBuy,const bool useBreakPrev)
    else      return (r[1].close < r[2].close);
 }
 
-bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double &adxTrend, double &adxEntry, double &atrPips, double &bodyPips)
+// -----------------------------------------
+// EntrySignal_Improved — v22.5
+// Edge: Trend (HTF EMA50>EMA200) + Pullback (EMA50 touch on entry TF) + Continuation candle.
+// Rationale: entering ON the pullback gives better RR than waiting for breakout confirmation.
+// All external risk guards (ATR, ADX, portfolio, correlation) still apply after this signal.
+// -----------------------------------------
+bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, double &atrPips)
+{
+   isBuy = false; atrPips = 0.0;
+
+   double pip = PipSize(sym);
+   if(pip <= 0.0) return false;
+
+   // --- Step 1: Last closed bar on entry TF ---
+   MqlRates r[2];
+   if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r)) return false;
+
+   // --- Step 2: ATR (use last closed bar value) ---
+   double atrBuf[2];
+   if(!CopyLast(g_atrHandle[symIdx], 0, 0, 2, atrBuf)) return false;
+   atrPips = atrBuf[1] / pip;
+   if(atrPips <= 0.0) return false;
+
+   // Minimum ATR guard (avoid entering in dead markets)
+   if(InpImprovedEntry_ATRMinPips > 0.0 && atrPips < InpImprovedEntry_ATRMinPips) return false;
+
+   // --- Step 3: HTF trend check — EMA-fast > EMA-slow on InpBiasTF ---
+   // Uses same handles as the HTF bias filter (g_biasFastHandle / g_biasSlowHandle).
+   if(g_biasFastHandle[symIdx] == INVALID_HANDLE || g_biasSlowHandle[symIdx] == INVALID_HANDLE) return false;
+   double emaFast[1], emaSlow[1];
+   if(CopyBuffer(g_biasFastHandle[symIdx], 0, 0, 1, emaFast) != 1) return false;
+   if(CopyBuffer(g_biasSlowHandle[symIdx], 0, 0, 1, emaSlow) != 1) return false;
+
+   // Require meaningful separation (at least 1 pip) to avoid acting on a flat EMA cross.
+   double emaDiff = emaFast[0] - emaSlow[0];
+   if(MathAbs(emaDiff) < pip) return false; // EMA too close — no clear trend
+
+   bool trendBuy  = (emaDiff > 0.0);  // fast > slow => uptrend
+   bool trendSell = (emaDiff < 0.0);  // fast < slow => downtrend
+
+   // --- Step 4: Pullback to EMA50 on entry TF ---
+   // Price of the last CLOSED bar must have touched (pierced) the entry-TF EMA.
+   if(g_emaHandle[symIdx] == INVALID_HANDLE) return false;
+   double emaBuf[2];
+   if(!CopyLast(g_emaHandle[symIdx], 0, 0, 2, emaBuf)) return false;
+   double ema = emaBuf[1]; // last closed bar EMA value
+
+   bool touched = (r[1].low <= ema && r[1].high >= ema);
+   if(!touched) return false;
+
+   // --- Step 5: Continuation candle (direction after EMA touch) ---
+   bool candleBuy  = (r[1].close > r[1].open);
+   bool candleSell = (r[1].close < r[1].open);
+   if(!candleBuy && !candleSell) return false; // doji — skip
+
+   // Trend and candle direction must agree
+   if(trendBuy && candleBuy)        isBuy = true;
+   else if(trendSell && candleSell) isBuy = false;
+   else return false; // trend / candle conflict
+
+   return true;
+}
+
+
 {
    isBuy=false; adxTrend=0; adxEntry=0; atrPips=0; bodyPips=0;
 
@@ -5992,10 +6064,24 @@ void ProcessSymbol(const int idx, const string sym)
    CountOpenPositionsOurMagicBoth(sym, openSym, openTot);
    if(openSym >= InpMaxPositionsPerSymbol) return;
    if(openTot >= InpMaxPositionsTotal) return;
-   // compute signals
+
+   // --- v22.5: Improved entry (Trend + Pullback + Continuation) ---
+   // When enabled, replaces Setup1 as the primary signal generator.
+   // ADX/ATR external filters still apply below if their respective inputs are enabled.
    bool isBuy1; double adxTrend, adxEntry, atrPips, bodyPips;
-   bool ok1 = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
-   if(!ok1) return;
+   adxTrend=999.0; adxEntry=999.0; bodyPips=0.0;
+
+   if(InpUseImprovedEntry)
+   {
+      bool okImp = EntrySignal_Improved(idx, sym, isBuy1, atrPips);
+      if(!okImp) return;
+      // ADX values stay at 999 (pass-through) so optional ADX filter can still work if enabled.
+   }
+   else
+   {
+      bool ok1 = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
+      if(!ok1) return;
+   }
 
    // ATR filter
    if(InpUseATRFilter && atrPips < Sym_MinATR_Pips(sym))
@@ -6025,10 +6111,12 @@ void ProcessSymbol(const int idx, const string sym)
 
    // v22.4: Setup2 activates BOTH as a fallback (when BreakPrev fails) AND independently
    // when Setup1 has no signal.  This can add 30–50% more trades without touching Setup1 quality.
-   bool breakOk = BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
+   // v22.5: when InpUseImprovedEntry is active, BreakPrev and Setup2 logic is bypassed —
+   // the improved entry already incorporates trend + pullback, making BreakPrev redundant.
+   bool breakOk = InpUseImprovedEntry ? true : BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
    bool useSetup2=false;
    bool isBuy=isBuy1;
-   string setup="S1";
+   string setup = InpUseImprovedEntry ? "IMP" : "S1";
 
    if(!breakOk)
    {
@@ -6598,7 +6686,7 @@ bool Data_CheckSymbol(const string sym, string &reason)
       return false;
    }
 
-   if(InpUseHTFBias)
+   if(InpUseHTFBias || InpUseImprovedEntry)
    {
       int needBias = 120;
       needBias = MathMax(needBias, InpBiasEMASlow + 50);
@@ -6773,7 +6861,8 @@ int OnInit()
 
 
    // init indicators per symbol
-   bool needEMA = (InpUsePullbackEMA || InpSymbolOverrides_Enable);
+   // v22.5: also need EMA handle when ImprovedEntry is active (uses EMA for pullback check)
+   bool needEMA = (InpUsePullbackEMA || InpSymbolOverrides_Enable || InpUseImprovedEntry);
    for(int i=0;i<g_symCount;i++)
    {
       g_emaHandle[i]=INVALID_HANDLE;
@@ -6792,7 +6881,7 @@ int OnInit()
    {
       string sym=g_syms[i];
 
-      bool useEMA = (InpUsePullbackEMA || Sym_UsePullbackEMA(sym));
+      bool useEMA = (InpUsePullbackEMA || Sym_UsePullbackEMA(sym) || InpUseImprovedEntry);
 
       int ema=INVALID_HANDLE;
       int atr=INVALID_HANDLE;
@@ -6818,7 +6907,7 @@ int OnInit()
          adxE= iADX(sym, InpEntryTF,   InpADX_Period);
       }
 
-      if(InpUseHTFBias)
+      if(InpUseHTFBias || InpUseImprovedEntry)
       {
          bf=iMA(sym, InpBiasTF, InpBiasEMAFast, 0, MODE_EMA, PRICE_CLOSE);
          bs=iMA(sym, InpBiasTF, InpBiasEMASlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -6829,7 +6918,7 @@ int OnInit()
       if(useEMA && ema==INVALID_HANDLE) ok=false;
       if(InpUseVolRegime && atrVol==INVALID_HANDLE) ok=false;
       if(InpUseADXFilter && (adx==INVALID_HANDLE || adxE==INVALID_HANDLE)) ok=false;
-      if(InpUseHTFBias && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
+      if((InpUseHTFBias || InpUseImprovedEntry) && (bf==INVALID_HANDLE || bs==INVALID_HANDLE)) ok=false;
 
       if(!ok)
       {

@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.5] — 2026-04-23
+
+### Added — EntrySignal_Improved: Trend + Pullback + Continuation edge
+
+**Doel**: vervang de te-late breakout entry door een vroege pullback entry. Betere RR, meer trades, minder filters.
+
+#### Nieuwe input parameters
+
+| Parameter | Default | Beschrijving |
+|-----------|---------|-------------|
+| `InpUseImprovedEntry` | `true` | Schakelt verbeterde entry in; vervangt Setup1 als primair signaal |
+| `InpImprovedEntry_ATRMinPips` | `2.0` | Minimale ATR (pips) voor improved entry — beschermt tegen dode markten |
+
+#### Logica `EntrySignal_Improved`
+
+```
+1. Trend (HTF): EMA50 > EMA200 op InpBiasTF (standaard H4)
+              → geeft alleen BUY setups in uptrend, alleen SELL setups in downtrend
+              → vereist minimale EMA-scheiding (1 pip) om vlakke crossovers te vermijden
+
+2. Pullback:   Laatste gesloten bar op InpEntryTF (standaard M5) raakt EMA50
+              → bar.low <= EMA50 <= bar.high
+
+3. Trigger:   Continuation candle na de EMA-aanraking
+              → close > open → BUY
+              → close < open → SELL
+              → Doji (close == open) → overgeslagen
+```
+
+#### Integratie
+
+- Vervangt Setup1 volledig als `InpUseImprovedEntry = true`
+- BreakPrevHighLow en Setup2 worden **geskipt** (zijn redundant — pullback entry geeft al betere timing)
+- Alle externe guards blijven actief: ATR-min, ADX-filter, portfolio cap, correlatie, circuit breakers
+- Audit-log toont `setup="IMP"` voor improved entry trades
+- Bias handles (`g_biasFastHandle`, `g_biasSlowHandle`) worden nu ook aangemaakt als `InpUseHTFBias=false` maar `InpUseImprovedEntry=true`
+
+#### Verwachte impact
+
+| Metric | Verwachting |
+|--------|-------------|
+| Handelsfrequentie | ⬆️ 2–4x meer trades |
+| RR | ⬆️ Beter (entry dichter bij EMA = kleinere SL) |
+| Winrate | ⬇️ Licht lager (meer setups, niet elk ideaal) |
+| Netto winst | ⬆️ Significant hoger |
+
+#### Aandachtspunten
+
+- `InpBiasTF = H4` is de trend-TF — zet naar `H1` voor snellere trendherkenning op kleinere accounts
+- `InpEMA_Period = 50` is de pullback-EMA — consistent met de bias EMA-fast
+- Setup1 is **niet verwijderd** — zet `InpUseImprovedEntry = false` om terug te vallen op de oude entry
+
+---
+
 ## [v22.4] — 2026-04-23
 
 ### Changed — Over-filtering reductie: block → scale, drempelwaarden versoepeld
