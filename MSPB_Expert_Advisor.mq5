@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.6: Live-safe defaults restored, ADX filter fixed for ImprovedEntry, Setup2 standalone disabled when ImprovedEntry active."
+#property description "MultiSymbol Pullback Scalper FULL v22.7: ImprovedEntry kwaliteitsfilters toegevoegd (EMA-close, body-ATR, close-in-range, wick)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -5795,6 +5795,45 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    if(trendBuy && candleBuy)        isBuy = true;
    else if(trendSell && candleSell) isBuy = false;
    else return false; // trend / candle conflict
+
+   // --- Step 6: EMA close confirmation (v22.7) ---
+   // Close must confirm EMA as support (BUY) or resistance (SELL).
+   // Prevents entries where price merely pierced EMA intra-bar but closed on the wrong side.
+   if(isBuy  && r[1].close < ema) return false;
+   if(!isBuy && r[1].close > ema) return false;
+
+   // --- Step 7: Signal quality filters — reuse same inputs as Setup1 (v22.7) ---
+   // When ImprovedEntry is active it bypasses Setup1 entirely, so these filters would
+   // otherwise never run.  Applying them here ensures the same quality bar is required.
+   double bodyPips = MathAbs(r[1].close - r[1].open) / pip;
+
+   // Minimum body size relative to ATR (rejects doji-like bars that look directional)
+   if(InpEntryMinBodyATRFrac > 0.0 && atrPips > 0.0)
+   {
+      if((bodyPips / atrPips) < InpEntryMinBodyATRFrac) return false;
+   }
+
+   // Close location: BUY must close near the top of the bar, SELL near the bottom
+   if(InpEntryMinCloseInRangeFrac > 0.0)
+   {
+      double range = r[1].high - r[1].low;
+      if(range > 0.0)
+      {
+         double closeFrac = (r[1].close - r[1].low) / range;
+         double minFrac = MathMax(ENTRY_CLOSE_LOCATION_MIN_FRAC, InpEntryMinCloseInRangeFrac);
+         minFrac = MathMin(ENTRY_CLOSE_LOCATION_MAX_FRAC, minFrac);
+         if(isBuy  && closeFrac < minFrac)       return false;
+         if(!isBuy && closeFrac > (1.0-minFrac)) return false;
+      }
+   }
+
+   // Opposite wick filter: reject bars with an oversized opposing wick
+   if(InpEntryUseWickFilter && bodyPips > 0.0)
+   {
+      double oppWickPips = isBuy ? (r[1].high  >= r[1].close ? (r[1].high  - r[1].close) / pip : 0.0)
+                                 : (r[1].close >= r[1].low   ? (r[1].close - r[1].low)   / pip : 0.0);
+      if(oppWickPips > bodyPips * MathMax(0.0, InpEntryMaxOppWickBodyFrac)) return false;
+   }
 
    return true;
 }

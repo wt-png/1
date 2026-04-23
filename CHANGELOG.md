@@ -5,6 +5,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.7] — 2026-04-23
+
+### Fixed — ImprovedEntry kwaliteitsfilters toegevoegd
+
+**Probleem**: `EntrySignal_Improved` miste de kwaliteitsfilters die `EntrySignal_Setup1` wél
+heeft. Omdat ImprovedEntry Setup1 volledig vervangt, werden deze filters nooit uitgevoerd —
+lage-kwaliteit entries kwamen door die in Setup1 geblokkeerd zouden zijn.
+
+#### Stap 6: EMA-close bevestiging (nieuw)
+
+| Richting | Vereiste | Reden |
+|----------|----------|-------|
+| BUY | `close >= EMA50` | EMA moet als steun werken — als close onder EMA sluit, heeft de pullback de EMA doorbroken |
+| SELL | `close <= EMA50` | EMA moet als weerstand werken — als close boven EMA sluit, is de neerwaartse kracht afwezig |
+
+#### Stap 7: Kwaliteitsfilters (hergebruikt bestaande inputs)
+
+| Filter | Input | Waarde (live-safe) | Effect |
+|--------|-------|--------------------|--------|
+| Body / ATR fractie | `InpEntryMinBodyATRFrac` | 0.20 | Kleine doji-achtige bars geblokkeerd |
+| Close in range | `InpEntryMinCloseInRangeFrac` | 0.60 | BUY moet in bovenste 40% sluiten; SELL in onderste 40% |
+| Tegengestelde wick | `InpEntryUseWickFilter` + `InpEntryMaxOppWickBodyFrac=0.45` | aan | Bars met grote tegengestelde wick geblokkeerd |
+
+Alle drie filters hergebruiken bestaande inputs — geen nieuwe parameters nodig.
+
+#### Verwachte impact
+
+| Metric | Verwachting |
+|--------|-------------|
+| Aantal entries | ⬇️ Minder entries (lagere kwaliteit gefilterd) |
+| Win-rate | ⬆️ Beter (alleen hoge-kwaliteit setups door) |
+| Verlies per trade | ⬇️ Minder entries aan de verkeerde kant van EMA |
+| Profit Factor | ⬆️ Significant hoger |
+
+---
+
 ## [v22.6] — 2026-04-23
 
 ### Fixed — Drie kritieke bugs gecorrigeerd
