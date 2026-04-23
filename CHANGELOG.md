@@ -5,6 +5,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.1] — 2026-04-23
+
+### Added — Anti-Loss Hardening
+
+**1. Daily loss circuit breaker (`InpDailyLoss_Enable`, `InpDailyLoss_PctBalance=2%`, `InpDailyLoss_CloseAll`)**
+- Records the account balance at the start of each trading day (`g_dailyLossStartBal`).
+- If intraday P&L drops below –`InpDailyLoss_PctBalance`% of the day-start balance, all new
+  entries are halted for the remainder of the day (`g_dailyLossBreached`).
+- Optional nuclear mode (`InpDailyLoss_CloseAll=true`) closes all open positions on breach.
+- Resets automatically at the start of the next trading day.
+- Audit-logged on trigger.
+
+**2. Equity drawdown circuit breaker (`InpEquityCB_Enable`, `InpEquityCB_Pct=5%`)**
+- Integrated into `EqRegime_Update()`.
+- Sets `g_equityCBBreached=true` when live equity DD from peak ≥ `InpEquityCB_Pct`.
+- Auto-clears when equity recovers back above the threshold.
+- Acts as a hard entry gate above the existing loss-streak and rate-limit guards.
+
+**3. Dashboard CB indicators**
+- Status line now shows `DAILY_LOSS_CB` or `EQUITY_CB` (red) when a circuit breaker is active.
+
+### Changed — Anti-Overtrading Defaults
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+| `InpLossStreakBlockAfter` | 3 | **2** |
+| `InpLossStreakBlockMinutes` | 180 | **240** |
+| `InpMinMinutesBetweenEntries` | 15 | **30** |
+| `InpMaxEntriesPerSymbolPerDay` | 6 | **4** |
+| `InpMaxEntriesTotalPerDay` | 12 | **8** |
+
+### Changed — Entry Filter Defaults
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+| `InpMaxSpreadPips_FX` | 3.0 | **2.0** |
+| `InpMinATR_Pips` | 10.0 | **12.0** |
+| `InpMinADXForEntry` | 20.0 | **22.0** |
+| `InpMinADXEntryFilter` | 20.0 | **22.0** |
+| `InpUseSessions` | false | **true** (London 07–17 + NY 12–21 UTC) |
+| `InpVolHighRiskMult` | 0.50 | **0.25** |
+
+### Context
+The v22.0 backtest baseline showed:
+- Net profit: **–300.98 USD** (GBPUSD M15, 283 trades), PF **0.68**, max equity DD **3.75 %**
+- Root causes identified: overtrading in low-quality setups + no hard loss cap.
+
+---
+
 ## [v22.0] — 2026-04-22
 
 ### Added — Optimisation Infrastructure
