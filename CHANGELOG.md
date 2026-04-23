@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.9] — 2026-04-23
+
+### Changed — Conservatief anti-loss settings-profiel aangescherpt
+
+Omdat er nog te veel verlies was, zijn de standaardinstellingen verder verlaagd op risico en
+tradefrequentie, en zijn de remmen op drawdown aangescherpt.
+
+| Parameter | Oud | Nieuw | Doel |
+|-----------|-----|-------|------|
+| `InpMaxPositionsTotal` | 3 | 2 | Minder gelijktijdige exposure |
+| `InpRiskPercent` | 0.25 | 0.20 | Lager basisrisico per trade |
+| `InpMaxRiskPercentPerTrade` | 0.50 | 0.35 | Hardere risicolimiet per trade |
+| `InpMaxPortfolioRiskPct` | 2.0 | 1.5 | Lager totaalrisico op portfolio |
+| `InpMinATR_Pips` | 8.0 | 10.0 | Ruis-/lage-volatiliteit entries blokkeren |
+| `InpMinADXForEntry` | 25.0 | 28.0 | Alleen sterkere trends toelaten |
+| `InpMinADXEntryFilter` | 25.0 | 28.0 | Alleen sterkere trend op entry-TF |
+| `InpImprovedEntry_ATRMinPips` | 2.0 | 6.0 | Extra kwaliteitsfilter op ImprovedEntry |
+| `InpMinMinutesBetweenEntries` | 60 | 90 | Minder overtrading in zelfde context |
+| `InpMaxEntriesPerSymbolPerDay` | 5 | 3 | Minder herhaalentries per symbool |
+| `InpMaxEntriesTotalPerDay` | 10 | 6 | Lagere totale dagfrequentie |
+| `InpLossStreakBlockAfter` | 3 | 2 | Sneller blokkeren na verliesreeks |
+| `InpLossStreakBlockMinutes` | 120 | 240 | Langer herstellen na verliesreeks |
+| `InpDailyLoss_PctBalance` | 2.0% | 1.5% | Eerder dagstop bij verlies |
+| `InpDailyLoss_CloseAll` | false | true | Open posities sluiten bij dagstop |
+| `InpEquityCB_Pct` | 5.0% | 4.0% | Eerdere equity drawdown-stop |
+
+#### Verwachte impact
+
+- Minder trades en minder simultane blootstelling
+- Lagere drawdown en kleinere verliesclusters
+- Betere kapitaalbescherming bij slechte marktfases
+
+---
+
 ## [v22.8] — 2026-04-23
 
 ### Fixed — Oorzaken van geldverlies aangepakt

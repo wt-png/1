@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.8: FollowThrough-fix ImprovedEntry; BE 0.8→1.2R, LockPips 1→3, TimeStopAbsR 0.15→0.50, MinGap 20→60min, TP_RR 1.8→2.2."
+#property description "MultiSymbol Pullback Scalper FULL v22.9: conservative anti-loss defaults (lower risk, stricter filters, tighter loss brakes)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -441,7 +441,7 @@ input long     InpMagic                   = 20250213;
 input bool     InpAllowBuy                = true;
 input bool     InpAllowSell               = true;
 input int      InpMaxPositionsPerSymbol   = 1;
-input int      InpMaxPositionsTotal       = 3;
+input int      InpMaxPositionsTotal       = 2;
 
 // --- Entry driver / management
 input bool     InpUseTimerForEntries      = true;   // if true, entries evaluated in OnTimer; else in OnTick
@@ -450,11 +450,11 @@ input int      InpTimerSec                = 1;
 
 // --- Risk
 input bool     InpUseRiskPercent          = true;
-input double   InpRiskPercent             = 0.25;  // per trade risk budget in % of equity
-input double   InpMaxRiskPercentPerTrade  = 0.50;  // hard cap (% of equity) regardless of multipliers
+input double   InpRiskPercent             = 0.20;  // v22.9: lager basisrisico per trade
+input double   InpMaxRiskPercentPerTrade  = 0.35;  // v22.9: strakkere harde cap per trade
 input double   InpLots                    = 0.01; // fixed lot fallback when risk sizing disabled
 input bool     InpUsePortfolioRiskGuard   = true;
-input double   InpMaxPortfolioRiskPct     = 2.0;
+input double   InpMaxPortfolioRiskPct     = 1.5;   // v22.9: lager maximaal gelijktijdig portfoliorisico
 input int      InpRisk_Cap_Mode           = 1;     // 0=Off, 1=Absolute
 input double   InpRisk_Cap_USD_R          = 1.0;
 input double   InpRisk_Cap_EUR_R          = 1.0;
@@ -479,12 +479,12 @@ input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.5
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 8.0;   // v22.2: min ATR (pips) — filters dode markten uit
+input double   InpMinATR_Pips             = 10.0;  // v22.9: strengere ATR-min om ruisregimes te vermijden
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
 input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
-input double   InpMinADXForEntry          = 25.0;  // v22.2: minimale ADX op trend-TF — alleen duidelijke trends
-input double   InpMinADXEntryFilter       = 25.0;  // v22.2: minimale ADX op entry-TF — idem
+input double   InpMinADXForEntry          = 28.0;  // v22.9: sterkere trendvereiste op trend-TF
+input double   InpMinADXEntryFilter       = 28.0;  // v22.9: sterkere trendvereiste op entry-TF
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
 input double   InpEntryMinBodyATRFrac     = 0.20; // v22.2: min candle body als fractie van ATR
@@ -502,7 +502,7 @@ input double   InpEntryMinCloseInRangeFrac= 0.60; // v22.2: close moet >= 60% in
 //   3. Trigger:   continuation candle (close > open for buy, < open for sell)
 // All other risk guards (ATR, ADX, corr, portfolio) remain active.
 input bool     InpUseImprovedEntry        = true;  // v22.5: verbeterde entry (Trend+Pullback+Continuation); vervangt Setup1
-input double   InpImprovedEntry_ATRMinPips = 2.0;  // min ATR in pips for improved entry (0 = off)
+input double   InpImprovedEntry_ATRMinPips = 6.0;  // v22.9: extra guard tegen lage-volatiliteit entries
 
 
 // --- Advanced filters / regimes (v9)
@@ -699,21 +699,21 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 60;   // v22.8: 20→60 — minder over-trading na slechte entries op dezelfde H4-context
-input int      InpMaxEntriesPerSymbolPerDay = 5;   // v22.2: max entries per symbool per dag
-input int      InpMaxEntriesTotalPerDay   = 10;   // v22.2: max totale entries per dag
+input int      InpMinMinutesBetweenEntries = 90;   // v22.9: ruimere cooldown tussen entries
+input int      InpMaxEntriesPerSymbolPerDay = 3;   // v22.9: minder herhaalde entries per symbool
+input int      InpMaxEntriesTotalPerDay   = 6;    // v22.9: lagere totale dagfrequentie
 input bool     InpLossStreakBlock_Enable  = true;  // v22.1: blokkeer entries na opeenvolgende verliezen
-input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses (v22.2: 2→3)
-input int      InpLossStreakBlockMinutes  = 120;   // lock duration after loss-streak trigger (v22.2: 240→120)
+input int      InpLossStreakBlockAfter    = 2;     // v22.9: sneller blokkeren na verliesreeks
+input int      InpLossStreakBlockMinutes  = 240;   // v22.9: langere cooldown na verliesreeks
 
 // --- Daily loss circuit breaker (v22.1)
 input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance
-input double   InpDailyLoss_PctBalance    = 2.0;    // v22.1: halt entries wanneer dagverlies >= X% van dagbalans
-input bool     InpDailyLoss_CloseAll      = false;  // close all open positions when breached (nuclear option)
+input double   InpDailyLoss_PctBalance    = 1.5;    // v22.9: strakkere dagverliesgrens
+input bool     InpDailyLoss_CloseAll      = true;   // v22.9: bij breach direct alle EA-posities sluiten
 
 // --- Equity drawdown circuit breaker (v22.1)
 input bool     InpEquityCB_Enable         = true;   // halt new entries when equity DD >= X% from peak
-input double   InpEquityCB_Pct            = 5.0;    // v22.1: halt entries wanneer equity DD >= X% van piek
+input double   InpEquityCB_Pct            = 4.0;    // v22.9: eerdere stop op equity drawdown
 
 // -----------------------------------------
 // Globals / enums
