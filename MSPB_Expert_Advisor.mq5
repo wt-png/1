@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.5: Improved entry (Trend+Pullback+Continuation), BreakPrev relaxed, VolBlock→scale, EqRegime 5/10%, CorrThresh 0.90, SL-fallback 50%, FailSafe→risk-reduce, OnTester harder trade-penalty."
+#property description "MultiSymbol Pullback Scalper FULL v22.6: Live-safe defaults restored, ADX filter fixed for ImprovedEntry, Setup2 standalone disabled when ImprovedEntry active."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -479,21 +479,21 @@ input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.5
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 4.0;   // lean-test: 8→4 — meer signalen doorlaten
+input double   InpMinATR_Pips             = 8.0;   // v22.2: min ATR (pips) — filters dode markten uit
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
 input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
-input double   InpMinADXForEntry          = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
-input double   InpMinADXEntryFilter       = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
+input double   InpMinADXForEntry          = 25.0;  // v22.2: minimale ADX op trend-TF — alleen duidelijke trends
+input double   InpMinADXEntryFilter       = 25.0;  // v22.2: minimale ADX op entry-TF — idem
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
-input double   InpEntryMinBodyATRFrac     = 0.10; // lean-test: 0.20→0.10 — kleinere body toegestaan
-input bool     InpEntryUseFollowThrough   = false; // lean-test: UIT — geen follow-through vereist
-input bool     InpEntryUseWickFilter      = false; // lean-test: UIT — geen wick-filter
-input double   InpEntryMaxOppWickBodyFrac = 0.45; // (referentie — filter staat uit)
-input bool     InpEntryUseRangeATRFilter  = false; // lean-test: UIT — geen range/ATR-filter
-input double   InpEntryMinRangeATRFrac    = 0.20; // lean-test: 0.35→0.20 (referentie — filter staat uit)
-input double   InpEntryMinCloseInRangeFrac= 0.45; // lean-test: 0.60→0.45 — ruimere close-locatie
+input double   InpEntryMinBodyATRFrac     = 0.20; // v22.2: min candle body als fractie van ATR
+input bool     InpEntryUseFollowThrough   = true;  // vereist follow-through: vorig candle zelfde richting
+input bool     InpEntryUseWickFilter      = true;  // blokkeer indecisie-bars met grote tegengestelde wick
+input double   InpEntryMaxOppWickBodyFrac = 0.45; // max toegestane tegengestelde wick t.o.v. body
+input bool     InpEntryUseRangeATRFilter  = true;  // vereist minimale candle-range t.o.v. ATR
+input double   InpEntryMinRangeATRFrac    = 0.35; // min (candle range / ATR) — filtert te kleine bars
+input double   InpEntryMinCloseInRangeFrac= 0.60; // v22.2: close moet >= 60% in candle range zitten
 
 // --- Improved entry: Trend + Pullback + Continuation (v22.5)
 // When true, replaces Setup1 with a simplified pullback-based edge:
@@ -501,18 +501,18 @@ input double   InpEntryMinCloseInRangeFrac= 0.45; // lean-test: 0.60→0.45 — 
 //   2. Pullback:  last closed bar touches EMA on InpEntryTF (InpEMA_Period)
 //   3. Trigger:   continuation candle (close > open for buy, < open for sell)
 // All other risk guards (ATR, ADX, corr, portfolio) remain active.
-input bool     InpUseImprovedEntry        = true;  // lean-test: AAN — betere RR, meer trades, minder filters
+input bool     InpUseImprovedEntry        = true;  // v22.5: verbeterde entry (Trend+Pullback+Continuation); vervangt Setup1
 input double   InpImprovedEntry_ATRMinPips = 2.0;  // min ATR in pips for improved entry (0 = off)
 
 
 // --- Advanced filters / regimes (v9)
-input bool     InpUseHTFBias              = false; // lean-test: UIT — geen H4 bias filter
+input bool     InpUseHTFBias              = true;  // v22.2: H4 trend-bias — traden alleen met de sterke trend
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
 input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
 
-input bool     InpUseCorrelationGuard     = false; // lean-test: UIT — geen correlatie-blokkering
+input bool     InpUseCorrelationGuard     = true;  // v22.2: correlatie-bewaking — blokkeert gecorreleerde posities
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
 input double   InpCorrAbsThreshold        = 0.90;  // abs(corr) >= threshold blocks entry (v22.4: 0.85→0.90; many FX pairs naturally exceed 0.85)
@@ -540,7 +540,7 @@ input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP
 input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
 input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
-input bool     InpUseVolRegime            = false; // lean-test: UIT — geen volatiliteitsregime blokkering
+input bool     InpUseVolRegime            = true;  // v22.2: vol-regime bewaking — schaal risico bij abnormale volatiliteit
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
@@ -549,19 +549,19 @@ input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflic
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
-// lean-test: ON — Setup2 runs in parallel as an extra signal path
-input bool     InpUseSetup2               = true;
+// Uitgeschakeld: contrarian logica geeft 100% één-richting trades wanneer ImprovedEntry actief is
+input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = false; // lean-test: UIT — handel ook buiten London/NY
+input bool     InpUseSessions             = true;  // v22.1: handel alleen tijdens London (07–17) + NY (12–21 UTC)
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 3.5;   // lean-test: 2.0→3.5 — meer brokers/momenten toegestaan
+input double   InpMaxSpreadPips_FX        = 2.0;   // v22.1: max spread in pips voor FX-paren
 input double   InpMaxSpreadPips_XAU       = 80.0;
 
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
@@ -621,7 +621,7 @@ input int      InpTGBackoffMaxSec         = 60;     // max backoff on Telegram e
 input bool     InpEnableAuditLog          = true;
 input bool     InpAuditFlushAlways        = false;
 
-input bool     InpEnableMLExport          = true;  // lean-test: AAN — data verzamelen voor analyse
+input bool     InpEnableMLExport          = false; // ML export UIT als standaard — zet AAN voor data-collectie
 input string   InpMLFile                  = "ml_export_v2.csv";
 input string   InpMLDelimiter             = ";";
 input int      InpMLFlushEveryNRows       = 50; // increased for IO perf
@@ -699,21 +699,21 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 5;    // lean-test: 20→5 — meer setups per dag
-input int      InpMaxEntriesPerSymbolPerDay = 10;  // lean-test: 5→10 — ruimere dagcap per symbool
-input int      InpMaxEntriesTotalPerDay   = 25;   // lean-test: 10→25 — ruimere totale dagcap
-input bool     InpLossStreakBlock_Enable  = false; // lean-test: UIT — geen verlies-streak blokkering
+input int      InpMinMinutesBetweenEntries = 20;   // v22.2: minimale wachttijd tussen entries (minuten)
+input int      InpMaxEntriesPerSymbolPerDay = 5;   // v22.2: max entries per symbool per dag
+input int      InpMaxEntriesTotalPerDay   = 10;   // v22.2: max totale entries per dag
+input bool     InpLossStreakBlock_Enable  = true;  // v22.1: blokkeer entries na opeenvolgende verliezen
 input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses (v22.2: 2→3)
 input int      InpLossStreakBlockMinutes  = 120;   // lock duration after loss-streak trigger (v22.2: 240→120)
 
 // --- Daily loss circuit breaker (v22.1)
 input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance
-input double   InpDailyLoss_PctBalance    = 5.0;    // lean-test: 2→5% — ruimer voor testperiode
+input double   InpDailyLoss_PctBalance    = 2.0;    // v22.1: halt entries wanneer dagverlies >= X% van dagbalans
 input bool     InpDailyLoss_CloseAll      = false;  // close all open positions when breached (nuclear option)
 
 // --- Equity drawdown circuit breaker (v22.1)
 input bool     InpEquityCB_Enable         = true;   // halt new entries when equity DD >= X% from peak
-input double   InpEquityCB_Pct            = 15.0;   // lean-test: 5→15% — ruimere equity CB voor testperiode
+input double   InpEquityCB_Pct            = 5.0;    // v22.1: halt entries wanneer equity DD >= X% van piek
 
 // -----------------------------------------
 // Globals / enums
@@ -6082,17 +6082,28 @@ void ProcessSymbol(const int idx, const string sym)
    if(InpUseImprovedEntry)
    {
       primaryOk = EntrySignal_Improved(idx, sym, isBuy1, atrPips);
-      // ADX values stay at 999 (pass-through) so optional ADX filter can still work if enabled.
+      // v22.6: lees werkelijke ADX-waarden zodat de ADX-filter ook werkt voor ImprovedEntry.
+      // Voorheen bleven adxTrend/adxEntry op 999 waardoor de ADX-filter altijd passeerde.
+      if(InpUseADXFilter)
+      {
+         double _adxT[2], _adxE[2];
+         if(CopyLast(g_adxHandle[idx],0,0,2,_adxT))  adxTrend = _adxT[1];
+         if(CopyLast(g_adxEntryHandle[idx],0,0,2,_adxE)) adxEntry = _adxE[1];
+      }
    }
    else
    {
       primaryOk = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
    }
 
-   // Setup2 runs in parallel: if primary has no signal, Setup2 can still produce an entry.
+   // v22.6: Setup2 standalone is UITGESCHAKELD wanneer ImprovedEntry actief is.
+   // Bug: Setup2 is contrarian (geeft tegengestelde richting van de candle). In een dalende H4-trend:
+   //   - ImprovedEntry vuurt SELL op bearish M5-bar
+   //   - Als M5-bar bullish is (ImprovedEntry faalt), vuurt Setup2 SELL (contrarian van bullish)
+   // → 100% SELL-signalen in elke aanhoudende trend, ongeacht de marktrichting.
    bool setup2Ok=false;
    bool isBuy2=false;
-   if(InpUseSetup2)
+   if(InpUseSetup2 && !InpUseImprovedEntry)
       setup2Ok = EntrySignal_Setup2(idx, sym, isBuy2);
 
    if(!primaryOk && !setup2Ok) return;
@@ -6198,7 +6209,8 @@ void ProcessSymbol(const int idx, const string sym)
    // v22.4: allow Setup2 also when Setup1 DID pass BreakPrev but Setup2 gives a different direction.
    // Only override when Setup1 was confirmed and Setup2 agrees (same direction = stronger confluence).
    // We do NOT override to opposite direction to avoid BreakPrev-vs-S2 conflicts caught in v22.3.
-   if(!setup2Active && breakOk && InpUseSetup2)
+   // v22.6: skip entirely when ImprovedEntry active — contrarian Setup2 never agrees with ImprovedEntry direction.
+   if(!setup2Active && breakOk && InpUseSetup2 && !InpUseImprovedEntry)
    {
       bool isBuy2=false;
       if(EntrySignal_Setup2(idx, sym, isBuy2) && isBuy2==isBuy1)
