@@ -1092,7 +1092,7 @@ bool IsAllowedTradeSymbol(const string sym)
       if(StringFind(up,"EURUSD")==0) pair="EURUSD";
       else if(StringFind(up,"GBPUSD")==0) pair="GBPUSD";
       else if(StringFind(up,"XAUUSD")==0) pair="XAUUSD";
-      else if(StringFind(up,"CUCUSD")==0) pair="CUCUSD"; // backward compatibility for older typo-based configs
+      else if(StringFind(up,"CUCUSD")==0) pair="CUCUSD"; // keep legacy alias so older parameter sets keep working
    }
 
    return (pair=="EURUSD" || pair=="GBPUSD" || pair=="XAUUSD" || pair=="CUCUSD");
@@ -6095,8 +6095,8 @@ void ProcessSymbol(const int idx, const string sym)
    if(InpUseSetup2)
       setup2Ok = EntrySignal_Setup2(idx, sym, isBuy2);
 
-   bool setup2Standalone = (!primaryOk && setup2Ok);
    if(!primaryOk && !setup2Ok) return;
+   bool setup2Standalone = (!primaryOk && setup2Ok);
 
    if(setup2Standalone)
    {
@@ -6163,8 +6163,18 @@ void ProcessSymbol(const int idx, const string sym)
    // the improved entry already incorporates trend + pullback, making BreakPrev redundant.
    bool breakOk = InpUseImprovedEntry ? true : BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
    bool useSetup2=setup2Standalone;
-   bool isBuy=(setup2Standalone ? isBuy2 : isBuy1);
-   string setup = (setup2Standalone ? "S2" : (InpUseImprovedEntry ? "IMP" : "S1"));
+   bool isBuy=false;
+   string setup="";
+   if(setup2Standalone)
+   {
+      isBuy=isBuy2;
+      setup="S2";
+   }
+   else
+   {
+      isBuy=isBuy1;
+      setup=(InpUseImprovedEntry ? "IMP" : "S1");
+   }
 
    if(!breakOk)
    {
