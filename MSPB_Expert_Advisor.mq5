@@ -421,7 +421,8 @@ string News_StatusLine()
 // -----------------------------------------
 
 // --- Symbols / TF
-input string   InpSymbols                 = "EURUSD,GBPUSD,CUCUSD";
+input string   InpSymbols                 = "EURUSD,GBPUSD,XAUUSD";
+input bool     InpEnforceSymbolWhitelist  = false; // if true: only allow hardcoded majors (controlled tests)
 input ENUM_TIMEFRAMES InpEntryTF          = PERIOD_M5;  // entry signal timeframe (v22.2: M1→M5 — less noise)
 input ENUM_TIMEFRAMES InpConfirmTF        = PERIOD_H1;  // confirmation timeframe (v22.2: M5→H1 — stronger confirm)
 
@@ -548,8 +549,8 @@ input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflic
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
-// lean-test: UIT — Setup2 geeft contrarian richting t.o.v. Setup1 op dezelfde candle → richtingconflict
-input bool     InpUseSetup2               = false;
+// lean-test: AAN — Setup2 runs in parallel as an extra signal path
+input bool     InpUseSetup2               = true;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
@@ -1075,7 +1076,7 @@ string ResolveSymbolName(const string raw)
 
 
 // ----------------------------------------------------
-// Hard whitelist: trade only these FX pairs (suffix ok)
+// Optional hard whitelist (suffix ok)
 // ----------------------------------------------------
 bool IsAllowedTradeSymbol(const string sym)
 {
@@ -1090,10 +1091,11 @@ bool IsAllowedTradeSymbol(const string sym)
       string up=sym; StringToUpper(up);
       if(StringFind(up,"EURUSD")==0) pair="EURUSD";
       else if(StringFind(up,"GBPUSD")==0) pair="GBPUSD";
-      else if(StringFind(up,"CUCUSD")==0) pair="CUCUSD";
+      else if(StringFind(up,"XAUUSD")==0) pair="XAUUSD";
+      else if(StringFind(up,"CUCUSD")==0) pair="CUCUSD"; // backward compatibility for older typo-based configs
    }
 
-   return (pair=="EURUSD" || pair=="GBPUSD" || pair=="CUCUSD");
+   return (pair=="EURUSD" || pair=="GBPUSD" || pair=="XAUUSD" || pair=="CUCUSD");
 }
 
 
@@ -6076,16 +6078,57 @@ void ProcessSymbol(const int idx, const string sym)
    bool isBuy1; double adxTrend, adxEntry, atrPips, bodyPips;
    adxTrend=999.0; adxEntry=999.0; bodyPips=0.0;
 
+   bool primaryOk=false;
    if(InpUseImprovedEntry)
    {
-      bool okImp = EntrySignal_Improved(idx, sym, isBuy1, atrPips);
-      if(!okImp) return;
+      primaryOk = EntrySignal_Improved(idx, sym, isBuy1, atrPips);
       // ADX values stay at 999 (pass-through) so optional ADX filter can still work if enabled.
    }
    else
    {
-      bool ok1 = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
-      if(!ok1) return;
+      primaryOk = EntrySignal_Setup1(idx, sym, isBuy1, adxTrend, adxEntry, atrPips, bodyPips);
+   }
+
+   // Setup2 runs in parallel: if primary has no signal, Setup2 can still produce an entry.
+   bool setup2Ok=false;
+   bool isBuy2=false;
+   if(InpUseSetup2)
+      setup2Ok = EntrySignal_Setup2(idx, sym, isBuy2);
+
+   bool setup2Standalone = (!primaryOk && setup2Ok);
+   if(!primaryOk && !setup2Ok) return;
+
+   if(setup2Standalone)
+   {
+      isBuy1 = isBuy2;
+
+      // Load minimum signal context needed by downstream risk/filters.
+      double pip=PipSize(sym);
+      if(pip<=0.0) return;
+
+      MqlRates r2[2];
+      if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r2)) return;
+      bodyPips = MathAbs(r2[1].close - r2[1].open) / pip;
+
+      double atrBuf2[2];
+      if(!CopyLast(g_atrHandle[idx],0,0,2,atrBuf2)) return;
+      atrPips = atrBuf2[1] / pip;
+      if(atrPips<=0.0) return;
+
+      if(InpUseADXFilter)
+      {
+         double adxBufT2[2];
+         double adxBufE2[2];
+         if(!CopyLast(g_adxHandle[idx],0,0,2,adxBufT2)) return;
+         if(!CopyLast(g_adxEntryHandle[idx],0,0,2,adxBufE2)) return;
+         adxTrend = adxBufT2[1];
+         adxEntry = adxBufE2[1];
+      }
+      else
+      {
+         adxTrend = 999.0;
+         adxEntry = 999.0;
+      }
    }
 
    // ATR filter
@@ -6119,9 +6162,9 @@ void ProcessSymbol(const int idx, const string sym)
    // v22.5: when InpUseImprovedEntry is active, BreakPrev and Setup2 logic is bypassed —
    // the improved entry already incorporates trend + pullback, making BreakPrev redundant.
    bool breakOk = InpUseImprovedEntry ? true : BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
-   bool useSetup2=false;
-   bool isBuy=isBuy1;
-   string setup = InpUseImprovedEntry ? "IMP" : "S1";
+   bool useSetup2=setup2Standalone;
+   bool isBuy=(setup2Standalone ? isBuy2 : isBuy1);
+   string setup = (setup2Standalone ? "S2" : (InpUseImprovedEntry ? "IMP" : "S1"));
 
    if(!breakOk)
    {
@@ -6807,8 +6850,8 @@ int OnInit()
       }
 
 
-      // Hard whitelist: only trade EURUSD/GBPUSD/CUCUSD (suffix ok)
-      if(!IsAllowedTradeSymbol(sym))
+      // Optional hard whitelist (disabled by default to keep multi-symbol engine active)
+      if(InpEnforceSymbolWhitelist && !IsAllowedTradeSymbol(sym))
       {
          Print("[INIT] Skipping not-allowed symbol: ", raw, " (resolved: ", sym, ")");
          continue;
