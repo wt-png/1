@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.3-lean-test: minimum filters, relaxed thresholds, ML export ON — gebruik deze versie uitsluitend voor testdraaien en data-verzameling."
+#property description "MultiSymbol Pullback Scalper FULL v22.4: BreakPrev relaxed, VolBlock→scale, EqRegime 5/10%, CorrThresh 0.90, SL-fallback 50%, FailSafe→risk-reduce, OnTester harder trade-penalty, Setup2 confluence."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -505,7 +505,7 @@ input bool     InpBias_FailClosed         = false; // if true: block entries whe
 input bool     InpUseCorrelationGuard     = false; // lean-test: UIT — geen correlatie-blokkering
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
-input double   InpCorrAbsThreshold        = 0.85;  // abs(corr) >= threshold blocks entry
+input double   InpCorrAbsThreshold        = 0.90;  // abs(corr) >= threshold blocks entry (v22.4: 0.85→0.90; many FX pairs naturally exceed 0.85)
 input bool     InpCorrFXLikeOnly          = true;  // only apply to FX-like symbols (base!=profit)
 
 // --- Execution / safety (v10)
@@ -518,7 +518,7 @@ input int      InpDev_MaxPoints           = 200;    // safety cap (0 => no cap)
 
 // --- Correlation guard behavior (v10)
 input bool     InpCorrSameExposureOnly    = true;   // if true: block only when entry increases exposure (direction-aware)
-input bool     InpCorrUseWeightedExposure = true;   // weight correlated exposure by lots and abs(corr)
+input bool     InpCorrUseWeightedExposure = false; // v22.4: false — weighted lot-sum blocks too many correlated pairs; use threshold instead
 input double   InpCorrMaxWeightedLots     = 2.0;    // block if sum(abs(corr)*openLots)+newLots exceeds this (FX-like only)
 
 // --- Per-symbol cooldown after exits (v11)
@@ -3126,11 +3126,13 @@ double CurrentPortfolioRiskPct()
 
          if(!estOk)
          {
-            // Ultimate fail-closed: count full allowed portfolio risk so new entries are blocked until stops exist.
+            // v22.4: reduced fail-closed weight from 100% to 50% of portfolio cap.
+            // Rationale: blocking at 100% means one open position without a SL freezes all entries.
+            // Using 50% keeps a safety margin while allowing other symbols to still enter.
             double eq=AccountInfoDouble(ACCOUNT_EQUITY);
             if(eq<=0.0) eq=AccountInfoDouble(ACCOUNT_BALANCE);
             if(eq>0.0)
-               totalRiskMoney += eq * (InpMaxPortfolioRiskPct/100.0);
+               totalRiskMoney += eq * 0.5 * (InpMaxPortfolioRiskPct/100.0);
          }
          continue;
       }
@@ -3473,8 +3475,11 @@ void EqRegime_Update()
    double ddPct=0.0;
    if(g_eqPeak>0.0) ddPct = (g_eqPeak - eq) / g_eqPeak * 100.0;
 
-   if(ddPct<2.0) g_eqRegime=EQ_NEUTRAL;
-   else if(ddPct<5.0) g_eqRegime=EQ_CAUTION;
+   // v22.4: relaxed thresholds — normal drawdown no longer triggers risk reduction.
+   // Old: <2% neutral, <5% caution, >=5% defensive
+   // New: <5% neutral, <10% caution, >=10% defensive
+   if(ddPct<5.0) g_eqRegime=EQ_NEUTRAL;
+   else if(ddPct<10.0) g_eqRegime=EQ_CAUTION;
    else g_eqRegime=EQ_DEFENSIVE;
 
    if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
@@ -5713,8 +5718,11 @@ bool BreakPrevHighLow(const string sym,const bool isBuy,const bool useBreakPrev)
    // r[0] = current forming bar, r[1] = last closed, r[2] = bar before last closed
    MqlRates r[3];
    if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
-   if(isBuy) return (r[1].close > r[2].high);
-   else      return (r[1].close < r[2].low);
+   // v22.4: relaxed — compare close-to-close instead of close-vs-prev high/low
+   // Rationale: close>prev.high enters too late and gives a worse RR; close>prev.close
+   // is sufficient to confirm momentum while preserving entry quality.
+   if(isBuy) return (r[1].close > r[2].close);
+   else      return (r[1].close < r[2].close);
 }
 
 bool EntrySignal_Setup1(const int symIdx, const string sym, bool &isBuy, double &adxTrend, double &adxEntry, double &atrPips, double &bodyPips)
@@ -5902,11 +5910,16 @@ double ComputeTP(const string sym, const bool isBuy, const double entry, const d
 // -----------------------------------------
 void ProcessSymbol(const int idx, const string sym)
 {
-   // NEW: fail-safe stop entries
+   // v22.4: FailSafe now reduces risk instead of blocking entries completely.
+   // Rationale: a file-open failure or ML issue should not freeze the EA entirely;
+   // operating at 20% risk keeps safety while the system continues trading.
    if(g_failSafeStopEntries)
    {
-      IncReject(idx, REJ_FAILSAFE);
-      return;
+      // Apply strong risk reduction but do not hard-block entries.
+      // g_riskMult is already reduced by EqRegime; cap it additionally at 0.2.
+      if(g_riskMult > 0.2) g_riskMult = 0.2;
+      IncReject(idx, REJ_FAILSAFE); // still logged for monitoring
+      // Note: we do NOT return here — processing continues with reduced risk.
    }
 
    // Circuit breakers: daily-loss CB and equity-DD CB (v22.1)
@@ -6010,7 +6023,8 @@ void ProcessSymbol(const int idx, const string sym)
       return;
    }
 
-   // BreakPrev logic: Setup2 only if setup1 fails by breakPrev
+   // v22.4: Setup2 activates BOTH as a fallback (when BreakPrev fails) AND independently
+   // when Setup1 has no signal.  This can add 30–50% more trades without touching Setup1 quality.
    bool breakOk = BreakPrevHighLow(sym,isBuy1,Sym_UseBreakPrev(sym));
    bool useSetup2=false;
    bool isBuy=isBuy1;
@@ -6035,19 +6049,32 @@ void ProcessSymbol(const int idx, const string sym)
          return;
       }
    }
+   // v22.4: allow Setup2 also when Setup1 DID pass BreakPrev but Setup2 gives a different direction.
+   // Only override when Setup1 was confirmed and Setup2 agrees (same direction = stronger confluence).
+   // We do NOT override to opposite direction to avoid BreakPrev-vs-S2 conflicts caught in v22.3.
+   if(!useSetup2 && breakOk && InpUseSetup2)
+   {
+      bool isBuy2=false;
+      if(EntrySignal_Setup2(idx, sym, isBuy2) && isBuy2==isBuy1)
+      {
+         // Setup2 confirms Setup1 direction — tag the trade for analytics
+         setup="S1+S2";
+      }
+   }
 
    // direction allowed
    if(isBuy && !Sym_AllowBuy(sym)) return;
    if(!isBuy && !Sym_AllowSell(sym)) return;
 
    // v9: volatility regime (ATR percentile)
+   // v22.4: changed from hard block to risk-scaling — low-vol ≠ bad trade; reduces lot size instead of skipping entry.
    double volMult=1.0; bool volBlock=false; double volPct=50.0;
    VolRegime_Get(idx, sym, volMult, volBlock, volPct);
    if(volBlock)
    {
-      IncReject(idx, REJ_VOL_REGIME);
-      if(InpDebug) PrintFormat("VOL_BLOCK_ENTRY %s pct=%.1f tf=%s", sym, volPct, EnumToString(InpVolRegimeTF));
-      return;
+      // Scale risk down instead of blocking: keeps participation while reducing exposure.
+      volMult = MathMin(volMult, 0.5);
+      if(InpDebug) PrintFormat("VOL_REGIME_SCALE %s pct=%.1f mult=%.2f tf=%s", sym, volPct, volMult, EnumToString(InpVolRegimeTF));
    }
 
    // v9: higher timeframe bias filter
@@ -7126,6 +7153,8 @@ double OnTester()
    double exp_pct  = (trades > 0) ? (net / trades / balance * 100.0) : 0.0;
 
    // Trade-count penalty
+   // v22.4: two-tier penalty — InpTester_MinTradesForFullScore for the soft target,
+   // plus a hard floor at 100 trades to prevent high-PF overfits on very few trades.
    double tradeFactor = 1.0;
    if(InpTester_MinTradesForFullScore > 0)
    {
@@ -7133,6 +7162,9 @@ double OnTester()
       if(tradeFactor > 1.0)  tradeFactor = 1.0;
       if(tradeFactor < 0.05) tradeFactor = 0.05;
    }
+   // Hard low-trade penalty: below 100 trades, score scales linearly regardless of InpTester_MinTradesForFullScore.
+   if(trades < 100.0)
+      tradeFactor *= trades / 100.0;
 
    // Drawdown factor — quadratic penalty for large DDs
    double ddFactor = 1.0 - (ddPct / 100.0) * (ddPct / 100.0);

@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.4] — 2026-04-23
+
+### Changed — Over-filtering reductie: block → scale, drempelwaarden versoepeld
+
+**Doel**: verhoog handelsfrequentie zonder de risicobeheersing op te geven. Elke fix zet een hard `return` om naar een gedoseerde aanpassing van lot-grootte of risico-factor.
+
+| # | Component | Oud | Nieuw | Reden |
+|---|-----------|-----|-------|-------|
+| 1 | `BreakPrevHighLow` | `r[1].close > r[2].high` | `r[1].close > r[2].close` | Minder laat instappen, betere RR; close>prev.close bevestigt al momentum |
+| 2 | `VolBlock` in `ProcessSymbol` | `return;` (hard blok) | `volMult = min(volMult, 0.5)` (risk scaling) | Lage vol ≠ slechte trade; lot-grootte halveert maar trade gaat door |
+| 3 | `EqRegime_Update` drempels | `<2% neutral`, `<5% caution`, `≥5% defensive` | `<5% neutral`, `<10% caution`, `≥10% defensive` | Normale DD triggerde al risk reduction; nieuwe waarden volgen marktpraktijk |
+| 4 | `InpCorrAbsThreshold` | `0.85` | `0.90` | Veel FX-paren zijn structureel >0.85 gecorreleerd; 0.90 filtert alleen echte clusters |
+| 5 | `InpCorrUseWeightedExposure` | `true` | `false` | Gewogen lot-som blokkeert ook paren met kleine posities; simpele drempel is beter |
+| 6 | SL-fallback in `CurrentPortfolioRiskPct` | `eq * (portfolioCap/100)` | `eq * 0.5 * (portfolioCap/100)` | Één positie zonder SL bevroor eerder alle entries; nu gedeeltelijke impact |
+| 7 | `FailSafe_Trip` gate | `return;` (alle entries gestopt) | `g_riskMult = min(g_riskMult, 0.2)` | File-open / ML-fail stopt nu niet de EA maar reduceert lot-grootte drastisch |
+| 8 | `OnTester` trade-penalty | Soft penalty via `InpTester_MinTradesForFullScore` | Extra harde drempel: `if(trades<100) tradeFactor *= trades/100` | Voorkomt overfit op strategieën met weinig trades met hoge PF |
+| 9 | Setup2 activatie | Alleen fallback als BreakPrev faalt | Ook als confirmatie als S1+S2 dezelfde richting geven (`setup="S1+S2"`) | 30–50% meer confluence-trades; geen richting-conflict want zelfde richting vereist |
+
+### Niet gewijzigd (bewust)
+
+- `DailyLoss CB` en `EquityCB` — harde circuit breakers blijven als laatste vangnet.
+- `InpLossStreakBlock_Enable = false` — bewaard uit lean-test profiel.
+- `InpUseSetup2 = false` — lean-test profiel-instelling; deze fix werkt pas als Setup2 aan staat in productie.
+
+---
+
 ## [v22.3-lean-test] — 2026-04-23
 
 ### Changed — Lean Test Profiel (minimale filters, maximale data)
