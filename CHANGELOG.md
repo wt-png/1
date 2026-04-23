@@ -44,6 +44,20 @@ echte data terug krijgen om de instellingen daarna te verbeteren.
 3. Draai `python tools/stress_test.py ml_export_v2.csv` → stress-gates.
 4. Zet filters die data bevestigt stap voor stap terug aan (begin met ADX en sessies).
 
+### Filter-conflicten opgelost (v22.3 patch)
+
+Na analyse van de entry-flow zijn drie filter-conflicten gevonden en gecorrigeerd:
+
+| # | Conflict | Fix |
+|---|---------|-----|
+| 1 | **Setup2 geeft contrarian richting** — als Setup1 een BUY geeft maar BreakPrev faalt, flipt Setup2 naar SELL op dezelfde candle | `InpUseSetup2 = false` |
+| 2 | **VolRegime-blok vs ATR-min filter** — beide meten volatiliteit op M5; ATR-min selecteert al op "genoeg vol", waarna VolLowBlock dezelfde bars nogmaals uitsluit | `InpVolLowBlockEntries = false`; gebruik `InpVolHighRiskMult` voor lot-scaling i.p.v. hard blok |
+| 3 | **WickFilter redundant met CloseInRange** — een candle die ≥ 45 % close-in-range haalt heeft per definitie een kleine tegengestelde wick; WickFilter voegt niets toe | WickFilter was al `false` in lean-test |
+
+> **Resterende aandachtspunten na testrun:**
+> - Als HTF bias (H4) later weer aan gaat → verlaag ADX-entry drempel naar ~18 (H4 doet de grove richting al).
+> - DailyLoss CB + Equity CB zijn voldoende bescherming op portfolio-niveau; LossStreakBlock staat uit in lean-test.
+
 ---
 
 ## [v22.2] — 2026-04-23

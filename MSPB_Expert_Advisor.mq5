@@ -535,11 +535,12 @@ input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
 input double   InpVolHighPct              = 80.0;  // >= => high vol regime
-input bool     InpVolLowBlockEntries      = true;  // block entries in low regime
+input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflicteert met ATR-min filter (beide meten vol); gebruik VolHighRiskMult voor lot-scaling i.p.v. hard blok
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
-input bool     InpUseSetup2               = true;  // lean-test: AAN — fallback signaal voor meer trades
+// lean-test: UIT — Setup2 geeft contrarian richting t.o.v. Setup1 op dezelfde candle → richtingconflict
+input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
