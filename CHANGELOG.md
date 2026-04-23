@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.3-lean-test] — 2026-04-23
+
+### Changed — Lean Test Profiel (minimale filters, maximale data)
+
+**Doel**: Zoveel mogelijk trades genereren in de Strategy Tester zodat we
+echte data terug krijgen om de instellingen daarna te verbeteren.
+**Gebruik**: Alleen voor testdraaien / data-verzameling. Niet voor live.
+
+| Parameter | v22.2 | v22.3-lean | Reden |
+|-----------|-------|-----------|-------|
+| `InpMinATR_Pips` | 8.0 | **4.0** | Meer setups doorlaten |
+| `InpMinADXForEntry` | 25.0 | **15.0** | Ook matige trends meenemen |
+| `InpMinADXEntryFilter` | 25.0 | **15.0** | Idem |
+| `InpEntryMinBodyATRFrac` | 0.20 | **0.10** | Kleinere body toegestaan |
+| `InpEntryMinCloseInRangeFrac` | 0.60 | **0.45** | Ruimere close-locatie |
+| `InpEntryUseFollowThrough` | true | **false** | Geen follow-through vereist |
+| `InpEntryUseWickFilter` | true | **false** | Geen wick-filter |
+| `InpEntryUseRangeATRFilter` | true | **false** | Geen range/ATR-filter |
+| `InpUseHTFBias` | true | **false** | Geen H4 bias filter |
+| `InpUseCorrelationGuard` | true | **false** | Geen correlatie-blokkering |
+| `InpUseVolRegime` | true | **false** | Geen vol-regime blokkering |
+| `InpUseSetup2` | false | **true** | Fallback signaal voor extra trades |
+| `InpUseSessions` | true | **false** | Handel ook buiten London/NY |
+| `InpMaxSpreadPips_FX` | 2.0 | **3.5** | Meer brokers/momenten toegestaan |
+| `InpMinMinutesBetweenEntries` | 20 | **5** | Minder wachttijd tussen entries |
+| `InpMaxEntriesPerSymbolPerDay` | 5 | **10** | Ruimere dagcap per symbool |
+| `InpMaxEntriesTotalPerDay` | 10 | **25** | Ruimere totale dagcap |
+| `InpLossStreakBlock_Enable` | true | **false** | Geen verlies-streak blokkering |
+| `InpDailyLoss_PctBalance` | 2.0 % | **5.0 %** | Ruimere daily-loss CB voor test |
+| `InpEquityCB_Pct` | 5.0 % | **15.0 %** | Ruimere equity CB voor test |
+| `InpEnableMLExport` | false | **true** | Data verzamelen voor analyse |
+| `InpTester_UseCustomCriterion` | false | **true** | Custom score voor optimalisatie |
+
+### Volgend stap na testrun
+1. Export `ml_export_v2.csv` uit de tester-run.
+2. Draai `python tools/wfo_pipeline.py ml_export_v2.csv` → WFO rapport.
+3. Draai `python tools/stress_test.py ml_export_v2.csv` → stress-gates.
+4. Zet filters die data bevestigt stap voor stap terug aan (begin met ADX en sessies).
+
+---
+
 ## [v22.2] — 2026-04-23
 
 ### Changed — Demo-Ready Parameter Tuning

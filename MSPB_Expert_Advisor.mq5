@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.2: demo-ready tuning — M5 entries, H1 confirm, H4 bias, RR 1.8, ADX/ATR period 14, higher quality filters."
+#property description "MultiSymbol Pullback Scalper FULL v22.3-lean-test: minimum filters, relaxed thresholds, ML export ON — gebruik deze versie uitsluitend voor testdraaien en data-verzameling."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -478,31 +478,31 @@ input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.5
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 8.0;   // min ATR in pips (v22.2: 12→8 — M5 bars are smaller)
+input double   InpMinATR_Pips             = 4.0;   // lean-test: 8→4 — meer signalen doorlaten
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
 input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
-input double   InpMinADXForEntry          = 25.0;  // min ADX trend for entry (v22.2: 22→25 — only strong trends)
-input double   InpMinADXEntryFilter       = 25.0;  // min ADX entry quality (v22.2: 22→25 — only strong trends)
+input double   InpMinADXForEntry          = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
+input double   InpMinADXEntryFilter       = 15.0;  // lean-test: 25→15 — ook matige trends meenemen
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
-input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
-input bool     InpEntryUseFollowThrough   = true; // require previous bar in same direction
-input bool     InpEntryUseWickFilter      = true; // reject indecision candles with big opposite wick
-input double   InpEntryMaxOppWickBodyFrac = 0.45; // opposite wick <= X * body
-input bool     InpEntryUseRangeATRFilter  = true; // require meaningful candle range vs ATR
-input double   InpEntryMinRangeATRFrac    = 0.35; // candle range >= X * ATR
-input double   InpEntryMinCloseInRangeFrac= 0.60; // buy: close near high; sell: close near low
+input double   InpEntryMinBodyATRFrac     = 0.10; // lean-test: 0.20→0.10 — kleinere body toegestaan
+input bool     InpEntryUseFollowThrough   = false; // lean-test: UIT — geen follow-through vereist
+input bool     InpEntryUseWickFilter      = false; // lean-test: UIT — geen wick-filter
+input double   InpEntryMaxOppWickBodyFrac = 0.45; // (referentie — filter staat uit)
+input bool     InpEntryUseRangeATRFilter  = false; // lean-test: UIT — geen range/ATR-filter
+input double   InpEntryMinRangeATRFrac    = 0.20; // lean-test: 0.35→0.20 (referentie — filter staat uit)
+input double   InpEntryMinCloseInRangeFrac= 0.45; // lean-test: 0.60→0.45 — ruimere close-locatie
 
 
 // --- Advanced filters / regimes (v9)
-input bool     InpUseHTFBias              = true;
+input bool     InpUseHTFBias              = false; // lean-test: UIT — geen H4 bias filter
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
 input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
 
-input bool     InpUseCorrelationGuard     = true;
+input bool     InpUseCorrelationGuard     = false; // lean-test: UIT — geen correlatie-blokkering
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
 input double   InpCorrAbsThreshold        = 0.85;  // abs(corr) >= threshold blocks entry
@@ -530,7 +530,7 @@ input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP
 input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
 input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
-input bool     InpUseVolRegime            = true;
+input bool     InpUseVolRegime            = false; // lean-test: UIT — geen volatiliteitsregime blokkering
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
@@ -539,18 +539,18 @@ input bool     InpVolLowBlockEntries      = true;  // block entries in low regim
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
-input bool     InpUseSetup2               = false;
+input bool     InpUseSetup2               = true;  // lean-test: AAN — fallback signaal voor meer trades
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = true;  // London + NY only (v22.1: false→true)
+input bool     InpUseSessions             = false; // lean-test: UIT — handel ook buiten London/NY
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 2.0;   // max spread for FX (v22.1: 3.0→2.0 pips)
+input double   InpMaxSpreadPips_FX        = 3.5;   // lean-test: 2.0→3.5 — meer brokers/momenten toegestaan
 input double   InpMaxSpreadPips_XAU       = 80.0;
 
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
@@ -610,7 +610,7 @@ input int      InpTGBackoffMaxSec         = 60;     // max backoff on Telegram e
 input bool     InpEnableAuditLog          = true;
 input bool     InpAuditFlushAlways        = false;
 
-input bool     InpEnableMLExport          = false;
+input bool     InpEnableMLExport          = true;  // lean-test: AAN — data verzamelen voor analyse
 input string   InpMLFile                  = "ml_export_v2.csv";
 input string   InpMLDelimiter             = ";";
 input int      InpMLFlushEveryNRows       = 50; // increased for IO perf
@@ -680,7 +680,7 @@ input bool     InpShowDashboard           = true;
 
 // --- Tester / robustness / diagnostics (NEW v12)
 input double   InpSpreadStressMult        = 1.0;   // 1.0 normal; 1.4 => +40% spread stress (affects spread checks + deviation only)
-input bool     InpTester_UseCustomCriterion = false; // enable OnTester() custom score (Strategy Tester optimization)
+input bool     InpTester_UseCustomCriterion = true; // lean-test: AAN — optimaliseer op custom score
 input int      InpTester_MinTradesForFullScore = 200; // trades below this get a penalty in score (0 => no penalty)
 input double   InpTester_DDCapPct         = 20.0;  // hard reject in OnTester if equity DD% > cap (0 => no cap)
 input bool     InpAppliedLog_Enable       = true;  // append applied settings snapshot to CSV when changed
@@ -688,21 +688,21 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 20;   // anti-overtrading spacing per symbol (v22.2: 30→20 — allow more quality setups)
-input int      InpMaxEntriesPerSymbolPerDay = 5;   // anti-overtrading daily cap per symbol (v22.2: 4→5)
-input int      InpMaxEntriesTotalPerDay   = 10;   // anti-overtrading daily cap across all symbols (v22.2: 8→10)
-input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N consecutive losing positions
+input int      InpMinMinutesBetweenEntries = 5;    // lean-test: 20→5 — meer setups per dag
+input int      InpMaxEntriesPerSymbolPerDay = 10;  // lean-test: 5→10 — ruimere dagcap per symbool
+input int      InpMaxEntriesTotalPerDay   = 25;   // lean-test: 10→25 — ruimere totale dagcap
+input bool     InpLossStreakBlock_Enable  = false; // lean-test: UIT — geen verlies-streak blokkering
 input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses (v22.2: 2→3)
 input int      InpLossStreakBlockMinutes  = 120;   // lock duration after loss-streak trigger (v22.2: 240→120)
 
 // --- Daily loss circuit breaker (v22.1)
 input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance
-input double   InpDailyLoss_PctBalance    = 2.0;    // daily loss threshold as % of balance at day open
+input double   InpDailyLoss_PctBalance    = 5.0;    // lean-test: 2→5% — ruimer voor testperiode
 input bool     InpDailyLoss_CloseAll      = false;  // close all open positions when breached (nuclear option)
 
 // --- Equity drawdown circuit breaker (v22.1)
 input bool     InpEquityCB_Enable         = true;   // halt new entries when equity DD >= X% from peak
-input double   InpEquityCB_Pct            = 5.0;    // equity DD% threshold
+input double   InpEquityCB_Pct            = 15.0;   // lean-test: 5→15% — ruimere equity CB voor testperiode
 
 // -----------------------------------------
 // Globals / enums
