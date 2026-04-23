@@ -5796,8 +5796,13 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
 
    return true;
 }
-
-
+bool EntrySignal_Setup1(const int symIdx,
+                        const string sym,
+                        bool &isBuy,
+                        double &adxTrend,
+                        double &adxEntry,
+                        double &atrPips,
+                        double &bodyPips)
 {
    isBuy=false; adxTrend=0; adxEntry=0; atrPips=0; bodyPips=0;
 
