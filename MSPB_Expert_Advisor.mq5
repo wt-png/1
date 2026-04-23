@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v22.0: optimisation infrastructure — KPI framework, WFO pipeline, Monte Carlo, stress-test, session analysis, phased deployment + governance."
+#property description "MultiSymbol Pullback Scalper FULL (DATA defaults) v22.1: anti-loss hardening — daily-loss CB, equity-DD CB, tighter filters, session guard, lower overtrading caps."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -478,12 +478,12 @@ input double   InpTP_RR_Max               = 2.50; // hard RR ceiling (0 => uncap
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
 input bool     InpUseATRFilter            = true;
-input double   InpMinATR_Pips             = 10.0;
+input double   InpMinATR_Pips             = 12.0;  // min ATR in pips (v22.1: 10.0→12.0)
 input bool     InpUseADXFilter            = true;
 input int      InpADX_Period              = 7;   // DATA mode: faster warm-up
 input int      InpATR_Period             = 7;   // DATA mode: ATR period (was hardcoded 14)
-input double   InpMinADXForEntry          = 20.0;
-input double   InpMinADXEntryFilter       = 20.0;
+input double   InpMinADXForEntry          = 22.0;  // min ADX trend for entry (v22.1: 20→22)
+input double   InpMinADXEntryFilter       = 22.0;  // min ADX entry quality (v22.1: 20→22)
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
 input double   InpEntryMinBodyATRFrac     = 0.20; // body must be >= X * ATR(pips)
@@ -536,21 +536,21 @@ input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
 input double   InpVolHighPct              = 80.0;  // >= => high vol regime
 input bool     InpVolLowBlockEntries      = true;  // block entries in low regime
-input double   InpVolHighRiskMult         = 0.50;  // risk multiplier in high regime
+input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
 input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = false;
+input bool     InpUseSessions             = true;  // London + NY only (v22.1: false→true)
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
 input int      InpNYEndHour               = 21;
 
 // --- Spread
-input double   InpMaxSpreadPips_FX        = 3.0;
+input double   InpMaxSpreadPips_FX        = 2.0;   // max spread for FX (v22.1: 3.0→2.0 pips)
 input double   InpMaxSpreadPips_XAU       = 80.0;
 
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
@@ -688,12 +688,21 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 15;   // anti-overtrading spacing per symbol
-input int      InpMaxEntriesPerSymbolPerDay = 6;   // anti-overtrading daily cap per symbol (0=off)
-input int      InpMaxEntriesTotalPerDay   = 12;    // anti-overtrading daily cap across all symbols (0=off)
+input int      InpMinMinutesBetweenEntries = 30;   // anti-overtrading spacing per symbol (v22.1: 15→30)
+input int      InpMaxEntriesPerSymbolPerDay = 4;   // anti-overtrading daily cap per symbol (v22.1: 6→4; 0=off)
+input int      InpMaxEntriesTotalPerDay   = 8;    // anti-overtrading daily cap across all symbols (v22.1: 12→8; 0=off)
 input bool     InpLossStreakBlock_Enable  = true;  // block symbol after N consecutive losing positions
-input int      InpLossStreakBlockAfter    = 3;     // trigger block at this many consecutive losses
-input int      InpLossStreakBlockMinutes  = 180;   // lock duration after loss-streak trigger
+input int      InpLossStreakBlockAfter    = 2;     // trigger block at this many consecutive losses (v22.1: 3→2)
+input int      InpLossStreakBlockMinutes  = 240;   // lock duration after loss-streak trigger (v22.1: 180→240)
+
+// --- Daily loss circuit breaker (v22.1)
+input bool     InpDailyLoss_Enable        = true;   // halt new entries when today's P&L <= -X% of day-start balance
+input double   InpDailyLoss_PctBalance    = 2.0;    // daily loss threshold as % of balance at day open
+input bool     InpDailyLoss_CloseAll      = false;  // close all open positions when breached (nuclear option)
+
+// --- Equity drawdown circuit breaker (v22.1)
+input bool     InpEquityCB_Enable         = true;   // halt new entries when equity DD >= X% from peak
+input double   InpEquityCB_Pct            = 5.0;    // equity DD% threshold
 
 // -----------------------------------------
 // Globals / enums
@@ -1115,6 +1124,12 @@ const int    SL_STRUCTURE_MIN_LOOKBACK_BARS = 2;
 enum EqRegime { EQ_NEUTRAL=0, EQ_CAUTION=1, EQ_DEFENSIVE=2 };
 EqRegime g_eqRegime=EQ_NEUTRAL;
 double   g_riskMult=1.0;
+
+// --- Circuit breaker state (v22.1)
+bool     g_dailyLossBreached  = false;   // true for remainder of day once daily loss CB fires
+int      g_dailyLossDayKey    = 0;       // YYYYMMDD of last reset
+double   g_dailyLossStartBal  = 0.0;    // balance at start of current trading day
+bool     g_equityCBBreached   = false;   // true while equity DD >= InpEquityCB_Pct
 
 // --- Dashboard
 string g_dashObjPrefix="MSPB_DASH_";
@@ -3464,6 +3479,78 @@ void EqRegime_Update()
    if(g_eqRegime==EQ_NEUTRAL) g_riskMult=1.0;
    if(g_eqRegime==EQ_CAUTION) g_riskMult=0.7;
    if(g_eqRegime==EQ_DEFENSIVE) g_riskMult=0.4;
+
+   // Equity CB: hard entry gate when DD >= threshold (v22.1)
+   if(InpEquityCB_Enable && InpEquityCB_Pct > 0.0)
+   {
+      bool shouldBreach = (ddPct >= InpEquityCB_Pct);
+      if(shouldBreach && !g_equityCBBreached)
+      {
+         g_equityCBBreached = true;
+         Audit_Log("EQUITY_CB_TRIGGERED",
+                   StringFormat("ddPct=%.2f threshold=%.2f eq=%.2f peak=%.2f",
+                                ddPct, InpEquityCB_Pct, eq, g_eqPeak),
+                   false);
+      }
+      else if(!shouldBreach && g_equityCBBreached)
+      {
+         g_equityCBBreached = false;
+         Audit_Log("EQUITY_CB_CLEARED",
+                   StringFormat("ddPct=%.2f threshold=%.2f eq=%.2f peak=%.2f",
+                                ddPct, InpEquityCB_Pct, eq, g_eqPeak),
+                   false);
+      }
+   }
+}
+
+// -----------------------------------------
+// Daily loss circuit breaker (v22.1)
+// -----------------------------------------
+void DailyLoss_Update()
+{
+   if(!InpDailyLoss_Enable) return;
+
+   datetime now = TimeCurrent();
+   int dkey = Entry_DayKey(now);
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   // New day: reset state
+   if(g_dailyLossDayKey != dkey)
+   {
+      g_dailyLossDayKey   = dkey;
+      g_dailyLossStartBal = bal;
+      g_dailyLossBreached = false;
+      return;
+   }
+
+   if(g_dailyLossBreached) return; // already triggered today; no re-evaluation needed
+
+   if(g_dailyLossStartBal <= 0.0) { g_dailyLossStartBal = bal; return; }
+
+   double eq        = AccountInfoDouble(ACCOUNT_EQUITY);
+   double pnl       = eq - g_dailyLossStartBal;           // negative = daily loss
+   double threshold = -(InpDailyLoss_PctBalance / 100.0 * g_dailyLossStartBal);
+
+   if(pnl <= threshold)
+   {
+      g_dailyLossBreached = true;
+      Audit_Log("DAILY_LOSS_CB_TRIGGERED",
+                StringFormat("pnl=%.2f threshold=%.2f startBal=%.2f eq=%.2f",
+                             pnl, threshold, g_dailyLossStartBal, eq),
+                false);
+
+      if(InpDailyLoss_CloseAll)
+      {
+         for(int i = PositionsTotal()-1; i >= 0; i--)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(!PositionSelectByTicket(ticket)) continue;
+            if((long)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+            trade.PositionClose(ticket, InpDev_MaxPoints);
+         }
+      }
+   }
 }
 
 // -----------------------------------------
@@ -5544,6 +5631,16 @@ void DashboardUpdate()
       status="FAILSAFE_"+g_failSafeReason;
       statusCol=clrRed;
    }
+   else if(g_dailyLossBreached)
+   {
+      status="DAILY_LOSS_CB";
+      statusCol=clrRed;
+   }
+   else if(g_equityCBBreached)
+   {
+      status="EQUITY_CB";
+      statusCol=clrRed;
+   }
    else if(InpNews_Enable && News_LastError()!="" && InpNews_FailClosedOnError)
    {
       status="NEWS_FAIL_CLOSED";
@@ -5808,6 +5905,13 @@ void ProcessSymbol(const int idx, const string sym)
    if(g_failSafeStopEntries)
    {
       IncReject(idx, REJ_FAILSAFE);
+      return;
+   }
+
+   // Circuit breakers: daily-loss CB and equity-DD CB (v22.1)
+   if(g_dailyLossBreached || g_equityCBBreached)
+   {
+      IncReject(idx, REJ_RISK_GUARDS);
       return;
    }
 
@@ -6810,6 +6914,7 @@ void OnTick()
 {
    Cycle_Begin();
    EqRegime_Update();
+   DailyLoss_Update();  // v22.1: daily loss circuit breaker
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
 
@@ -6949,6 +7054,7 @@ void OnTimer()
    Cycle_Begin();
    SymbolOverrides_UpdateIfDue();
    EqRegime_Update();
+   DailyLoss_Update();  // v22.1: daily loss circuit breaker
    News_UpdateIfDue();
    Sanity_UpdateReadiness(); // NEW: update indicator readiness (sanity mode)
 
