@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.9: conservative anti-loss defaults (lower risk, stricter filters, tighter loss brakes)."
+#property description "MultiSymbol Pullback Scalper FULL v22.10: fix 3 logische bugs die verlies veroorzaken (HTF repaint, FollowThrough conflict, bias cache)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -2925,16 +2925,17 @@ int GetBiasDirCached(const int symIdx, const string sym, double &fastOut, double
    if(g_biasFastHandle[symIdx]==INVALID_HANDLE || g_biasSlowHandle[symIdx]==INVALID_HANDLE)
       return (InpBias_FailClosed ? 99 : 0);
 
+   // v22.10 bug fix: was reading bar[0] (current forming bar) which repaints intrabar.
+   // Use bar[1] = last CLOSED bar for a stable trend direction read.
    double f[]; double s[];
-   ArrayResize(f,1);
-   ArrayResize(s,1);
    ArraySetAsSeries(f,true);
    ArraySetAsSeries(s,true);
-   if(CopyBuffer(g_biasFastHandle[symIdx],0,0,1,f)!=1 || CopyBuffer(g_biasSlowHandle[symIdx],0,0,1,s)!=1)
+   if(CopyBuffer(g_biasFastHandle[symIdx],0,0,2,f)!=2 || CopyBuffer(g_biasSlowHandle[symIdx],0,0,2,s)!=2)
       return (InpBias_FailClosed ? 99 : 0);
 
-   fastOut=f[0];
-   slowOut=s[0];
+   // SetAsSeries=true: [0]=current forming bar, [1]=last closed bar.
+   fastOut=f[1];
+   slowOut=s[1];
    int dir=0;
    if(fastOut>slowOut) dir=1;
    else if(fastOut<slowOut) dir=-1;
@@ -5764,13 +5765,16 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
 
    // --- Step 3: HTF trend check — EMA-fast > EMA-slow on InpBiasTF ---
    // Uses same handles as the HTF bias filter (g_biasFastHandle / g_biasSlowHandle).
+   // v22.10 bug fix: was using bar[0] (current forming bar on BiasTF) which updates intrabar
+   // (repaint risk). Use bar[1] = last CLOSED bar for a stable, non-repainting trend read.
    if(g_biasFastHandle[symIdx] == INVALID_HANDLE || g_biasSlowHandle[symIdx] == INVALID_HANDLE) return false;
-   double emaFast[1], emaSlow[1];
-   if(CopyBuffer(g_biasFastHandle[symIdx], 0, 0, 1, emaFast) != 1) return false;
-   if(CopyBuffer(g_biasSlowHandle[symIdx], 0, 0, 1, emaSlow) != 1) return false;
+   double emaFast[2], emaSlow[2];
+   if(!CopyLast(g_biasFastHandle[symIdx], 0, 0, 2, emaFast)) return false;
+   if(!CopyLast(g_biasSlowHandle[symIdx], 0, 0, 2, emaSlow)) return false;
 
    // Require meaningful separation (at least 1 pip) to avoid acting on a flat EMA cross.
-   double emaDiff = emaFast[0] - emaSlow[0];
+   // CopyLast uses SetAsSeries=true: [0]=current bar, [1]=last closed bar.
+   double emaDiff = emaFast[1] - emaSlow[1];
    if(MathAbs(emaDiff) < pip) return false; // EMA too close — no clear trend
 
    bool trendBuy  = (emaDiff > 0.0);  // fast > slow => uptrend
@@ -5796,14 +5800,16 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    else if(trendSell && candleSell) isBuy = false;
    else return false; // trend / candle conflict
 
-   // --- Step 5b: FollowThrough — previous bar must be same direction (v22.8) ---
-   // Same filter as Setup1 (InpEntryUseFollowThrough): avoids entering on a single-bar reversal
-   // that disagrees with the prior bar, which often indicates a one-candle spike rather than real momentum.
-   if(InpEntryUseFollowThrough)
-   {
-      bool prevBuy = (r[2].close > r[2].open);
-      if(prevBuy != isBuy) return false;
-   }
+   // --- Step 5b: FollowThrough verwijderd (v22.10 bug fix) ---
+   // De FollowThrough-check (v22.8) blokkeerde de BESTE pullback-setups:
+   //   Classic pullback: bar[2] beweegt TEGEN de trend (de pullback), bar[1] keert terug
+   //   met de trend (het signaal). FollowThrough eiste bar[2] IN dezelfde richting als bar[1],
+   //   wat alleen opeenvolgende same-direction bars toeliet — géén pullback-patroon.
+   // Resultaat: de slechtste setups werden geselecteerd (prijs al in trend-richting, kort
+   //   EMA-tik), de beste gereject (klassieke pullback + keercande l). Win-rate: 5.56%.
+   // De EMA-close-bevestiging (Step 6) + close-in-range + wick-filter voorkomen al spikes;
+   //   FollowThrough is hier overbodig en schadelijk. InpEntryUseFollowThrough blijft
+   //   actief voor Setup1 waar het wél zinvol is.
 
    // --- Step 6: EMA close confirmation (v22.7) ---
    // Close must confirm EMA as support (BUY) or resistance (SELL).

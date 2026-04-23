@@ -5,6 +5,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.10] — 2026-04-23
+
+### Fixed — 3 logische bugs die verlies veroorzaakten
+
+Analyse van backtest-resultaten (win-rate 5.56%, profit factor 0.07) identificeerde drie concrete
+code-fouten die samen verantwoordelijk zijn voor het structurele verlies.
+
+#### Bug 1: HTF-bias las huidige (intrabar) candle — repaint
+
+In `EntrySignal_Improved` werd de HTF-trend (EMA-fast vs EMA-slow op `InpBiasTF`) berekend met
+`CopyBuffer(..., count=1)`. Dat geeft bar[0] = de **nog lopende** candle op de bias-timeframe (bijv.
+H4). De EMA-waarde van een lopende H4-candle wijzigt elke tick, waardoor de trend-richting intrabar
+kan omklappen — dit is een **repaint-bug**.
+
+**Fix:** gebruik `CopyLast(..., count=2)` en lees index `[1]` (= laatste gesloten bar).
+
+#### Bug 2: GetBiasDirCached — zelfde repaint-bug in bias-cache
+
+Dezelfde fout stond ook in `GetBiasDirCached` (de cache die `InpUseHTFBias` gebruikt):
+`CopyBuffer(..., count=1, f)` → `fastOut = f[0]` = lopende bar.
+
+**Fix:** count=2, gebruik `f[1]` / `s[1]` (SetAsSeries=true).
+
+#### Bug 3: FollowThrough in ImprovedEntry blokkeerde de BESTE pullback-setups (hoofd-oorzaak)
+
+In v22.8 werd de `InpEntryUseFollowThrough`-check toegevoegd aan `EntrySignal_Improved` om spike-
+entries te voorkomen. Dit was een verkeerde toepassing van een Setup1-filter op de ImprovedEntry-
+logica en veroorzaakte een **omgekeerde kwaliteitsselectie**:
+
+- **Klassiek pullback-patroon (GOED):** bar[2] beweegt tégen de trend (de pullback omhoog),
+  bar[1] keert terug mét de trend (het signal). → FollowThrough **blockt dit** (bar[2] ≠ richting
+  bar[1]).
+- **Slechte setup:** bar[2] én bar[1] beide in trend-richting, bar[1] raakt toevallig de EMA.
+  → FollowThrough **laat dit door**.
+
+Resultaat: de EA selecteerde alleen de slechtste entries en verwierp de beste → win-rate 5.56%.
+
+De bestaande filters in ImprovedEntry (EMA-close-bevestiging Step 6, close-in-range Step 7, wick-
+filter Step 7) zijn voldoende bescherming tegen spike-entries. De FollowThrough-check is hier
+overbodig én schadelijk. In Setup1 blijft hij wél actief.
+
+**Fix:** Step 5b (FollowThrough) verwijderd uit `EntrySignal_Improved`.
+
+---
+
 ## [v22.9] — 2026-04-23
 
 ### Changed — Conservatief anti-loss settings-profiel aangescherpt
