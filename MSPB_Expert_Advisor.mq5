@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.7: ImprovedEntry kwaliteitsfilters toegevoegd (EMA-close, body-ATR, close-in-range, wick)."
+#property description "MultiSymbol Pullback Scalper FULL v22.8: FollowThrough-fix ImprovedEntry; BE 0.8→1.2R, LockPips 1→3, TimeStopAbsR 0.15→0.50, MinGap 20→60min, TP_RR 1.8→2.2."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -465,7 +465,7 @@ input int      InpRisk_Cap_TelegramCooldownSec = 120;
 
 // --- SL/TP
 input double   InpSL_ATR_Mult             = 1.5;  // SL as ATR multiple (v22.2: 1.6→1.5 — slightly tighter)
-input double   InpTP_RR                   = 1.8;  // base RR target (v22.2: 1.4→1.8 — better risk/reward)
+input double   InpTP_RR                   = 2.2;  // v22.8: 1.8→2.2 — hogere RR target compenseert BE-effect en spread-kosten
 input double   InpMinSLPips               = 6.0;  // hard minimum SL distance
 input double   InpMinTP_RR                = 1.2;  // hard minimum RR floor
 input bool     InpSL_UseSwingStructure    = true; // widen SL to recent swing structure when needed
@@ -567,8 +567,8 @@ input double   InpMaxSpreadPips_XAU       = 80.0;
 input double   InpMaxSpreadPips_STOCK     = 20.0;   // stocks/CFDs default (if no overrides row; units follow symbol pip)
 // --- Break-even / trailing
 input bool     InpUseBreakEven            = true;
-input double   InpBE_At_R                 = 0.8;
-input double   InpBE_LockPips             = 1.0;
+input double   InpBE_At_R                 = 1.2;  // v22.8: 0.8→1.2 — BE te vroeg triggerde BE-stops op normale terugval
+input double   InpBE_LockPips             = 3.0;  // v22.8: 1.0→3.0 — ruimere buffer na BE voorkomt onnodig uitgestopt worden
 input double   InpBE_MinStepPips          = 0.5;
 
 input bool     InpUseATRTrailing          = true;
@@ -588,7 +588,7 @@ input double   InpNewsSpike_MinATRPips     = 0.0;   // NEW: minimum ATR(pips) re
 input bool     InpUseTimeStop             = true;
 input int      InpTimeStopBars            = 8;    // avoid hyper-fast churn exits
 input bool     InpTimeStopOnlyIfNonPositiveR = true; // only force-close stagnating/non-performing trades
-input double   InpTimeStopMinAbsR         = 0.15; // only time-exit if |R| is small (stagnation filter)
+input double   InpTimeStopMinAbsR         = 0.50; // v22.8: 0.15→0.50 — sluit ook stagnerende verliezers (was alleen trades dicht bij nul)
 input bool     InpUseProtectMode          = true;
 input bool     InpDSP_CloseWinnerBelowPipsIfNoSL = true;
 input double   InpDSP_CloseWinnerBelowPips = 3.0;
@@ -699,7 +699,7 @@ input string   InpAppliedLog_File         = "MSPB_AppliedSettings.csv";
 input bool     InpAppliedLog_UseCommonFolder = false;
 input int      InpTradeDensity_MinTrades30d_Warn = 30; // warn if <X closed positions per symbol in last 30 days (0=off)
 input int      InpTradeDensity_CheckSec   = 3600;  // how often to re-check history for trade-density warnings (sec)
-input int      InpMinMinutesBetweenEntries = 20;   // v22.2: minimale wachttijd tussen entries (minuten)
+input int      InpMinMinutesBetweenEntries = 60;   // v22.8: 20→60 — minder over-trading na slechte entries op dezelfde H4-context
 input int      InpMaxEntriesPerSymbolPerDay = 5;   // v22.2: max entries per symbool per dag
 input int      InpMaxEntriesTotalPerDay   = 10;   // v22.2: max totale entries per dag
 input bool     InpLossStreakBlock_Enable  = true;  // v22.1: blokkeer entries na opeenvolgende verliezen
@@ -5749,9 +5749,9 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    double pip = PipSize(sym);
    if(pip <= 0.0) return false;
 
-   // --- Step 1: Last closed bar on entry TF ---
-   MqlRates r[2];
-   if(!CopyRatesLast(sym, InpEntryTF, 0, 2, r)) return false;
+   // --- Step 1: Last two closed bars on entry TF (r[1]=last closed, r[2]=bar before last closed) ---
+   MqlRates r[3];
+   if(!CopyRatesLast(sym, InpEntryTF, 0, 3, r)) return false;
 
    // --- Step 2: ATR (use last closed bar value) ---
    double atrBuf[2];
@@ -5795,6 +5795,15 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    if(trendBuy && candleBuy)        isBuy = true;
    else if(trendSell && candleSell) isBuy = false;
    else return false; // trend / candle conflict
+
+   // --- Step 5b: FollowThrough — previous bar must be same direction (v22.8) ---
+   // Same filter as Setup1 (InpEntryUseFollowThrough): avoids entering on a single-bar reversal
+   // that disagrees with the prior bar, which often indicates a one-candle spike rather than real momentum.
+   if(InpEntryUseFollowThrough)
+   {
+      bool prevBuy = (r[2].close > r[2].open);
+      if(prevBuy != isBuy) return false;
+   }
 
    // --- Step 6: EMA close confirmation (v22.7) ---
    // Close must confirm EMA as support (BUY) or resistance (SELL).

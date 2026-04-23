@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.8] — 2026-04-23
+
+### Fixed — Oorzaken van geldverlies aangepakt
+
+Analyse van de EA-logica identificeerde zes concrete oorzaken van verlies. Alle zes zijn opgelost.
+
+#### Fix 1: FollowThrough-check toegevoegd aan EntrySignal_Improved (code fix)
+
+`EntrySignal_Improved` miste de `InpEntryUseFollowThrough`-check die in `Setup1` wél aanwezig is.
+Hierdoor werden eenmalige spike-candles als geldig signaal geaccepteerd. Nu vereist ImprovedEntry
+ook dat de vorige candle dezelfde richting heeft als de signaalkandel.
+
+- Bars-array vergroot van 2 → 3 (`CopyRatesLast(..., 3, r)`)
+- Nieuwe Step 5b: `if(InpEntryUseFollowThrough) { prevBuy != isBuy → return false; }`
+
+#### Fix 2–3: Break-Even te vroeg (BE_At_R en BE_LockPips)
+
+| Parameter | Oud | Nieuw | Reden |
+|-----------|-----|-------|-------|
+| `InpBE_At_R` | 0.8 | 1.2 | BE op 0.8R triggerde tijdens normaal marktgeluid → positie sloot op ~nul |
+| `InpBE_LockPips` | 1.0 | 3.0 | Te kleine buffer na BE; kleine dip sloeg BE-stop meteen |
+
+#### Fix 4: TimeStop sloot geen diep verliezende trades
+
+| Parameter | Oud | Nieuw | Reden |
+|-----------|-----|-------|-------|
+| `InpTimeStopMinAbsR` | 0.15 | 0.50 | Trades op –0.4R na 8 bars bleven open tot volledige SL-hit |
+
+#### Fix 5: Minimum entryGap te kort
+
+| Parameter | Oud | Nieuw | Reden |
+|-----------|-----|-------|-------|
+| `InpMinMinutesBetweenEntries` | 20 | 60 | Na slechte M5-entry kon EA 20min later opnieuw dezelfde verkeerde setup handelen |
+
+#### Fix 6: TP_RR te laag t.o.v. BE-effect en spread
+
+| Parameter | Oud | Nieuw | Reden |
+|-----------|-----|-------|-------|
+| `InpTP_RR` | 1.8 | 2.2 | Met BE op 1.2R en spread-aftrek was effectief RR te laag voor positieve verwachte waarde |
+
+#### Verwachte impact
+
+| Metric | Verwachting |
+|--------|-------------|
+| Aantal entries | ⬇️ Minder (FollowThrough filter + langere entryGap) |
+| Win-rate | ⬆️ Beter (geen spike-entries meer) |
+| Gemiddelde winst | ⬆️ Groter (BE geeft meer ruimte + hogere TP) |
+| Gemiddeld verlies | ⬇️ Kleiner (TimeStop snijdt verliezers tijdig) |
+| Profit Factor | ⬆️ Significant hoger |
+
+---
+
 ## [v22.7] — 2026-04-23
 
 ### Fixed — ImprovedEntry kwaliteitsfilters toegevoegd
