@@ -5,6 +5,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.12] — 2026-04-24
+
+### Fixed — Alle filters correct gezet (win-rate 12.5% → verwacht beter)
+
+Analyse van de backtest-resultaten na v22.11 (win-rate ~12.5%, 87.5% verliezers) identificeerde
+drie filterproblemen die samen verantwoordelijk zijn voor het aanhoudende verlies.
+
+#### Fix 1: InpBiasMinEMASepPips — H4 EMA-scheiding was effectief geen filter (nieuw)
+
+**Probleem:** `EntrySignal_Improved` controleerde of de H4 EMA50/EMA200 minstens **1 pip** uit
+elkaar lagen om een "trend" te vormen. Voor AUDCAD (pip = 0.0001) betekent dit dat een scheiding
+van 0.0002 (2 pips) al als een geldige bullish of bearish bias werd geaccepteerd. In werkelijkheid
+is een H4-scheiding van 2 pips zinloos — de twee lijnen zijn vrijwel identiek, de markt is flat.
+
+**Fix:** Nieuw input `InpBiasMinEMASepPips = 5.0` — de H4 EMA50/200 moeten minstens 5 pips
+gescheiden zijn voordat een trend als geldig wordt beschouwd. Dit blokkeert entries in rangy,
+trendloze H4-marktfasen waar de bias-filter voorheen kleurloos was.
+
+| Parameter | Oud | Nieuw | Doel |
+|-----------|-----|-------|------|
+| *(hardcoded)* | 1 pip | `InpBiasMinEMASepPips = 5.0` pips | Echte trendvereiste op H4 |
+
+#### Fix 2: InpBias_FailClosed — bias-fout liet beide richtingen door (parameter)
+
+**Probleem:** `InpBias_FailClosed = false` betekent: als de H4 biasdata niet beschikbaar is
+(bijv. bij start of dataverlies), retourneert `GetBiasDirCached` richting = 0. In dat geval
+blokkeren de checks `bdir>0 && !isBuy` en `bdir<0 && isBuy` NIET — zowel LONG als SHORT mogen
+openen, terwijl er geen trendbevestiging is.
+
+**Fix:** `InpBias_FailClosed = true` — blokkeert entries wanneer biasdata niet beschikbaar is
+(retourneert bdir=99, gevolgd door directe `return` in ProcessSymbol).
+
+| Parameter | Oud | Nieuw | Doel |
+|-----------|-----|-------|------|
+| `InpBias_FailClosed` | `false` | `true` | Geen entries zonder H4 trendbevestiging |
+
+#### Fix 3: InpVolLowBlockEntries — lean-test instelling stond uit in productie (parameter)
+
+**Probleem:** `InpVolLowBlockEntries = false` stond expliciet als "lean-test: UIT" in de code.
+In productie moet dit `true` zijn: in een low-vol regime (ATR-percentiel ≤ 20%) wordt de
+lot-grootte gehalveerd (0.5×). Zo neemt de EA nog wel deel aan valide setups, maar met
+sterk verminderd risico in rustige/choppy marktomstandigheden.
+
+**Fix:** `InpVolLowBlockEntries = true`
+
+| Parameter | Oud | Nieuw | Doel |
+|-----------|-----|-------|------|
+| `InpVolLowBlockEntries` | `false` | `true` | 0.5× lot in low-vol regime |
+
+#### Verwachte impact
+
+| Metric | Verwachting |
+|--------|-------------|
+| Aantal entries | ⬇️ Minder (H4 flat-markt geblokkeerd door 5-pip EMA-eis) |
+| Win-rate | ⬆️ Beter (entries alleen in echte H4-trends) |
+| Risico in low-vol | ⬇️ Lager (0.5× lot in rustige markten) |
+| Veiligheid bij dataverlies | ⬆️ Beter (geen entries zonder biasdata) |
+
+---
+
 ## [v22.11] — 2026-04-24
 
 ### Added — Pullback-origin filter in EntrySignal_Improved
