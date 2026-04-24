@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.10: fix 3 logische bugs die verlies veroorzaken (HTF repaint, FollowThrough conflict, bias cache)."
+#property description "MultiSymbol Pullback Scalper FULL v22.11: pullback-origin filter — bar[2] moet op de juiste EMA-kant staan voor entry (filtert EMA-oscillatie false signals)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -503,6 +503,7 @@ input double   InpEntryMinCloseInRangeFrac= 0.60; // v22.2: close moet >= 60% in
 // All other risk guards (ATR, ADX, corr, portfolio) remain active.
 input bool     InpUseImprovedEntry        = true;  // v22.5: verbeterde entry (Trend+Pullback+Continuation); vervangt Setup1
 input double   InpImprovedEntry_ATRMinPips = 6.0;  // v22.9: extra guard tegen lage-volatiliteit entries
+input bool     InpEntryRequirePullbackOrigin = true; // v22.11: bar[2] sloot op de juiste EMA-kant — echte pullback check
 
 
 // --- Advanced filters / regimes (v9)
@@ -5783,12 +5784,32 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    // --- Step 4: Pullback to EMA50 on entry TF ---
    // Price of the last CLOSED bar must have touched (pierced) the entry-TF EMA.
    if(g_emaHandle[symIdx] == INVALID_HANDLE) return false;
-   double emaBuf[2];
-   if(!CopyLast(g_emaHandle[symIdx], 0, 0, 2, emaBuf)) return false;
-   double ema = emaBuf[1]; // last closed bar EMA value
+   double emaBuf[3];
+   if(!CopyLast(g_emaHandle[symIdx], 0, 0, 3, emaBuf)) return false;
+   double ema  = emaBuf[1]; // EMA at bar[1] (last closed bar)
+   double ema2 = emaBuf[2]; // EMA at bar[2] (bar before signal bar)
 
    bool touched = (r[1].low <= ema && r[1].high >= ema);
    if(!touched) return false;
+
+   // --- Step 4b: Pullback origin check (v22.11) ---
+   // bar[2] must have closed on the side of the EMA that the pullback ORIGINATED from.
+   // BUY  (uptrend): bar[2] close > ema2 → price came FROM ABOVE and dipped to EMA in bar[1].
+   // SELL (dntrend): bar[2] close < ema2 → price came FROM BELOW and rose to EMA in bar[1].
+   // This filters EMA-oscillation entries where price has been bouncing at the EMA level for
+   // multiple bars — only TRUE directional pullbacks are accepted.
+   // Note: different from the removed FollowThrough check, which required bar[2] and bar[1] to
+   // be bullish/bearish in the SAME direction (blocking classic pullbacks).  This check uses
+   // the bar[2] CLOSE vs EMA position, not its candle direction, so classic pullback bars
+   // (bar[2] bearish/above-EMA → bar[1] bullish touching EMA) still pass correctly.
+   // Uses trendBuy/trendSell (set in Step 3) because isBuy is resolved in Step 5.
+   if(InpEntryRequirePullbackOrigin)
+   {
+      // Use <= / >= so that bar[2] closing exactly at the EMA is also blocked:
+      // an exact EMA touch is ambiguous (neither side) and therefore not a valid pullback origin.
+      if(trendBuy  && r[2].close <= ema2) return false;  // BUY needs bar[2] strictly above EMA
+      if(trendSell && r[2].close >= ema2) return false;  // SELL needs bar[2] strictly below EMA
+   }
 
    // --- Step 5: Continuation candle (direction after EMA touch) ---
    bool candleBuy  = (r[1].close > r[1].open);

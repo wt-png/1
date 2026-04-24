@@ -5,6 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v22.11] — 2026-04-24
+
+### Added — Pullback-origin filter in EntrySignal_Improved
+
+Analyse van de backtest-resultaten (PF ≈ 0.11, win-rate ~5%) na v22.10 toonde aan dat de EA
+kans heeft om te vuren op EMA-oscillatie-setups: situaties waar de prijs al meerdere bars
+rond de EMA zweeft en elke kleine aanraking als "pullback" wordt gecategoriseerd.  Dit zijn
+geen echte pullbacks — er is geen duidelijke richting vanwaar de prijs de EMA nadert.
+
+#### Probleem: EMA-oscillatie geeft nep-pullback-signalen
+
+In `EntrySignal_Improved` controleerde Step 4 alleen of bar[1] de EMA raakte (low≤ema≤high).
+Als de prijs al meerdere bars rond de EMA zweeft, voldoet elke bar aan die eis. Gevolg:
+- De EA vuurt entries terwijl de markt sideways is op entry-TF.
+- De HTF-bias (H4 EMA50>EMA200) is de enige trendbevestiging; op M5 is de prijs flat.
+- Win-rate blijft laag: entries worden genomen in een kansloze context.
+
+#### Fix: Step 4b — pullback-origin check (nieuw)
+
+**Nieuw input:** `InpEntryRequirePullbackOrigin = true`
+
+**Logica:** bar[2] (de bar vóór de signaalkandel) moet gesloten hebben op de juiste kant van
+de EMA, als bewijs dat de prijs VANUIT die richting de EMA naderde:
+
+| Richting | Vereiste bar[2] positie | Redenering |
+|----------|------------------------|------------|
+| BUY (uptrend) | close > ema2 (bar[2] EMA) | Prijs was boven EMA, zakte terug naar EMA in bar[1] |
+| SELL (dntrend) | close < ema2 (bar[2] EMA) | Prijs was onder EMA, steeg terug naar EMA in bar[1] |
+
+Als bar[2] op de VERKEERDE kant sloot (bijv. bar[2] al onder EMA bij een BUY-setup), is er
+geen sprake van een klassieke pullback — de prijs was al door de EMA heen of zweefde eronder.
+
+**Verschil met de verwijderde FollowThrough-check (v22.10):**
+
+FollowThrough eiste dat bar[2] dezelfde CANDLE-RICHTING had als bar[1] (beide bullish bij BUY).
+Dit blokkeerde het klassieke pullback-patroon waarbij bar[2] bearish is (de terugval omhoog in
+uptrend) en bar[1] bullish is (de keercandle). Resultaat: 5.56% win-rate.
+
+De nieuwe pullback-origin check gebruikt niet de candle-richting maar de **EMA-positie**:
+- bar[2] bearish MÉT close boven EMA → **correct** (pullback in uptrend) → toegelaten
+- bar[2] bearish MET close onder EMA → **fout** (prijs was al door EMA) → geblokkeerd
+- Klassieke pullback bars blijven gewoon doorgelaten ✓
+
+#### Verwachte impact
+
+- Selecteert uitsluitend bars waar een duidelijke EMA-nadering vanuit de trendzijde plaatsvond
+- Filtert EMA-oscillatie en post-doorbraak false entries
+- Win-rate verwacht omhoog door hogere setup-kwaliteit
+
+
+
 ## [v22.10] — 2026-04-23
 
 ### Fixed — 3 logische bugs die verlies veroorzaakten
