@@ -225,7 +225,7 @@ def _print_results(r: Dict[str, Any]) -> None:
     print(f"  Trades analysed     : {r['total_trades']}")
     print(f"  Avg MFE (pips)      : {r['avg_mfe_pips']}")
     print(f"  Avg MAE proxy (pips): {r['avg_mae_proxy_pips']}")
-    print(f"  Avg capture ratio   : {r['avg_capture_ratio']:.1%}")
+    print(f"  Avg capture ratio   : {r['avg_capture_ratio'] * 100:.1f}%")
     print(f"  Wrong-side flag     : {'⚠ YES' if r['wrong_side_flag'] else 'OK'}")
     print(f"  Runaway losers      : {r['runaway_loser_pct']} %")
     print()

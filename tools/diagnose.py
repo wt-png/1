@@ -17,6 +17,8 @@ Steps executed
   6. Monte Carlo          — is the edge robust or lucky?
   7. Stress test          — does the strategy survive adverse conditions?
 
+All seven diagnostic steps are executed in sequence.
+
 Usage
 -----
     python tools/diagnose.py [trades.csv] [options]
@@ -225,7 +227,7 @@ def _step4_mae_mfe(
 
     print(f"  Avg MFE captured   : {results.get('avg_mfe_pips', 0):.2f} pips")
     print(f"  Avg MAE proxy      : {results.get('avg_mae_proxy_pips', 0):.2f} pips")
-    print(f"  Avg capture ratio  : {results.get('avg_capture_ratio', 0):.1%}")
+    print(f"  Avg capture ratio  : {results.get('avg_capture_ratio', 0) * 100:.1f}%")
     print(f"  Wrong-side flag    : {'⚠ YES' if results.get('wrong_side_flag') else 'NO'}")
     print(f"  Runaway losers     : {results.get('runaway_loser_pct', 0):.1f}%")
     print(f"  Action             : {results.get('action', '')}")
