@@ -1191,3 +1191,341 @@ class TestPrintTable:
         out = capsys.readouterr().out
         assert "Asia" in out
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# analyse_mae_mfe tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+from analyse_mae_mfe import (  # noqa: E402
+    classify_trade,
+    run_mae_mfe_analysis,
+    _profit_pips,
+    _sl_pips,
+    WINNER_CLEAN,
+    WINNER_MARGINAL,
+    LOSER_MARGINAL,
+    LOSER_RUNAWAY,
+    main as mae_main,
+)
+
+
+def _make_mae_trade(
+    profit: float,
+    sl_pips: float = 20.0,
+    lots: float = 0.01,
+    symbol: str = "EURUSD",
+) -> dict:
+    return {
+        "profit":   profit,
+        "sl_pips":  sl_pips,
+        "lots":     lots,
+        "symbol":   symbol,
+        "entry_time": "2023.01.02 09:00:00",
+        "exit_time":  "2023.01.02 09:30:00",
+    }
+
+
+class TestSlPips:
+    def test_primary_column(self):
+        assert _sl_pips({"sl_pips": 20.0}) == pytest.approx(20.0)
+
+    def test_fallback_column(self):
+        assert _sl_pips({"sl_dist_pips": 15.0}) == pytest.approx(15.0)
+
+    def test_missing_returns_zero(self):
+        assert _sl_pips({}) == 0.0
+
+    def test_absolute_value(self):
+        assert _sl_pips({"sl_pips": -10.0}) == pytest.approx(10.0)
+
+
+class TestProfitPips:
+    def test_positive_trade(self):
+        # profit 10 USD, lots 0.01, pip_value 10 → 10 / (0.01 * 10) = 100 pips
+        t = {"profit": 10.0, "lots": 0.01}
+        assert _profit_pips(t, pip_value_usd=10.0) == pytest.approx(100.0)
+
+    def test_zero_lots_no_crash(self):
+        t = {"profit": 5.0, "lots": 0.0}
+        # should fall back to default 0.01
+        result = _profit_pips(t, pip_value_usd=10.0)
+        assert isinstance(result, float)
+
+
+class TestClassifyTrade:
+    def test_winner_clean(self):
+        # profit 20 USD, sl 20 pips, lots 0.01, pip_value 10 → mfe 200 pips > 0.5*20=10
+        t = {"profit": 20.0, "sl_pips": 20.0, "lots": 0.01}
+        assert classify_trade(t, 10.0) == WINNER_CLEAN
+
+    def test_winner_marginal(self):
+        # profit 0.01 USD (barely positive), sl 20 pips → mfe tiny < threshold
+        t = {"profit": 0.01, "sl_pips": 20.0, "lots": 0.01}
+        assert classify_trade(t, 10.0) == WINNER_MARGINAL
+
+    def test_loser_runaway(self):
+        # profit -20 USD, sl 20 pips → mfe 200 pips ≥ 0.5*20=10
+        t = {"profit": -20.0, "sl_pips": 20.0, "lots": 0.01}
+        assert classify_trade(t, 10.0) == LOSER_RUNAWAY
+
+    def test_loser_marginal(self):
+        # profit -0.01 USD (tiny loss), sl 20 pips → mfe tiny < threshold
+        t = {"profit": -0.01, "sl_pips": 20.0, "lots": 0.01}
+        assert classify_trade(t, 10.0) == LOSER_MARGINAL
+
+    def test_no_sl_data(self):
+        # Without sl_pips threshold is 0, any trade with profit>0 → WINNER_CLEAN
+        t = {"profit": 5.0, "lots": 0.01}
+        assert classify_trade(t, 10.0) == WINNER_CLEAN
+
+
+class TestRunMaeMfeAnalysis:
+    def test_empty_trades(self):
+        result = run_mae_mfe_analysis([])
+        assert "error" in result
+
+    def test_basic_structure(self):
+        trades = [_make_mae_trade(20.0)] * 10 + [_make_mae_trade(-15.0)] * 5
+        result = run_mae_mfe_analysis(trades)
+        assert result["total_trades"] == 15
+        assert "avg_mfe_pips" in result
+        assert "avg_mae_proxy_pips" in result
+        assert "avg_capture_ratio" in result
+        assert "wrong_side_flag" in result
+        assert "runaway_loser_pct" in result
+        assert "buckets" in result
+        assert "action" in result
+        assert "per_symbol" in result
+
+    def test_buckets_sum_to_total(self):
+        trades = [_make_mae_trade(20.0)] * 6 + [_make_mae_trade(-15.0)] * 4
+        result = run_mae_mfe_analysis(trades)
+        total = sum(result["buckets"].values())
+        assert total == result["total_trades"]
+
+    def test_wrong_side_flag_with_all_losers(self):
+        # All trades are -5 USD with 20 pip SL and 0.01 lot
+        # mfe_pips = 50, mae_proxy = 20 → mfe > mae so wrong_side should be False
+        trades = [_make_mae_trade(-5.0, sl_pips=20.0)] * 20
+        result = run_mae_mfe_analysis(trades)
+        # wrong_side = avg_mfe < 0.30 * avg_mae_proxy
+        # avg_mfe = 50, avg_mae = 20 → NOT wrong_side
+        assert result["wrong_side_flag"] is False
+
+    def test_wrong_side_flag_detected(self):
+        # Tiny MFE but large SL → entries always wrong-side
+        trades = [{"profit": -0.001, "sl_pips": 100.0, "lots": 0.01, "symbol": "EURUSD"}] * 20
+        result = run_mae_mfe_analysis(trades)
+        # avg_mfe ≈ 0.1 pips, avg_mae = 100 pips → 0.1 < 0.30 * 100 = 30 → wrong_side True
+        assert result["wrong_side_flag"] is True
+
+    def test_per_symbol_breakdown(self):
+        trades = (
+            [_make_mae_trade(10.0, symbol="EURUSD")] * 5 +
+            [_make_mae_trade(-5.0, symbol="AUDUSD")] * 5
+        )
+        result = run_mae_mfe_analysis(trades)
+        symbols = {s["symbol"] for s in result["per_symbol"]}
+        assert "EURUSD" in symbols
+        assert "AUDUSD" in symbols
+
+    def test_action_is_string(self):
+        trades = [_make_mae_trade(10.0)] * 10 + [_make_mae_trade(-5.0)] * 10
+        result = run_mae_mfe_analysis(trades)
+        assert isinstance(result["action"], str)
+        assert result["action"] in (
+            "STRENGTHEN_HTF_BIAS", "WIDEN_TP_OR_TRAIL",
+            "TIGHTEN_ENTRY_FILTERS", "MONITOR",
+        )
+
+
+class TestMaeMfeMain:
+    def test_missing_csv(self, tmp_path):
+        rc = mae_main([str(tmp_path / "missing.csv")])
+        assert rc == 1
+
+    def test_success_writes_json(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "mae.json"
+        _write_csv(
+            [_make_mae_trade(10.0)] * 10 + [_make_mae_trade(-5.0)] * 5,
+            str(csv_path),
+        )
+        rc = mae_main([str(csv_path), "--out", str(out_path)])
+        assert rc == 0
+        assert out_path.exists()
+        data = json.loads(out_path.read_text())
+        assert data["total_trades"] == 15
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# rank_symbols tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+from rank_symbols import (  # noqa: E402
+    rank_symbols,
+    _recommend,
+    main as rank_main,
+)
+
+
+def _sym_trade(profit: float, symbol: str, lots: float = 0.01) -> dict:
+    return {
+        "profit": profit,
+        "r_risk": abs(profit) if profit != 0 else 10.0,
+        "lots":   lots,
+        "symbol": symbol,
+        "entry_time": "2023.01.02 09:00:00",
+        "exit_time":  "2023.01.02 09:30:00",
+    }
+
+
+def _build_sym_trades() -> list:
+    """10 winning EURUSD, 10 losing AUDCAD, 3 GBPJPY (insufficient)."""
+    trades = (
+        [_sym_trade(20.0, "EURUSD")] * 10 +
+        [_sym_trade(-10.0, "AUDCAD")] * 10 +
+        [_sym_trade(5.0, "GBPJPY")] * 3
+    )
+    return trades
+
+
+class TestRecommend:
+    def test_keep(self):
+        assert _recommend(1.5, 50.0) == "KEEP"
+
+    def test_reduce_risk(self):
+        assert _recommend(1.15, 40.0) == "REDUCE_RISK"
+
+    def test_blacklist(self):
+        assert _recommend(0.80, 30.0) == "BLACKLIST"
+
+    def test_boundary_pf_exactly_1_30_wr_exactly_45(self):
+        assert _recommend(1.30, 45.0) == "KEEP"
+
+    def test_pf_ok_but_wr_too_low(self):
+        assert _recommend(1.40, 30.0) == "REDUCE_RISK"
+
+
+class TestRankSymbols:
+    def test_empty_trades(self):
+        result = rank_symbols([])
+        assert "error" in result
+
+    def test_basic_structure(self):
+        result = rank_symbols(_build_sym_trades(), min_trades=5)
+        assert "symbols" in result
+        assert "blacklist" in result
+        assert "reduce_risk" in result
+        assert "keep" in result
+
+    def test_losing_symbol_blacklisted(self):
+        result = rank_symbols(_build_sym_trades(), min_trades=5)
+        assert "AUDCAD" in result["blacklist"]
+
+    def test_winning_symbol_keep(self):
+        trades = [_sym_trade(20.0, "EURUSD")] * 10
+        result = rank_symbols(trades, min_trades=5)
+        assert "EURUSD" in result["keep"]
+
+    def test_insufficient_data_skipped(self):
+        result = rank_symbols(_build_sym_trades(), min_trades=5)
+        gbp_rows = [r for r in result["symbols"] if r["symbol"] == "GBPJPY"]
+        assert gbp_rows[0]["recommendation"] == "INSUFFICIENT_DATA"
+
+    def test_sorted_best_first(self):
+        result = rank_symbols(_build_sym_trades(), min_trades=5)
+        pfs = [
+            r.get("profit_factor", 0.0) or 0.0
+            for r in result["symbols"]
+            if not r.get("skipped")
+        ]
+        assert pfs == sorted(pfs, reverse=True)
+
+    def test_total_trades_count(self):
+        trades = _build_sym_trades()
+        result = rank_symbols(trades, min_trades=5)
+        assert result["total_trades"] == len(trades)
+
+
+class TestRankMain:
+    def test_missing_csv(self, tmp_path):
+        rc = rank_main([str(tmp_path / "missing.csv")])
+        assert rc == 1
+
+    def test_success_writes_json(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_path = tmp_path / "rank.json"
+        _write_csv(_build_sym_trades(), str(csv_path))
+        rc = rank_main([str(csv_path), "--min-trades", "3", "--out", str(out_path)])
+        assert rc == 0
+        assert out_path.exists()
+        data = json.loads(out_path.read_text())
+        assert "symbols" in data
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# diagnose.py tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+from diagnose import (  # noqa: E402
+    run_diagnostics,
+    main as diag_main,
+)
+
+
+class TestRunDiagnostics:
+    def test_basic_structure(self):
+        trades = _mixed_trades(20, 10)
+        result = run_diagnostics(
+            trades,
+            balance=10_000.0,
+            skip_wfo=True,
+            skip_mc=True,
+        )
+        assert "baseline" in result
+        assert "symbols" in result
+        assert "sessions" in result
+        assert "mae_mfe" in result
+        assert "stress" in result
+        assert "actions" in result
+
+    def test_actions_is_list(self):
+        trades = _mixed_trades(20, 10)
+        result = run_diagnostics(trades, skip_wfo=True, skip_mc=True)
+        assert isinstance(result["actions"], list)
+
+    def test_losing_strategy_generates_critical_action(self):
+        trades = _losing_trades(30)
+        result = run_diagnostics(trades, skip_wfo=True, skip_mc=True)
+        priorities = [a["priority"] for a in result["actions"]]
+        assert "CRITICAL" in priorities
+
+    def test_wfo_included_when_not_skipped(self):
+        trades = _mixed_trades(30, 10)
+        result = run_diagnostics(trades, skip_wfo=False, skip_mc=True)
+        assert "wfo" in result
+
+    def test_mc_included_when_not_skipped(self):
+        trades = _mixed_trades(30, 10)
+        result = run_diagnostics(trades, skip_wfo=True, skip_mc=False, mc_iterations=50)
+        assert "monte_carlo" in result
+
+
+class TestDiagMain:
+    def test_missing_csv(self, tmp_path):
+        rc = diag_main([str(tmp_path / "missing.csv")])
+        assert rc == 1
+
+    def test_success_writes_json(self, tmp_path):
+        csv_path = tmp_path / "trades.csv"
+        out_dir  = tmp_path / "diag"
+        _write_csv(_mixed_trades(20, 10), str(csv_path))
+        rc = diag_main([
+            str(csv_path),
+            "--skip-wfo", "--skip-mc",
+            "--out-dir", str(out_dir),
+        ])
+        assert rc == 0
+        assert (out_dir / "diag_latest.json").exists()
+
