@@ -511,7 +511,8 @@ input bool     InpUseHTFBias              = true;  // v22.2: H4 trend-bias — t
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
-input bool     InpBias_FailClosed         = false; // if true: block entries when bias data not ready
+input bool     InpBias_FailClosed         = true;  // v22.12: block entries when bias data not ready (was false — dangerous: allowed both directions)
+input double   InpBiasMinEMASepPips      = 5.0;   // v22.12: min H4 EMA50/200 separation in pips to constitute a real trend (was 1 pip — effectively no filter)
 
 input bool     InpUseCorrelationGuard     = true;  // v22.2: correlatie-bewaking — blokkeert gecorreleerde posities
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
@@ -546,7 +547,7 @@ input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
 input double   InpVolHighPct              = 80.0;  // >= => high vol regime
-input bool     InpVolLowBlockEntries      = false; // lean-test: UIT — conflicteert met ATR-min filter (beide meten vol); gebruik VolHighRiskMult voor lot-scaling i.p.v. hard blok
+input bool     InpVolLowBlockEntries      = true;  // v22.12: halve lot size in low-vol regime (was false lean-test; enables 0.5× scaling to reduce risk in choppy/quiet markets)
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
@@ -5773,10 +5774,13 @@ bool EntrySignal_Improved(const int symIdx, const string sym, bool &isBuy, doubl
    if(!CopyLast(g_biasFastHandle[symIdx], 0, 0, 2, emaFast)) return false;
    if(!CopyLast(g_biasSlowHandle[symIdx], 0, 0, 2, emaSlow)) return false;
 
-   // Require meaningful separation (at least 1 pip) to avoid acting on a flat EMA cross.
+   // Require meaningful EMA separation on the bias TF to ensure a real trend (not noise/flat cross).
+   // v22.12: InpBiasMinEMASepPips (default 5 pips) replaces the old 1-pip hardcoded floor.
+   // With 1 pip, EMA50 = 0.8503 vs EMA200 = 0.8502 would pass — essentially no filter.
    // CopyLast uses SetAsSeries=true: [0]=current bar, [1]=last closed bar.
    double emaDiff = emaFast[1] - emaSlow[1];
-   if(MathAbs(emaDiff) < pip) return false; // EMA too close — no clear trend
+   double biasMinSep = MathMax(1.0, InpBiasMinEMASepPips) * pip; // at least 1 pip safety floor
+   if(MathAbs(emaDiff) < biasMinSep) return false; // EMA separation too small — no clear trend
 
    bool trendBuy  = (emaDiff > 0.0);  // fast > slow => uptrend
    bool trendSell = (emaDiff < 0.0);  // fast < slow => downtrend
