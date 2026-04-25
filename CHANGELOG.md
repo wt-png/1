@@ -5,7 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [v22.12] — 2026-04-24
+## [v22.13] — 2026-04-25
+
+### Changed — Alle filters uitgeschakeld; alleen ImprovedEntry actief
+
+Alle externe guards en kwaliteitsfilters zijn op `false` / `0.0` gezet.
+Alleen de kern van `EntrySignal_Improved` blijft actief:
+EMA-touch op entry-TF + continuation candle + EMA-close bevestiging.
+
+**Uitgeschakeld:**
+- `InpUseATRFilter` false
+- `InpUseADXFilter` false
+- `InpEntryUseFollowThrough` false
+- `InpEntryUseWickFilter` false
+- `InpEntryUseRangeATRFilter` false
+- `InpEntryMinBodyATRFrac` 0.0
+- `InpEntryMinCloseInRangeFrac` 0.0
+- `InpImprovedEntry_ATRMinPips` 0.0
+- `InpEntryRequirePullbackOrigin` false
+- `InpUseHTFBias` false
+- `InpBias_FailClosed` false
+- `InpBiasMinEMASepPips` 0.0
+- `InpUseCorrelationGuard` false
+- `InpUseSymbolCooldown` false
+- `InpUseVolRegime` false
+- `InpVolLowBlockEntries` false
+- `InpUseSessions` false
+- `InpUsePortfolioRiskGuard` false
+
+**Actief (ongewijzigd):**
+- `InpUseImprovedEntry` true — EMA-touch + continuation candle kern-logica
+
+---
+
+
 
 ### Fixed — Alle filters correct gezet (win-rate 12.5% → verwacht beter)
 

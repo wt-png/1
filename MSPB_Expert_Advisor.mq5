@@ -1,5 +1,5 @@
 #property strict
-#property description "MultiSymbol Pullback Scalper FULL v22.11: pullback-origin filter — bar[2] moet op de juiste EMA-kant staan voor entry (filtert EMA-oscillatie false signals)."
+#property description "MultiSymbol Pullback Scalper FULL v22.13: alle filters uitgeschakeld — alleen ImprovedEntry kern actief (EMA-touch + continuation candle)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -453,7 +453,7 @@ input bool     InpUseRiskPercent          = true;
 input double   InpRiskPercent             = 0.20;  // v22.9: lager basisrisico per trade
 input double   InpMaxRiskPercentPerTrade  = 0.35;  // v22.9: strakkere harde cap per trade
 input double   InpLots                    = 0.01; // fixed lot fallback when risk sizing disabled
-input bool     InpUsePortfolioRiskGuard   = true;
+input bool     InpUsePortfolioRiskGuard   = false;
 input double   InpMaxPortfolioRiskPct     = 1.5;   // v22.9: lager maximaal gelijktijdig portfoliorisico
 input int      InpRisk_Cap_Mode           = 1;     // 0=Off, 1=Absolute
 input double   InpRisk_Cap_USD_R          = 1.0;
@@ -478,22 +478,22 @@ input double   InpTP_RR_Max               = 3.00; // hard RR ceiling (v22.2: 2.5
 // --- Filters
 input bool     InpUsePullbackEMA          = false;
 input int      InpEMA_Period              = 50;
-input bool     InpUseATRFilter            = true;
+input bool     InpUseATRFilter            = false;
 input double   InpMinATR_Pips             = 10.0;  // v22.9: strengere ATR-min om ruisregimes te vermijden
-input bool     InpUseADXFilter            = true;
+input bool     InpUseADXFilter            = false;
 input int      InpADX_Period              = 14;  // standard ADX period (v22.2: 7→14 — more reliable)
 input int      InpATR_Period             = 14;  // standard ATR period (v22.2: 7→14 — more reliable)
 input double   InpMinADXForEntry          = 28.0;  // v22.9: sterkere trendvereiste op trend-TF
 input double   InpMinADXEntryFilter       = 28.0;  // v22.9: sterkere trendvereiste op entry-TF
 input bool     InpUseBodyFilter           = false;
 input double   InpMinBodyPips             = 2.0;
-input double   InpEntryMinBodyATRFrac     = 0.20; // v22.2: min candle body als fractie van ATR
-input bool     InpEntryUseFollowThrough   = true;  // vereist follow-through: vorig candle zelfde richting
-input bool     InpEntryUseWickFilter      = true;  // blokkeer indecisie-bars met grote tegengestelde wick
+input double   InpEntryMinBodyATRFrac     = 0.0;  // v22.13: alle filters uit — geen body-ATR eis
+input bool     InpEntryUseFollowThrough   = false; // v22.13: alle filters uit
+input bool     InpEntryUseWickFilter      = false; // v22.13: alle filters uit
 input double   InpEntryMaxOppWickBodyFrac = 0.45; // max toegestane tegengestelde wick t.o.v. body
-input bool     InpEntryUseRangeATRFilter  = true;  // vereist minimale candle-range t.o.v. ATR
+input bool     InpEntryUseRangeATRFilter  = false; // v22.13: alle filters uit
 input double   InpEntryMinRangeATRFrac    = 0.35; // min (candle range / ATR) — filtert te kleine bars
-input double   InpEntryMinCloseInRangeFrac= 0.60; // v22.2: close moet >= 60% in candle range zitten
+input double   InpEntryMinCloseInRangeFrac= 0.0;  // v22.13: alle filters uit
 
 // --- Improved entry: Trend + Pullback + Continuation (v22.5)
 // When true, replaces Setup1 with a simplified pullback-based edge:
@@ -502,19 +502,19 @@ input double   InpEntryMinCloseInRangeFrac= 0.60; // v22.2: close moet >= 60% in
 //   3. Trigger:   continuation candle (close > open for buy, < open for sell)
 // All other risk guards (ATR, ADX, corr, portfolio) remain active.
 input bool     InpUseImprovedEntry        = true;  // v22.5: verbeterde entry (Trend+Pullback+Continuation); vervangt Setup1
-input double   InpImprovedEntry_ATRMinPips = 6.0;  // v22.9: extra guard tegen lage-volatiliteit entries
-input bool     InpEntryRequirePullbackOrigin = true; // v22.11: bar[2] sloot op de juiste EMA-kant — echte pullback check
+input double   InpImprovedEntry_ATRMinPips = 0.0;  // v22.13: alle filters uit — geen ATR-min vereiste
+input bool     InpEntryRequirePullbackOrigin = false; // v22.13: alle filters uit
 
 
 // --- Advanced filters / regimes (v9)
-input bool     InpUseHTFBias              = true;  // v22.2: H4 trend-bias — traden alleen met de sterke trend
+input bool     InpUseHTFBias              = false; // v22.13: alle filters uit
 input ENUM_TIMEFRAMES InpBiasTF           = PERIOD_H4;  // bias timeframe (v22.2: H1→H4 — stronger trend filter)
 input int      InpBiasEMAFast             = 50;
 input int      InpBiasEMASlow             = 200;
-input bool     InpBias_FailClosed         = true;  // v22.12: block entries when bias data not ready (was false — dangerous: allowed both directions)
-input double   InpBiasMinEMASepPips      = 5.0;   // v22.12: min H4 EMA50/200 separation in pips to constitute a real trend (was 1 pip — effectively no filter)
+input bool     InpBias_FailClosed         = false; // v22.13: alle filters uit
+input double   InpBiasMinEMASepPips      = 0.0;   // v22.13: alle filters uit — geen EMA-scheiding vereiste
 
-input bool     InpUseCorrelationGuard     = true;  // v22.2: correlatie-bewaking — blokkeert gecorreleerde posities
+input bool     InpUseCorrelationGuard     = false; // v22.13: alle filters uit
 input ENUM_TIMEFRAMES InpCorrTF           = PERIOD_M15;
 input int      InpCorrLookbackBars        = 120;
 input double   InpCorrAbsThreshold        = 0.90;  // abs(corr) >= threshold blocks entry (v22.4: 0.85→0.90; many FX pairs naturally exceed 0.85)
@@ -534,7 +534,7 @@ input bool     InpCorrUseWeightedExposure = false; // v22.4: false — weighted 
 input double   InpCorrMaxWeightedLots     = 2.0;    // block if sum(abs(corr)*openLots)+newLots exceeds this (FX-like only)
 
 // --- Per-symbol cooldown after exits (v11)
-input bool     InpUseSymbolCooldown       = true;
+input bool     InpUseSymbolCooldown       = false; // v22.13: alle filters uit
 input bool     InpCooldownLossOnly        = true;   // apply cooldown only when net position P/L < 0
 input double   InpCooldownLossMinR        = 0.10;  // apply cooldown only if loss <= -X R (e.g. 0.10). 0 => any loss
 input int      InpCooldownSLMin           = 5;      // cooldown minutes after SL close (when loss-only: only if loss)
@@ -542,12 +542,12 @@ input int      InpCooldownTPMin           = 0;      // cooldown minutes after TP
 input int      InpCooldownManualMin       = 1;      // cooldown minutes after manual/time-stop/other close (when loss-only: only if loss)
 input int      InpCooldownExitMin         = 1;      // DEPRECATED: kept for compatibility (unused in v11)
 
-input bool     InpUseVolRegime            = true;  // v22.2: vol-regime bewaking — schaal risico bij abnormale volatiliteit
+input bool     InpUseVolRegime            = false; // v22.13: alle filters uit
 input ENUM_TIMEFRAMES InpVolRegimeTF      = PERIOD_M5;
 input int      InpVolRegimeLookbackBars   = 200;
 input double   InpVolLowPct               = 20.0;  // <= => low vol regime
 input double   InpVolHighPct              = 80.0;  // >= => high vol regime
-input bool     InpVolLowBlockEntries      = true;  // v22.12: halve lot size in low-vol regime (was false lean-test; enables 0.5× scaling to reduce risk in choppy/quiet markets)
+input bool     InpVolLowBlockEntries      = false; // v22.13: alle filters uit
 input double   InpVolHighRiskMult         = 0.25;  // risk multiplier in high-vol regime (v22.1: 0.50→0.25)
 
 // --- Setup2
@@ -556,7 +556,7 @@ input bool     InpUseSetup2               = false;
 input bool     InpUseBreakPrevHighLow     = true;
 
 // --- Sessions
-input bool     InpUseSessions             = true;  // v22.1: handel alleen tijdens London (07–17) + NY (12–21 UTC)
+input bool     InpUseSessions             = false; // v22.13: alle filters uit
 input int      InpLondonStartHour         = 7;
 input int      InpLondonEndHour           = 17;
 input int      InpNYStartHour             = 12;
